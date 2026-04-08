@@ -1,0 +1,32 @@
+# Core dependencies
+numpy>=1.21.0
+SimpleITK>=2.2.0
+scipy>=1.7.0
+scikit-learn>=1.0.0
+
+# Optional: Progress bars
+# tqdm>=4.60.0
+
+# Optional: PNG support (auto-installed with matplotlib)
+# Pillow>=9.0.0
+
+# Optional: FRD (Fréchet Radiomics Distance)
+# pyradiomics>=3.0.0
+
+# Optional: LPIPS (perceptual similarity)
+# torch>=1.9.0
+# lpips>=0.1.4
+
+# Optional: Classification (XGBoost model)
+# xgboost>=1.5.0
+
+# Optional: nnUNet segmentation
+# nnunetv2>=2.2
+
+# Optional: Visualization
+# matplotlib>=3.5.0
+# plotly>=5.0.0
+
+# Optional: Web interface
+# streamlit>=1.20.0
+# pandas>=1.4.0
