@@ -386,15 +386,24 @@ def create_labels(
     return patient_ids, labels
 
 
-def detect_split_column(clinical_df: "pd.DataFrame") -> Optional[str]:
+def detect_split_column(
+    clinical_df: "pd.DataFrame",
+    custom_test_values: Optional[list[str]] = None,
+) -> Optional[str]:
     """Auto-detect the train/test split column in the clinical data.
 
     Tries each candidate column name from :data:`SPLIT_COLUMN_CANDIDATES`
     (case-insensitive) and returns the first that exists and contains
     recognisable split values.
 
+    When *custom_test_values* are given the check is relaxed: the column
+    only needs to contain at least one of the custom values (no need for
+    standard train/test labels).
+
     Args:
         clinical_df: Clinical data DataFrame.
+        custom_test_values: If supplied, accept a candidate column when
+            it contains at least one of these values.
 
     Returns:
         Column name if found, else ``None``.
@@ -402,19 +411,38 @@ def detect_split_column(clinical_df: "pd.DataFrame") -> Optional[str]:
     # Build a lower-case → actual-name lookup for the DataFrame columns
     col_lower_map = {c.lower().strip(): c for c in clinical_df.columns}
 
+    custom_lower = (
+        {v.lower().strip() for v in custom_test_values}
+        if custom_test_values
+        else None
+    )
+
     for candidate in SPLIT_COLUMN_CANDIDATES:
         actual_col = col_lower_map.get(candidate.lower())
         if actual_col is not None:
             unique = set(clinical_df[actual_col].dropna().astype(str).unique())
             unique_lower = {v.lower().strip() for v in unique}
-            has_test = bool(unique_lower & TEST_SPLIT_VALUES)
-            has_train = bool(unique_lower & TRAIN_SPLIT_VALUES)
-            if has_test or has_train:
-                logger.info(
-                    f"Detected split column '{actual_col}' with values: "
-                    f"{sorted(unique)}"
-                )
-                return actual_col
+
+            if custom_lower is not None:
+                # Custom mode: column must contain at least one custom value
+                if unique_lower & custom_lower:
+                    logger.info(
+                        f"Detected split column '{actual_col}' "
+                        f"(matched custom test values: "
+                        f"{sorted(custom_lower & unique_lower)}). "
+                        f"All values: {sorted(unique)}"
+                    )
+                    return actual_col
+            else:
+                # Standard mode: need train/test labels
+                has_test = bool(unique_lower & TEST_SPLIT_VALUES)
+                has_train = bool(unique_lower & TRAIN_SPLIT_VALUES)
+                if has_test or has_train:
+                    logger.info(
+                        f"Detected split column '{actual_col}' with values: "
+                        f"{sorted(unique)}"
+                    )
+                    return actual_col
 
     # No match — log available columns for debugging
     logger.debug(
@@ -428,21 +456,36 @@ def detect_split_column(clinical_df: "pd.DataFrame") -> Optional[str]:
 def split_train_test_patients(
     clinical_df: "pd.DataFrame",
     split_column: Optional[str] = None,
+    test_split_values: Optional[list[str]] = None,
 ) -> tuple[list[str], list[str]]:
     """Split patient IDs into train and test sets using the clinical data.
 
-    If no split column is detected, all patients are returned as training
-    patients and the test list is empty.
+    If *test_split_values* is provided the split column is matched against
+    those values (case-insensitive).  Patients whose value matches are
+    treated as test, all others as training.
+
+    If no split column is detected and no custom values are given, all
+    patients are returned as training patients and the test list is empty.
 
     Args:
         clinical_df: Clinical data DataFrame.
         split_column: Column name containing split labels. If None,
             auto-detection is attempted.
+        test_split_values: Custom test-set value(s) for the split column.
+            When provided, any patient whose column value
+            (case-insensitive) matches is placed in the test set;
+            all remaining patients go to the training set.
 
     Returns:
         Tuple of (train_patient_ids, test_patient_ids).
     """
-    if split_column is None:
+    # --- Resolve split column ---
+    if split_column is None and test_split_values is not None:
+        # User gave custom values but no column — try auto-detect
+        split_column = detect_split_column(
+            clinical_df, custom_test_values=test_split_values,
+        )
+    elif split_column is None:
         split_column = detect_split_column(clinical_df)
 
     if split_column is None:
@@ -455,23 +498,31 @@ def split_train_test_patients(
     col_values = clinical_df[split_column].fillna("").astype(str)
     col_values_lower = col_values.str.lower().str.strip()
 
-    train_mask = col_values_lower.isin(TRAIN_SPLIT_VALUES)
-    test_mask = col_values_lower.isin(TEST_SPLIT_VALUES)
+    if test_split_values is not None:
+        # Custom test values mode: anything matching → test, rest → train
+        custom_lower = {v.lower().strip() for v in test_split_values}
+        test_mask = col_values_lower.isin(custom_lower)
+        train_mask = ~test_mask
+        train_ids = clinical_df.loc[train_mask, "patient_id"].tolist()
+        test_ids = clinical_df.loc[test_mask, "patient_id"].tolist()
+    else:
+        # Default mode: look for standard train/test labels
+        train_mask = col_values_lower.isin(TRAIN_SPLIT_VALUES)
+        test_mask = col_values_lower.isin(TEST_SPLIT_VALUES)
+        train_ids = clinical_df.loc[train_mask, "patient_id"].tolist()
+        test_ids = clinical_df.loc[test_mask, "patient_id"].tolist()
 
-    train_ids = clinical_df.loc[train_mask, "patient_id"].tolist()
-    test_ids = clinical_df.loc[test_mask, "patient_id"].tolist()
-
-    # Patients not matching either split go to training
-    unassigned = ~(train_mask | test_mask)
-    n_unassigned = int(unassigned.sum())
-    if n_unassigned > 0:
-        logger.info(
-            f"{n_unassigned} patients have unrecognised split value — "
-            f"assigning to training set."
-        )
-        train_ids.extend(
-            clinical_df.loc[unassigned, "patient_id"].tolist()
-        )
+        # Patients not matching either split go to training
+        unassigned = ~(train_mask | test_mask)
+        n_unassigned = int(unassigned.sum())
+        if n_unassigned > 0:
+            logger.info(
+                f"{n_unassigned} patients have unrecognised split value — "
+                f"assigning to training set."
+            )
+            train_ids.extend(
+                clinical_df.loc[unassigned, "patient_id"].tolist()
+            )
 
     logger.info(
         f"Dataset split: {len(train_ids)} training, {len(test_ids)} test "
@@ -1362,6 +1413,8 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         default=None,
         help=(
             "Directory for caching extracted features per patient. "
+            "For radiomics this stores per-patient feature arrays; for "
+            "CNN this stores extracted 2-D slices (.npz). "
             "Speeds up re-runs. Default: <output-dir>/feature_cache"
         ),
     )
@@ -1442,7 +1495,23 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         default=None,
         help=(
             "Column name in the clinical Excel containing train/test split "
-            "labels. If not specified, auto-detection is attempted."
+            "labels. If not specified, auto-detection is attempted. "
+            "For MAMA-MIA, consider using --split-column dataset together "
+            "with --test-split-values to treat specific datasets as the "
+            "test set (e.g. --test-split-values DUKE)."
+        ),
+    )
+    parser.add_argument(
+        "--test-split-values",
+        nargs="+",
+        type=str,
+        default=None,
+        help=(
+            "One or more values in the split column that identify test-set "
+            "patients. All other patients become the training set. "
+            "Example: --split-column dataset --test-split-values DUKE ISPY1. "
+            "When not specified, the default test labels ('test', 'testing') "
+            "are used."
         ),
     )
 
@@ -1547,6 +1616,19 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
             "Disabled by default because pre-contrast images are real "
             "(not synthesized) and including them dilutes evaluation of "
             "synthesis quality. Useful as an ablation baseline."
+        ),
+    )
+
+    # Device / acceleration
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        choices=["auto", "cpu", "cuda", "mps"],
+        help=(
+            "Device for CNN training and evaluation. 'auto' (default) "
+            "selects CUDA if available, then MPS, then CPU. Only "
+            "effective with --classifier-type cnn."
         ),
     )
 
@@ -1657,7 +1739,9 @@ def main(argv: Optional[list[str]] = None) -> None:
     if args.evaluate_test_set:
         logger.info("\n--- Detecting MAMA-MIA train/test split ---")
         _, test_patient_ids_global = split_train_test_patients(
-            clinical_df, split_column=args.split_column,
+            clinical_df,
+            split_column=args.split_column,
+            test_split_values=getattr(args, "test_split_values", None),
         )
         if len(test_patient_ids_global) == 0:
             logger.error(
@@ -1674,8 +1758,13 @@ def main(argv: Optional[list[str]] = None) -> None:
                 f"Columns found in data: {list(clinical_df.columns)}\n"
                 "\n"
                 "Hint: use --split-column <name> to specify the column\n"
-                "explicitly.  Training will proceed WITHOUT test-set\n"
-                "evaluation.\n" + "=" * 60
+                "explicitly, and --test-split-values <val1> <val2> ... to\n"
+                "treat specific values as test patients.\n"
+                "Example for MAMA-MIA (split by source dataset):\n"
+                "  --split-column dataset --test-split-values DUKE\n"
+                "\n"
+                "Training will proceed WITHOUT test-set evaluation.\n"
+                + "=" * 60
             )
         else:
             logger.info(
@@ -1764,6 +1853,8 @@ def main(argv: Optional[list[str]] = None) -> None:
                 clinical_df=clinical_df,
                 use_mask_channel=args.cnn_mask_channel,
                 dual_phase=getattr(args, "dual_phase", False),
+                device=getattr(args, "device", None),
+                cache_dir=getattr(args, "cache_dir", None),
             )
 
             task_elapsed = time.time() - task_start

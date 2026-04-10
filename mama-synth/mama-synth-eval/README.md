@@ -15,6 +15,17 @@ The MAMA-SYNTH challenge evaluates generative models that translate pre-contrast
 
 Rankings use **Borda-style hierarchical rank aggregation** with tie-break priority: ROI → CLF → SEG → FULL.
 
+## What's New in v0.8.0
+
+- **CNN slice caching** (`--cache-dir`) — extracted 2-D slices are written to disk on the first run and re-loaded on subsequent runs, avoiding repeated NIfTI I/O. Each patient's slices are stored in a `.npz` file keyed by extraction parameters (phase, slice mode, dual-phase, mask channel), so different configurations use separate caches.
+- **GPU / device selection** (`--device`) — new CLI flag for CNN training and evaluation: `auto` (default, selects CUDA → MPS → CPU), `cpu`, `cuda`, or `mps`. Previously the device was always auto-detected with no way to override.
+- **MAMA-MIA test split by dataset** (`--test-split-values`) — use arbitrary column values as the test set. The MAMA-MIA clinical Excel has a `dataset` column with values `DUKE`, `ISPY1`, `ISPY2`, `NACT` but no train/test split. With `--split-column dataset --test-split-values DUKE`, all DUKE patients become the test set. The improved error message now explains this and suggests the correct flags.
+- **Bug fixes**:
+  - Fixed `NameError` in `train_cnn()` — `dual_phase` parameter was referenced but not declared in the function signature.
+  - Fixed `evaluate_cnn()` crashing on GPU/MPS — `.cpu()` was missing before `.numpy()` on tensors.
+  - Fixed dual-phase evaluation crash when pre-contrast files are partially missing — zero-padding is now applied to maintain consistent feature widths.
+- **321 tests** — 21 new tests covering CNN slice caching, device selection, test-split-values CLI, and bug fix verification.
+
 ## What's New in v0.7.0
 
 - **Dual-phase classification** (`--dual-phase`) — optionally use both pre-contrast (phase 0) and post-contrast (phase 1) images for molecular subtype classification. For radiomics, features from both phases are concatenated (doubling the feature dimension). For CNN, channels from both phases are stacked into a 6-channel input. Disabled by default to preserve challenge emphasis on post-contrast synthesis quality; useful as an ablation baseline. Use `--precontrast-path` to specify the pre-contrast image directory during evaluation.
@@ -401,6 +412,9 @@ mamasia-train \
 | `--radiomics-model` | `all` | Radiomics family filter: `all`, `xgboost`, `random_forest`, `logistic_regression`, `svm` |
 | `--save-all-models` | `false` | Save all trained models (not just best) for ensemble |
 | `--dual-phase` | `false` | Use both phase 0 + phase 1 for classification |
+| `--device` | `auto` | Device for CNN training: `auto`, `cpu`, `cuda`, `mps` |
+| `--cache-dir` | `None` | Directory for caching extracted CNN slices (`.npz` per patient) |
+| `--test-split-values` | `None` | Custom test-set values for `--split-column` (e.g. `DUKE ISPY1`) |
 | `-v, --verbose` | `false` | Verbose logging |
 
 ### Training Modes
@@ -539,6 +553,28 @@ python -m eval.train_classifier \
     --data-dir /path/to/mama-mia-dataset \
     --output-dir ./models \
     --evaluate-test-set
+```
+
+**Test-set evaluation with MAMA-MIA datasets**: Use specific source datasets (e.g. DUKE) as test set.
+
+```bash
+python -m eval.train_classifier \
+    --data-dir /path/to/mama-mia-dataset \
+    --output-dir ./models \
+    --evaluate-test-set \
+    --split-column dataset \
+    --test-split-values DUKE
+```
+
+**GPU training with slice caching**: Train CNN on GPU and cache extracted slices.
+
+```bash
+python -m eval.train_classifier \
+    --data-dir /path/to/mama-mia-dataset \
+    --output-dir ./models \
+    --classifier-type cnn \
+    --device cuda \
+    --cache-dir ./slice_cache
 ```
 
 ### 2D Slice Extraction (Python API)

@@ -376,12 +376,19 @@ def extract_slices_for_cnn(
     n_slices: int = DEFAULT_N_SLICES,
     return_masks: bool = False,
     dual_phase: bool = False,
+    cache_dir: Optional[Path] = None,
+    batch_size_extract: int = 50,
 ) -> tuple[list[NDArray], NDArray, list[str], Optional[list[NDArray]]]:
     """Extract raw 2D slices for CNN training.
 
     Similar to :func:`extract_features_for_patients` in
     ``train_classifier.py`` but returns raw pixel arrays instead of
     radiomic feature vectors.
+
+    When *cache_dir* is provided, extracted slices are saved per-patient
+    as ``.npz`` files and reused on subsequent runs, avoiding repeated
+    NIfTI loading and slice extraction.  Patients are processed in
+    batches of *batch_size_extract* to limit peak CPU/memory usage.
 
     Parameters
     ----------
@@ -403,6 +410,16 @@ def extract_slices_for_cnn(
         If ``True``, also return the corresponding 2D mask slices
         (for mask-channel mode).  When a mask is unavailable for a
         particular slice, a zero-filled array of the same shape is used.
+    dual_phase : bool
+        When ``True``, stack phase-0 and phase-1 slices into a 2-channel
+        array per slice.
+    cache_dir : Path | None
+        Directory for per-patient slice caches.  Each patient's slices
+        are saved as ``{patient_id}_{cache_tag}.npz``.  If ``None``,
+        caching is disabled.
+    batch_size_extract : int
+        Number of patients to process per batch before flushing to cache.
+        Helps limit peak memory usage.  Default: 50.
 
     Returns
     -------
@@ -431,6 +448,7 @@ def extract_slices_for_cnn(
         _load_mask_as_array,
         _load_nifti_as_array,
     )
+    import hashlib
 
     if images_dir is None:
         images_dir = data_dir / IMAGES_SUBDIR
@@ -438,6 +456,62 @@ def extract_slices_for_cnn(
         segmentations_dir = data_dir / SEGMENTATIONS_SUBDIR
 
     _slice_mode = SliceMode(slice_mode)
+
+    # --- Caching helpers -------------------------------------------------
+    # Build a tag that uniquely identifies extraction parameters so cache
+    # files are invalidated when settings change.
+    _cache_tag = (
+        f"ph{phase}_{slice_mode}_n{n_slices}"
+        f"_dp{int(dual_phase)}_msk{int(return_masks)}"
+    )
+
+    def _patient_cache_path(pid: str) -> Optional[Path]:
+        if cache_dir is None:
+            return None
+        return cache_dir / f"{pid}_{_cache_tag}.npz"
+
+    def _load_from_cache(pid: str) -> Optional[dict]:
+        """Try to load cached slices for a patient. Returns None on miss."""
+        cp = _patient_cache_path(pid)
+        if cp is None or not cp.exists():
+            return None
+        try:
+            data = np.load(str(cp), allow_pickle=True)
+            return {
+                "slices": list(data["slices"]),
+                "masks": list(data["masks"]) if "masks" in data else None,
+                "n_slices": int(data["n_slices"]),
+            }
+        except Exception:
+            return None
+
+    def _save_to_cache(
+        pid: str,
+        slices: list[NDArray],
+        masks: Optional[list[NDArray]],
+    ) -> None:
+        cp = _patient_cache_path(pid)
+        if cp is None:
+            return
+        try:
+            cp.parent.mkdir(parents=True, exist_ok=True)
+            save_dict: dict = {
+                "slices": np.array(slices, dtype=object),
+                "n_slices": np.array(len(slices)),
+            }
+            if masks is not None:
+                save_dict["masks"] = np.array(masks, dtype=object)
+            np.savez(str(cp), **save_dict)
+        except Exception as e:
+            logger.debug(f"Failed to cache slices for {pid}: {e}")
+
+    if cache_dir is not None:
+        cache_dir = Path(cache_dir)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        logger.info(
+            f"CNN slice cache: {cache_dir}  "
+            f"(tag='{_cache_tag}')"
+        )
 
     # Progress bar
     try:
@@ -471,8 +545,27 @@ def extract_slices_for_cnn(
             p0 = np.zeros_like(s, dtype=np.float32)
         return np.stack([s, p0], axis=0)  # (2, H, W)
 
+    n_cache_hits = 0
+
     for i, pid in iterator:
         try:
+            label = float(labels[i])
+
+            # --- Try cache first ------------------------------------------
+            cached = _load_from_cache(pid)
+            if cached is not None:
+                for j, s in enumerate(cached["slices"]):
+                    all_slices.append(s)
+                    all_labels.append(label)
+                    all_pids.append(pid)
+                    if return_masks and cached["masks"] is not None:
+                        all_masks.append(cached["masks"][j])
+                    elif return_masks:
+                        all_masks.append(np.zeros_like(s[-1] if s.ndim == 3 else s, dtype=np.float32))
+                n_cache_hits += 1
+                continue
+
+            # --- Extract from NIfTI (cache miss) --------------------------
             img_path = _get_image_path(images_dir, pid, phase)
             volume = _load_nifti_as_array(img_path)
 
@@ -510,43 +603,60 @@ def extract_slices_for_cnn(
                     # MULTI_SLICE can fall back to evenly spaced
                     mask = None
 
-            label = float(labels[i])
-
             if _slice_mode == SliceMode.ALL_TUMOR:
                 slices_2d, masks_2d, indices = extract_all_tumor_slices(
                     volume, mask,
                 )
+                patient_slices: list[NDArray] = []
+                patient_masks: list[NDArray] = []
                 for j, s in enumerate(slices_2d):
-                    all_slices.append(_maybe_stack_dual(s, phase0_volume, indices[j]))
+                    stacked = _maybe_stack_dual(s, phase0_volume, indices[j])
+                    patient_slices.append(stacked)
+                    all_slices.append(stacked)
                     all_labels.append(label)
                     all_pids.append(pid)
                     if return_masks:
                         m2d = masks_2d[j] if masks_2d is not None and j < len(masks_2d) else np.zeros_like(s)
-                        all_masks.append(m2d.astype(np.float32))
+                        m2d = m2d.astype(np.float32)
+                        patient_masks.append(m2d)
+                        all_masks.append(m2d)
+                _save_to_cache(pid, patient_slices, patient_masks if return_masks else None)
 
             elif _slice_mode == SliceMode.MULTI_SLICE:
                 slices_2d, masks_2d, indices = extract_multi_slices(
                     volume, mask, n_slices=n_slices,
                 )
+                patient_slices = []
+                patient_masks = []
                 for j, s in enumerate(slices_2d):
-                    all_slices.append(_maybe_stack_dual(s, phase0_volume, indices[j]))
+                    stacked = _maybe_stack_dual(s, phase0_volume, indices[j])
+                    patient_slices.append(stacked)
+                    all_slices.append(stacked)
                     all_labels.append(label)
                     all_pids.append(pid)
                     if return_masks:
                         m2d = masks_2d[j] if masks_2d is not None and j < len(masks_2d) else np.zeros_like(s)
-                        all_masks.append(m2d.astype(np.float32))
+                        m2d = m2d.astype(np.float32)
+                        patient_masks.append(m2d)
+                        all_masks.append(m2d)
+                _save_to_cache(pid, patient_slices, patient_masks if return_masks else None)
 
             else:
                 # Single-slice modes
                 slice_2d, mask_2d, idx = extract_2d_slice(
                     volume, mask, mode=_slice_mode,
                 )
-                all_slices.append(_maybe_stack_dual(slice_2d, phase0_volume, idx))
+                stacked = _maybe_stack_dual(slice_2d, phase0_volume, idx)
+                all_slices.append(stacked)
                 all_labels.append(label)
                 all_pids.append(pid)
+                patient_masks_single: Optional[list[NDArray]] = None
                 if return_masks:
                     m2d = mask_2d if mask_2d is not None else np.zeros_like(slice_2d)
-                    all_masks.append(m2d.astype(np.float32))
+                    m2d = m2d.astype(np.float32)
+                    all_masks.append(m2d)
+                    patient_masks_single = [m2d]
+                _save_to_cache(pid, [stacked], patient_masks_single)
 
         except Exception as e:
             logger.warning(f"Failed to extract slices for {pid}: {e}")
@@ -562,7 +672,7 @@ def extract_slices_for_cnn(
     logger.info(
         f"CNN slice extraction: {len(all_slices)} slices from "
         f"{len(patient_ids) - n_failed}/{len(patient_ids)} patients "
-        f"({n_failed} failed)"
+        f"({n_failed} failed, {n_cache_hits} from cache)"
     )
 
     return (
@@ -595,6 +705,8 @@ def train_cnn(
     train_masks: Optional[list[NDArray]] = None,
     val_masks: Optional[list[NDArray]] = None,
     use_mask_channel: bool = False,
+    dual_phase: bool = False,
+    device: Optional[str] = None,
 ) -> tuple[Any, dict[str, float]]:
     """Train a CNN classifier on 2D MRI slices.
 
@@ -630,6 +742,13 @@ def train_cnn(
     use_mask_channel : bool
         When ``True``, the model receives a 4-channel input
         (3 × image + 1 × mask).
+    dual_phase : bool
+        When ``True``, input slices have two stacked phases (6 base
+        channels instead of 3).
+    device : str | None
+        Target device (``"auto"``, ``"cpu"``, ``"cuda"``, ``"mps"``).
+        When ``None`` or ``"auto"``, the best available device is
+        auto-detected.
 
     Returns
     -------
@@ -650,7 +769,9 @@ def train_cnn(
     np.random.seed(seed)
 
     # Determine device
-    if torch.cuda.is_available():
+    if device is not None and device != "auto":
+        device = torch.device(device)
+    elif torch.cuda.is_available():
         device = torch.device("cuda")
     elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         device = torch.device("mps")
@@ -888,6 +1009,7 @@ def evaluate_cnn(
     image_size: int = DEFAULT_CNN_IMAGE_SIZE,
     batch_size: int = DEFAULT_CNN_BATCH_SIZE,
     masks: Optional[list[NDArray]] = None,
+    device: Optional[str] = None,
 ) -> dict[str, float]:
     """Evaluate a trained CNN on a set of slices.
 
@@ -905,6 +1027,8 @@ def evaluate_cnn(
         Inference batch size.
     masks : list[NDArray] | None
         Optional 2D mask arrays (for mask-channel models).
+    device : str | None
+        Target device. If None or "auto", auto-detects best device.
 
     Returns
     -------
@@ -915,7 +1039,15 @@ def evaluate_cnn(
     from sklearn.metrics import balanced_accuracy_score, roc_auc_score
     from torch.utils.data import DataLoader
 
-    device = torch.device("cpu")
+    if device is not None and device != "auto":
+        device = torch.device(device)
+    elif torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
+
     model = model.to(device)
     model.eval()
 
@@ -938,9 +1070,9 @@ def evaluate_cnn(
             logits = model(images).squeeze(-1)
             total_loss += criterion(logits, targets).item()
             n_batches += 1
-            probs = torch.sigmoid(logits).numpy()
+            probs = torch.sigmoid(logits).cpu().numpy()
             all_probs.extend(probs.tolist())
-            all_targets.extend(targets.numpy().tolist())
+            all_targets.extend(targets.cpu().numpy().tolist())
 
     y_true = np.array(all_targets)
     y_score = np.array(all_probs)
@@ -1031,6 +1163,8 @@ def train_cnn_pipeline(
     clinical_df: Optional[Any] = None,
     use_mask_channel: bool = False,
     dual_phase: bool = False,
+    device: Optional[str] = None,
+    cache_dir: Optional[Path] = None,
 ) -> tuple[Any, str, dict[str, float]]:
     """Full CNN training pipeline for a single task.
 
@@ -1066,6 +1200,7 @@ def train_cnn_pipeline(
         n_slices=n_slices,
         return_masks=use_mask_channel,
         dual_phase=dual_phase,
+        cache_dir=cache_dir,
     )
 
     # 2. Patient-aware train/val split
@@ -1137,6 +1272,8 @@ def train_cnn_pipeline(
         train_masks=train_masks_list,
         val_masks=val_masks_list,
         use_mask_channel=use_mask_channel,
+        dual_phase=dual_phase,
+        device=device,
     )
 
     mask_tag = ", mask_ch" if use_mask_channel else ""
@@ -1169,6 +1306,7 @@ def train_cnn_pipeline(
                     slice_mode=slice_mode,
                     n_slices=n_slices,
                     return_masks=use_mask_channel,
+                    cache_dir=cache_dir,
                 )
 
                 # Patient-level aggregation for test: average per-slice probs
@@ -1176,6 +1314,7 @@ def train_cnn_pipeline(
                     best_model, test_slices, test_lbl,
                     image_size=image_size,
                     masks=test_masks_ret,
+                    device=device,
                 )
                 logger.info(
                     f"CNN TEST SET — {task}: "

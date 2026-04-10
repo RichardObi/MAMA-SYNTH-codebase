@@ -618,6 +618,9 @@ class MamaSynthEval:
                         break
                 if precon_feats is not None:
                     feats = np.concatenate([feats, precon_feats])
+                else:
+                    # Pad to double width so shapes stay consistent
+                    feats = np.concatenate([feats, np.zeros_like(feats)])
 
             features_list.append(feats)
             tnbc_true.append(labels[stem].get("tnbc", 0))
