@@ -66,8 +66,11 @@ from typing import Any, Optional
 
 import numpy as np
 from numpy.typing import NDArray
+from sklearn.feature_selection import VarianceThreshold
 from sklearn.metrics import balanced_accuracy_score, roc_auc_score
 from sklearn.model_selection import StratifiedKFold, train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 
 from eval.slice_extraction import (
     SliceMode,
@@ -133,86 +136,138 @@ TRAIN_SPLIT_VALUES = {"train", "training"}
 # Hyperparameter search space
 # ---------------------------------------------------------------------------
 
-def _get_model_configs() -> list[dict[str, Any]]:
+def _make_pipeline(clf: Any) -> Pipeline:
+    """Wrap a classifier in a preprocessing pipeline.
+
+    The pipeline applies:
+    1. StandardScaler — zero-mean, unit-variance normalisation.
+    2. VarianceThreshold — remove near-constant features.
+    3. The classifier itself.
+
+    Because the entire Pipeline is serialised with ``pickle``, the
+    saved ``.pkl`` model is self-contained: it will scale and select
+    features automatically at inference time.
+    """
+    return Pipeline([
+        ("scaler", StandardScaler()),
+        ("var_thresh", VarianceThreshold(threshold=0.0)),
+        ("clf", clf),
+    ])
+
+
+def _get_model_configs(
+    scale_pos_weight: float = 1.0,
+) -> list[dict[str, Any]]:
     """Return a list of model configurations to try during training.
 
-    Each config is a dict with 'name', 'create_fn' (callable returning a model).
-    The search tries XGBoost configs first, falling back to RandomForest if
-    XGBoost is unavailable.
+    Each config is a dict with 'name' and 'create_fn' (callable returning
+    a sklearn :class:`Pipeline` with preprocessing + classifier).
+
+    Args:
+        scale_pos_weight: Ratio *n_negative / n_positive* for the current
+            task.  Passed directly to XGBoost's ``scale_pos_weight`` and
+            used to inform other class-imbalance parameters.
     """
     configs: list[dict[str, Any]] = []
 
+    # --- XGBoost (if available) -------------------------------------------
     try:
         from xgboost import XGBClassifier
 
+        _spw = scale_pos_weight  # capture for lambdas
+
         configs.extend([
             {
-                "name": "XGBoost(n=100, depth=3, lr=0.1)",
-                "create_fn": lambda: XGBClassifier(
-                    n_estimators=100, max_depth=3, learning_rate=0.1,
-                    use_label_encoder=False, eval_metric="logloss",
-                    random_state=DEFAULT_SEED,
-                ),
-            },
-            {
-                "name": "XGBoost(n=200, depth=5, lr=0.05)",
-                "create_fn": lambda: XGBClassifier(
-                    n_estimators=200, max_depth=5, learning_rate=0.05,
-                    use_label_encoder=False, eval_metric="logloss",
-                    random_state=DEFAULT_SEED,
-                ),
-            },
-            {
-                "name": "XGBoost(n=300, depth=4, lr=0.05)",
-                "create_fn": lambda: XGBClassifier(
-                    n_estimators=300, max_depth=4, learning_rate=0.05,
-                    use_label_encoder=False, eval_metric="logloss",
-                    random_state=DEFAULT_SEED,
-                ),
-            },
-            {
-                "name": "XGBoost(n=150, depth=6, lr=0.1)",
-                "create_fn": lambda: XGBClassifier(
-                    n_estimators=150, max_depth=6, learning_rate=0.1,
-                    use_label_encoder=False, eval_metric="logloss",
-                    random_state=DEFAULT_SEED,
-                ),
-            },
-            {
-                "name": "XGBoost(n=200, depth=3, lr=0.1, subsample=0.8)",
-                "create_fn": lambda: XGBClassifier(
+                "name": "XGB(n=200, d=3, lr=0.1, bal)",
+                "create_fn": lambda: _make_pipeline(XGBClassifier(
                     n_estimators=200, max_depth=3, learning_rate=0.1,
-                    subsample=0.8, colsample_bytree=0.8,
+                    scale_pos_weight=_spw,
                     use_label_encoder=False, eval_metric="logloss",
                     random_state=DEFAULT_SEED,
-                ),
+                )),
+            },
+            {
+                "name": "XGB(n=300, d=4, lr=0.05, bal)",
+                "create_fn": lambda: _make_pipeline(XGBClassifier(
+                    n_estimators=300, max_depth=4, learning_rate=0.05,
+                    scale_pos_weight=_spw,
+                    use_label_encoder=False, eval_metric="logloss",
+                    random_state=DEFAULT_SEED,
+                )),
+            },
+            {
+                "name": "XGB(n=200, d=5, lr=0.05, sub=0.8, bal)",
+                "create_fn": lambda: _make_pipeline(XGBClassifier(
+                    n_estimators=200, max_depth=5, learning_rate=0.05,
+                    subsample=0.8, colsample_bytree=0.8,
+                    scale_pos_weight=_spw,
+                    use_label_encoder=False, eval_metric="logloss",
+                    random_state=DEFAULT_SEED,
+                )),
+            },
+            {
+                "name": "XGB(n=150, d=6, lr=0.1, sub=0.8, bal)",
+                "create_fn": lambda: _make_pipeline(XGBClassifier(
+                    n_estimators=150, max_depth=6, learning_rate=0.1,
+                    subsample=0.8, colsample_bytree=0.8,
+                    scale_pos_weight=_spw,
+                    use_label_encoder=False, eval_metric="logloss",
+                    random_state=DEFAULT_SEED,
+                )),
             },
         ])
     except Exception:
-        logger.info("XGBoost not available. Using RandomForest only.")
+        logger.info("XGBoost not available.")
 
+    # --- Random Forest ----------------------------------------------------
     from sklearn.ensemble import RandomForestClassifier
 
     configs.extend([
         {
-            "name": "RandomForest(n=100, depth=10)",
-            "create_fn": lambda: RandomForestClassifier(
-                n_estimators=100, max_depth=10, random_state=DEFAULT_SEED,
-            ),
+            "name": "RF(n=200, d=15, bal)",
+            "create_fn": lambda: _make_pipeline(RandomForestClassifier(
+                n_estimators=200, max_depth=15,
+                class_weight="balanced",
+                random_state=DEFAULT_SEED,
+            )),
         },
         {
-            "name": "RandomForest(n=200, depth=15)",
-            "create_fn": lambda: RandomForestClassifier(
-                n_estimators=200, max_depth=15, random_state=DEFAULT_SEED,
-            ),
-        },
-        {
-            "name": "RandomForest(n=300, depth=None)",
-            "create_fn": lambda: RandomForestClassifier(
-                n_estimators=300, max_depth=None, random_state=DEFAULT_SEED,
-            ),
+            "name": "RF(n=300, d=None, bal)",
+            "create_fn": lambda: _make_pipeline(RandomForestClassifier(
+                n_estimators=300, max_depth=None,
+                class_weight="balanced",
+                random_state=DEFAULT_SEED,
+            )),
         },
     ])
+
+    # --- Logistic Regression (often strong on small N, many features) -----
+    from sklearn.linear_model import LogisticRegression
+
+    for C in (0.01, 0.1, 1.0, 10.0):
+        configs.append({
+            "name": f"LogReg(C={C}, bal)",
+            "create_fn": (
+                lambda _C=C: _make_pipeline(LogisticRegression(
+                    C=_C, class_weight="balanced", max_iter=2000,
+                    solver="lbfgs", random_state=DEFAULT_SEED,
+                ))
+            ),
+        })
+
+    # --- SVM with RBF kernel (good for moderate N) ------------------------
+    from sklearn.svm import SVC
+
+    for C in (0.1, 1.0, 10.0):
+        configs.append({
+            "name": f"SVM-RBF(C={C}, bal)",
+            "create_fn": (
+                lambda _C=C: _make_pipeline(SVC(
+                    C=_C, kernel="rbf", probability=True,
+                    class_weight="balanced", random_state=DEFAULT_SEED,
+                ))
+            ),
+        })
 
     return configs
 
@@ -549,10 +604,17 @@ def extract_features_for_patients(
             cache_file = cache_dir / f"{pid}{cache_suffix}"
             if cache_file.exists():
                 try:
-                    feat = np.load(cache_file)
-                    features_list.append(feat)
-                    valid_patient_ids.append(pid)
-                    valid_indices.append(i)
+                    feat = np.load(cache_file, allow_pickle=False)
+                    if feat.ndim == 2:
+                        # all_tumor cache: 2-D array (n_slices, n_features)
+                        for row in feat:
+                            features_list.append(row)
+                            valid_patient_ids.append(pid)
+                            valid_indices.append(i)
+                    else:
+                        features_list.append(feat)
+                        valid_patient_ids.append(pid)
+                        valid_indices.append(i)
                     n_cached += 1
                     continue
                 except Exception:
@@ -625,7 +687,7 @@ def extract_features_for_patients(
                     at_imgs, at_masks, at_idxs = extract_all_tumor_slices(
                         image_array, mask=mask_array, normalize=True,
                     )
-                    n_slices_ok = 0
+                    at_feats: list[NDArray[np.floating]] = []
                     for s_img, s_msk in zip(at_imgs, at_masks):
                         sf = extract_radiomic_features(
                             s_img, mask=s_msk,
@@ -634,19 +696,30 @@ def extract_features_for_patients(
                         )
                         if sf.size == 0 or np.all(sf == 0):
                             continue
+                        at_feats.append(sf)
                         features_list.append(sf)
                         valid_patient_ids.append(pid)
                         valid_indices.append(i)
-                        n_slices_ok += 1
-                    if n_slices_ok == 0:
+                    if len(at_feats) == 0:
                         logger.warning(
                             f"All tumour slices yielded empty features for "
                             f"{pid}, skipping."
                         )
                         n_failed += 1
                     else:
+                        # Cache the 2-D (n_slices, n_features) array
+                        if cache_dir is not None:
+                            try:
+                                np.save(
+                                    cache_dir / f"{pid}{cache_suffix}",
+                                    np.stack(at_feats, axis=0),
+                                )
+                            except Exception as e:
+                                logger.debug(
+                                    f"Failed to cache features for {pid}: {e}"
+                                )
                         logger.debug(
-                            f"{pid}: {n_slices_ok}/{len(at_idxs)} tumour "
+                            f"{pid}: {len(at_feats)}/{len(at_idxs)} tumour "
                             f"slices produced valid features."
                         )
                         n_extracted += 1
@@ -856,7 +929,10 @@ def train_with_model_selection(
     Returns:
         Tuple of (best_model, best_config_name, best_val_metrics).
     """
-    configs = _get_model_configs()
+    n_pos = max(int(y_train.sum()), 1)
+    n_neg = int((1 - y_train).sum())
+    spw = n_neg / n_pos
+    configs = _get_model_configs(scale_pos_weight=spw)
     logger.info(
         f"\n{'='*60}\n"
         f"Training '{task}' classifier — trying {len(configs)} configurations\n"
@@ -864,7 +940,7 @@ def train_with_model_selection(
     )
     logger.info(
         f"Train set: {X_train.shape[0]} samples "
-        f"(pos={int(y_train.sum())}, neg={int((1-y_train).sum())})"
+        f"(pos={n_pos}, neg={n_neg}, scale_pos_weight={spw:.2f})"
     )
     logger.info(
         f"Val   set: {X_val.shape[0]} samples "
@@ -943,7 +1019,10 @@ def train_with_cross_validation(
     Returns:
         Tuple of (best_model, best_config_name, avg_cv_metrics).
     """
-    configs = _get_model_configs()
+    n_pos = max(int(y.sum()), 1)
+    n_neg = int((1 - y).sum())
+    spw = n_neg / n_pos
+    configs = _get_model_configs(scale_pos_weight=spw)
     skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=seed)
 
     logger.info(
@@ -1180,6 +1259,14 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--clear-cache",
+        action="store_true",
+        help=(
+            "Delete cached features before extraction, forcing re-computation. "
+            "Useful when masks, images, or the extraction pipeline have changed."
+        ),
+    )
+    parser.add_argument(
         "--n-workers",
         type=int,
         default=1,
@@ -1320,6 +1407,13 @@ def main(argv: Optional[list[str]] = None) -> None:
     # Set default cache dir
     if args.cache_dir is None:
         args.cache_dir = args.output_dir / "feature_cache"
+
+    # Clear cache if requested
+    if args.clear_cache and args.cache_dir.exists():
+        import shutil
+        n_removed = sum(1 for _ in args.cache_dir.glob("*.npy"))
+        shutil.rmtree(args.cache_dir)
+        logger.info(f"Cleared feature cache ({n_removed} files): {args.cache_dir}")
 
     # Create visualisation output directory
     viz_dir = args.output_dir / "visualizations"
