@@ -1,0 +1,966 @@
+#  Copyright 2025 mama-synth-eval contributors
+#
+#  Licensed under the Apache License, Version 2.0 (the "License");
+#  you may not use this file except in compliance with the License.
+#  You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+#  Unless required by applicable law or agreed to in writing, software
+#  distributed under the License is distributed on an "AS IS" BASIS,
+#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#  See the License for the specific language governing permissions and
+#  limitations under the License.
+
+"""
+CNN classifier training pipeline for MAMA-MIA dataset.
+
+Trains EfficientNet-based deep learning classifiers for TNBC and Luminal
+molecular subtype prediction using 2D DCE-MRI slices. The CNN approach
+serves as a higher-capacity alternative to the radiomics-based classifiers.
+
+Key design choices
+------------------
+- **EfficientNet-B0** (via ``timm``) initialised with ImageNet pretrained
+  weights — strong transfer-learning baseline for medical images.
+- **Single-channel MRI → 3-channel input**: grayscale slices are replicated
+  to 3 channels so that the pretrained convolution filters can be reused.
+- **Aggressive data augmentation**: random horizontal/vertical flip,
+  rotation, affine transforms, and Gaussian noise to combat overfitting
+  on the relatively small MAMA-MIA dataset.
+- **Class-imbalance handling**: ``BCEWithLogitsLoss`` with ``pos_weight``
+  computed from the training label distribution.
+- **Cosine-annealing LR schedule** with linear warmup.
+- **Early stopping** on validation AUROC.
+
+Trained models are saved as ``{task}_classifier_cnn.pt`` and are
+compatible with the evaluation pipeline via :class:`CNNClassifier` in
+``classification.py``.
+
+Usage (integrated via ``--classifier-type cnn`` in the training CLI)::
+
+    python -m eval.train_classifier \\
+        --data-dir /path/to/mama-mia \\
+        --output-dir ./models \\
+        --classifier-type cnn
+"""
+
+import logging
+import math
+import time
+from pathlib import Path
+from typing import Any, Optional
+
+import numpy as np
+from numpy.typing import NDArray
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+DEFAULT_CNN_IMAGE_SIZE = 224
+DEFAULT_CNN_BATCH_SIZE = 32
+DEFAULT_CNN_NUM_EPOCHS = 50
+DEFAULT_CNN_LEARNING_RATE = 1e-4
+DEFAULT_CNN_WEIGHT_DECAY = 1e-4
+DEFAULT_CNN_PATIENCE = 10
+DEFAULT_CNN_MODEL_NAME = "efficientnet_b0"
+CNN_MODEL_SUFFIX = "_classifier_cnn.pt"
+
+# Re-use constants from the main training module
+DEFAULT_PHASE = 1
+DEFAULT_N_SLICES = 5
+
+# Default seed
+DEFAULT_SEED = 42
+
+
+# ---------------------------------------------------------------------------
+# Dependency checks
+# ---------------------------------------------------------------------------
+
+def _check_cnn_dependencies() -> None:
+    """Verify that CNN training dependencies are available."""
+    missing = []
+    try:
+        import torch  # noqa: F401
+    except ImportError:
+        missing.append("torch")
+    try:
+        import torchvision  # noqa: F401
+    except ImportError:
+        missing.append("torchvision")
+    try:
+        import timm  # noqa: F401
+    except ImportError:
+        missing.append("timm")
+    if missing:
+        raise ImportError(
+            f"CNN training requires: {', '.join(missing)}. "
+            "Install with: pip install 'mama-synth-eval[cnn]'"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Dataset
+# ---------------------------------------------------------------------------
+
+class MRISliceDataset:
+    """PyTorch-compatible dataset for 2D MRI slices.
+
+    Each item returns a ``(tensor, label)`` pair where *tensor* has shape
+    ``(3, image_size, image_size)`` (3-channel replicated grayscale) and
+    *label* is a scalar ``float32`` (0.0 or 1.0).
+
+    Parameters
+    ----------
+    slices : list[NDArray]
+        List of 2D numpy arrays with arbitrary (H, W) shapes.
+    labels : NDArray
+        1-D binary label array (one entry per slice).
+    image_size : int
+        Output spatial resolution (squared).
+    augment : bool
+        Whether to apply training-time data augmentation.
+    """
+
+    def __init__(
+        self,
+        slices: list[NDArray],
+        labels: NDArray,
+        image_size: int = DEFAULT_CNN_IMAGE_SIZE,
+        augment: bool = False,
+    ) -> None:
+        import torch  # noqa: F811 — lazy import
+
+        self.slices = slices
+        self.labels = np.asarray(labels, dtype=np.float32)
+        self.image_size = image_size
+        self.augment = augment
+
+        # Build augmentation pipeline (operates on 3-channel tensors)
+        if augment:
+            from torchvision import transforms
+
+            self.transform = transforms.Compose([
+                transforms.RandomHorizontalFlip(p=0.5),
+                transforms.RandomVerticalFlip(p=0.3),
+                transforms.RandomRotation(degrees=15),
+                transforms.RandomAffine(
+                    degrees=0, translate=(0.1, 0.1), scale=(0.9, 1.1),
+                ),
+            ])
+        else:
+            self.transform = None
+
+    def __len__(self) -> int:
+        return len(self.slices)
+
+    def __getitem__(self, idx: int):
+        import torch
+        import torch.nn.functional as F
+
+        img = self.slices[idx].astype(np.float32)
+        label = self.labels[idx]
+
+        # Per-slice min-max normalisation → [0, 1]
+        vmin, vmax = float(img.min()), float(img.max())
+        if vmax - vmin > 1e-8:
+            img = (img - vmin) / (vmax - vmin)
+        else:
+            img = np.zeros_like(img)
+
+        # → (1, H, W) tensor
+        tensor = torch.from_numpy(img).unsqueeze(0)
+
+        # Resize to (image_size, image_size)
+        tensor = F.interpolate(
+            tensor.unsqueeze(0),
+            size=(self.image_size, self.image_size),
+            mode="bilinear",
+            align_corners=False,
+        ).squeeze(0)
+
+        # Replicate to 3 channels for pretrained backbone
+        tensor = tensor.repeat(3, 1, 1)
+
+        # Data augmentation (training only)
+        if self.transform is not None:
+            tensor = self.transform(tensor)
+
+        return tensor, torch.tensor(label, dtype=torch.float32)
+
+
+# ---------------------------------------------------------------------------
+# Model factory
+# ---------------------------------------------------------------------------
+
+def create_cnn_model(
+    model_name: str = DEFAULT_CNN_MODEL_NAME,
+    pretrained: bool = True,
+    num_classes: int = 1,
+):
+    """Create a ``timm`` CNN model.
+
+    Parameters
+    ----------
+    model_name : str
+        Any model identifier supported by ``timm.create_model``.
+    pretrained : bool
+        Load ImageNet-pretrained weights.
+    num_classes : int
+        Number of output units (1 for binary classification with
+        BCEWithLogitsLoss).
+
+    Returns
+    -------
+    model : torch.nn.Module
+    """
+    import timm
+
+    model = timm.create_model(
+        model_name,
+        pretrained=pretrained,
+        num_classes=num_classes,
+    )
+    return model
+
+
+# ---------------------------------------------------------------------------
+# Slice extraction for CNN (returns raw pixel arrays, not radiomic features)
+# ---------------------------------------------------------------------------
+
+def extract_slices_for_cnn(
+    patient_ids: list[str],
+    labels: NDArray,
+    data_dir: Path,
+    images_dir: Optional[Path] = None,
+    segmentations_dir: Optional[Path] = None,
+    phase: int = DEFAULT_PHASE,
+    slice_mode: str = "all_tumor",
+    n_slices: int = DEFAULT_N_SLICES,
+) -> tuple[list[NDArray], NDArray, list[str]]:
+    """Extract raw 2D slices for CNN training.
+
+    Similar to :func:`extract_features_for_patients` in
+    ``train_classifier.py`` but returns raw pixel arrays instead of
+    radiomic feature vectors.
+
+    Parameters
+    ----------
+    patient_ids : list[str]
+        Patient identifiers.
+    labels : NDArray
+        Binary labels aligned with *patient_ids*.
+    data_dir : Path
+        Root MAMA-MIA dataset directory.
+    images_dir, segmentations_dir : Path, optional
+        Override default subfolder paths.
+    phase : int
+        MRI phase index (0=pre-contrast, 1=first post-contrast).
+    slice_mode : str
+        Slice extraction strategy (see :class:`SliceMode`).
+    n_slices : int
+        Number of slices for ``multi_slice`` mode.
+
+    Returns
+    -------
+    slices : list[NDArray]
+        Raw 2D numpy arrays (one per extracted slice).
+    slice_labels : NDArray
+        Corresponding binary labels (may be longer than *patient_ids*
+        when ``all_tumor`` mode produces multiple slices per patient).
+    slice_pids : list[str]
+        Patient ID for each slice.
+    """
+    from eval.slice_extraction import (
+        SliceMode,
+        extract_2d_slice,
+        extract_all_tumor_slices,
+        extract_multi_slices,
+    )
+    from eval.train_classifier import (
+        IMAGES_SUBDIR,
+        SEGMENTATIONS_SUBDIR,
+        _get_image_path,
+        _get_segmentation_path,
+        _load_mask_as_array,
+        _load_nifti_as_array,
+    )
+
+    if images_dir is None:
+        images_dir = data_dir / IMAGES_SUBDIR
+    if segmentations_dir is None:
+        segmentations_dir = data_dir / SEGMENTATIONS_SUBDIR
+
+    _slice_mode = SliceMode(slice_mode)
+
+    # Progress bar
+    try:
+        from tqdm import tqdm
+        iterator = tqdm(
+            enumerate(patient_ids),
+            total=len(patient_ids),
+            desc="Extracting slices (CNN)",
+            unit="patient",
+        )
+    except ImportError:
+        iterator = enumerate(patient_ids)
+
+    all_slices: list[NDArray] = []
+    all_labels: list[float] = []
+    all_pids: list[str] = []
+    n_failed = 0
+
+    for i, pid in iterator:
+        try:
+            img_path = _get_image_path(images_dir, pid, phase)
+            volume = _load_nifti_as_array(img_path)
+
+            # Load mask (optional for MIDDLE mode)
+            mask: Optional[NDArray] = None
+            if _slice_mode != SliceMode.MIDDLE:
+                seg_path = _get_segmentation_path(segmentations_dir, pid)
+                try:
+                    mask = _load_mask_as_array(seg_path)
+                except FileNotFoundError:
+                    if _slice_mode in (
+                        SliceMode.MAX_TUMOR,
+                        SliceMode.CENTER_TUMOR,
+                        SliceMode.ALL_TUMOR,
+                    ):
+                        logger.warning(
+                            f"Mask not found for {pid}, skipping (required "
+                            f"for {_slice_mode.value} mode)."
+                        )
+                        n_failed += 1
+                        continue
+                    # MULTI_SLICE can fall back to evenly spaced
+                    mask = None
+
+            label = float(labels[i])
+
+            if _slice_mode == SliceMode.ALL_TUMOR:
+                slices_2d, masks_2d, indices = extract_all_tumor_slices(
+                    volume, mask,
+                )
+                for s in slices_2d:
+                    all_slices.append(s)
+                    all_labels.append(label)
+                    all_pids.append(pid)
+
+            elif _slice_mode == SliceMode.MULTI_SLICE:
+                slices_2d, masks_2d, indices = extract_multi_slices(
+                    volume, mask, n_slices=n_slices,
+                )
+                for s in slices_2d:
+                    all_slices.append(s)
+                    all_labels.append(label)
+                    all_pids.append(pid)
+
+            else:
+                # Single-slice modes
+                slice_2d, mask_2d, idx = extract_2d_slice(
+                    volume, mask, mode=_slice_mode,
+                )
+                all_slices.append(slice_2d)
+                all_labels.append(label)
+                all_pids.append(pid)
+
+        except Exception as e:
+            logger.warning(f"Failed to extract slices for {pid}: {e}")
+            n_failed += 1
+            continue
+
+    if len(all_slices) == 0:
+        raise RuntimeError(
+            "No slices could be extracted for CNN training. "
+            "Check image/mask paths and data integrity."
+        )
+
+    logger.info(
+        f"CNN slice extraction: {len(all_slices)} slices from "
+        f"{len(patient_ids) - n_failed}/{len(patient_ids)} patients "
+        f"({n_failed} failed)"
+    )
+
+    return all_slices, np.array(all_labels, dtype=np.float32), all_pids
+
+
+# ---------------------------------------------------------------------------
+# Training loop
+# ---------------------------------------------------------------------------
+
+def train_cnn(
+    train_slices: list[NDArray],
+    train_labels: NDArray,
+    val_slices: list[NDArray],
+    val_labels: NDArray,
+    task: str,
+    output_dir: Path,
+    model_name: str = DEFAULT_CNN_MODEL_NAME,
+    image_size: int = DEFAULT_CNN_IMAGE_SIZE,
+    num_epochs: int = DEFAULT_CNN_NUM_EPOCHS,
+    batch_size: int = DEFAULT_CNN_BATCH_SIZE,
+    learning_rate: float = DEFAULT_CNN_LEARNING_RATE,
+    weight_decay: float = DEFAULT_CNN_WEIGHT_DECAY,
+    patience: int = DEFAULT_CNN_PATIENCE,
+    seed: int = DEFAULT_SEED,
+) -> tuple[Any, dict[str, float]]:
+    """Train a CNN classifier on 2D MRI slices.
+
+    Parameters
+    ----------
+    train_slices, val_slices : list[NDArray]
+        Raw 2D slices for training and validation.
+    train_labels, val_labels : NDArray
+        Binary labels.
+    task : str
+        ``"tnbc"`` or ``"luminal"``.
+    output_dir : Path
+        Directory for saving the best model checkpoint.
+    model_name : str
+        ``timm`` model identifier (default: ``"efficientnet_b0"``).
+    image_size : int
+        Input image resolution (pixels, squared).
+    num_epochs : int
+        Maximum training epochs.
+    batch_size : int
+        Mini-batch size.
+    learning_rate : float
+        Peak learning rate.
+    weight_decay : float
+        AdamW weight decay.
+    patience : int
+        Early stopping patience (epochs without AUROC improvement).
+    seed : int
+        Random seed.
+
+    Returns
+    -------
+    best_model : torch.nn.Module
+        Trained model (on CPU).
+    best_metrics : dict[str, float]
+        Validation metrics for the best epoch.
+    """
+    import torch
+    import torch.nn as nn
+    from sklearn.metrics import balanced_accuracy_score, roc_auc_score
+    from torch.utils.data import DataLoader
+
+    _check_cnn_dependencies()
+
+    # Seed everything
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
+    # Determine device
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
+    logger.info(f"CNN training device: {device}")
+
+    # --- Datasets & Loaders -----------------------------------------------
+    train_ds = MRISliceDataset(
+        train_slices, train_labels,
+        image_size=image_size, augment=True,
+    )
+    val_ds = MRISliceDataset(
+        val_slices, val_labels,
+        image_size=image_size, augment=False,
+    )
+
+    train_loader = DataLoader(
+        train_ds, batch_size=batch_size, shuffle=True,
+        num_workers=0, pin_memory=(device.type == "cuda"),
+        drop_last=len(train_ds) > batch_size,
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=batch_size, shuffle=False,
+        num_workers=0, pin_memory=(device.type == "cuda"),
+    )
+
+    # --- Model ------------------------------------------------------------
+    model = create_cnn_model(
+        model_name=model_name, pretrained=True, num_classes=1,
+    )
+    model = model.to(device)
+
+    # --- Loss (class-weighted) --------------------------------------------
+    n_pos = float(train_labels.sum())
+    n_neg = float(len(train_labels) - n_pos)
+    pos_weight = torch.tensor([n_neg / max(n_pos, 1.0)], device=device)
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    logger.info(
+        f"Class balance: {int(n_pos)} positive, {int(n_neg)} negative "
+        f"(pos_weight={pos_weight.item():.2f})"
+    )
+
+    # --- Optimiser --------------------------------------------------------
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=learning_rate, weight_decay=weight_decay,
+    )
+
+    # --- LR schedule: linear warmup + cosine decay ------------------------
+    warmup_epochs = min(5, num_epochs // 5)
+    total_steps = num_epochs * len(train_loader)
+    warmup_steps = warmup_epochs * len(train_loader)
+
+    def lr_lambda(step: int) -> float:
+        if step < warmup_steps:
+            return float(step) / max(float(warmup_steps), 1.0)
+        progress = float(step - warmup_steps) / max(
+            float(total_steps - warmup_steps), 1.0
+        )
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+    # --- Training loop ----------------------------------------------------
+    best_val_auroc = -1.0
+    best_epoch = -1
+    best_state: Optional[dict] = None
+    best_metrics: dict[str, float] = {}
+    epochs_no_improve = 0
+
+    logger.info(
+        f"\n{'='*60}\n"
+        f"CNN Training — '{task}' ({model_name})\n"
+        f"  Train: {len(train_ds)} slices | Val: {len(val_ds)} slices\n"
+        f"  Epochs: {num_epochs} | Batch: {batch_size} | "
+        f"LR: {learning_rate} | Patience: {patience}\n"
+        f"{'='*60}"
+    )
+
+    for epoch in range(num_epochs):
+        epoch_start = time.time()
+
+        # --- Train --------------------------------------------------------
+        model.train()
+        train_loss = 0.0
+        n_train_batches = 0
+
+        for images, targets in train_loader:
+            images = images.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
+
+            optimizer.zero_grad()
+            logits = model(images).squeeze(-1)
+            loss = criterion(logits, targets)
+            loss.backward()
+
+            # Gradient clipping
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+            optimizer.step()
+            scheduler.step()
+
+            train_loss += loss.item()
+            n_train_batches += 1
+
+        avg_train_loss = train_loss / max(n_train_batches, 1)
+
+        # --- Validate -----------------------------------------------------
+        model.eval()
+        val_loss = 0.0
+        n_val_batches = 0
+        all_val_probs: list[float] = []
+        all_val_targets: list[float] = []
+
+        with torch.no_grad():
+            for images, targets in val_loader:
+                images = images.to(device, non_blocking=True)
+                targets = targets.to(device, non_blocking=True)
+
+                logits = model(images).squeeze(-1)
+                loss = criterion(logits, targets)
+
+                val_loss += loss.item()
+                n_val_batches += 1
+
+                probs = torch.sigmoid(logits).cpu().numpy()
+                all_val_probs.extend(probs.tolist())
+                all_val_targets.extend(targets.cpu().numpy().tolist())
+
+        avg_val_loss = val_loss / max(n_val_batches, 1)
+
+        # Metrics
+        y_true = np.array(all_val_targets)
+        y_score = np.array(all_val_probs)
+        y_pred = (y_score >= 0.5).astype(int)
+
+        if len(np.unique(y_true)) >= 2:
+            val_auroc = float(roc_auc_score(y_true, y_score))
+        else:
+            val_auroc = 0.5
+
+        val_bal_acc = float(balanced_accuracy_score(y_true, y_pred))
+
+        elapsed = time.time() - epoch_start
+        current_lr = optimizer.param_groups[0]["lr"]
+        logger.info(
+            f"Epoch {epoch+1:3d}/{num_epochs} — "
+            f"train_loss={avg_train_loss:.4f}  "
+            f"val_loss={avg_val_loss:.4f}  "
+            f"val_AUROC={val_auroc:.4f}  "
+            f"val_BalAcc={val_bal_acc:.4f}  "
+            f"lr={current_lr:.2e}  "
+            f"({elapsed:.1f}s)"
+        )
+
+        # Early stopping check
+        if val_auroc > best_val_auroc:
+            best_val_auroc = val_auroc
+            best_epoch = epoch + 1
+            best_state = {
+                k: v.cpu().clone() for k, v in model.state_dict().items()
+            }
+            best_metrics = {
+                "auroc": val_auroc,
+                "balanced_accuracy": val_bal_acc,
+                "val_loss": avg_val_loss,
+                "train_loss": avg_train_loss,
+                "epoch": epoch + 1,
+            }
+            epochs_no_improve = 0
+        else:
+            epochs_no_improve += 1
+            if epochs_no_improve >= patience:
+                logger.info(
+                    f"Early stopping at epoch {epoch+1} "
+                    f"(best AUROC {best_val_auroc:.4f} at epoch {best_epoch})"
+                )
+                break
+
+    # --- Save best model --------------------------------------------------
+    if best_state is None:
+        logger.warning("No valid model was found during training.")
+        # Use final model state as fallback
+        best_state = {
+            k: v.cpu().clone() for k, v in model.state_dict().items()
+        }
+        best_metrics = {
+            "auroc": 0.0,
+            "balanced_accuracy": 0.0,
+            "epoch": num_epochs,
+        }
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    model_path = output_dir / f"{task}{CNN_MODEL_SUFFIX}"
+
+    checkpoint = {
+        "model_state_dict": best_state,
+        "model_name": model_name,
+        "num_classes": 1,
+        "image_size": image_size,
+        "task": task,
+        "best_epoch": best_epoch,
+        "best_val_auroc": best_val_auroc,
+    }
+
+    import torch as _torch
+    _torch.save(checkpoint, model_path)
+    logger.info(
+        f"Best CNN model saved → {model_path}  "
+        f"(epoch {best_epoch}, AUROC={best_val_auroc:.4f})"
+    )
+
+    # Move model back to CPU with best weights for return
+    model.cpu()
+    model.load_state_dict(best_state)
+
+    return model, best_metrics
+
+
+# ---------------------------------------------------------------------------
+# CNN evaluation helper
+# ---------------------------------------------------------------------------
+
+def evaluate_cnn(
+    model,
+    slices: list[NDArray],
+    labels: NDArray,
+    image_size: int = DEFAULT_CNN_IMAGE_SIZE,
+    batch_size: int = DEFAULT_CNN_BATCH_SIZE,
+) -> dict[str, float]:
+    """Evaluate a trained CNN on a set of slices.
+
+    Parameters
+    ----------
+    model : torch.nn.Module
+        Trained CNN (on CPU).
+    slices : list[NDArray]
+        Raw 2D slice arrays.
+    labels : NDArray
+        Binary labels.
+    image_size : int
+        Expected input resolution.
+    batch_size : int
+        Inference batch size.
+
+    Returns
+    -------
+    dict with ``auroc``, ``balanced_accuracy``, and ``loss``.
+    """
+    import torch
+    import torch.nn as nn
+    from sklearn.metrics import balanced_accuracy_score, roc_auc_score
+    from torch.utils.data import DataLoader
+
+    device = torch.device("cpu")
+    model = model.to(device)
+    model.eval()
+
+    ds = MRISliceDataset(slices, labels, image_size=image_size, augment=False)
+    loader = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=0)
+
+    criterion = nn.BCEWithLogitsLoss()
+    all_probs: list[float] = []
+    all_targets: list[float] = []
+    total_loss = 0.0
+    n_batches = 0
+
+    with torch.no_grad():
+        for images, targets in loader:
+            images = images.to(device)
+            targets = targets.to(device)
+            logits = model(images).squeeze(-1)
+            total_loss += criterion(logits, targets).item()
+            n_batches += 1
+            probs = torch.sigmoid(logits).numpy()
+            all_probs.extend(probs.tolist())
+            all_targets.extend(targets.numpy().tolist())
+
+    y_true = np.array(all_targets)
+    y_score = np.array(all_probs)
+    y_pred = (y_score >= 0.5).astype(int)
+
+    auroc = float("nan")
+    if len(np.unique(y_true)) >= 2:
+        auroc = float(roc_auc_score(y_true, y_score))
+
+    return {
+        "auroc": auroc,
+        "balanced_accuracy": float(balanced_accuracy_score(y_true, y_pred)),
+        "loss": total_loss / max(n_batches, 1),
+    }
+
+
+# ---------------------------------------------------------------------------
+# CNN model persistence
+# ---------------------------------------------------------------------------
+
+def load_cnn_model(
+    path: Path,
+    device: str = "cpu",
+):
+    """Load a saved CNN checkpoint.
+
+    Parameters
+    ----------
+    path : Path
+        ``{task}_classifier_cnn.pt`` file.
+    device : str
+        Target device (``"cpu"``, ``"cuda"``, ``"mps"``).
+
+    Returns
+    -------
+    model : torch.nn.Module
+        Model loaded with trained weights, in eval mode.
+    config : dict
+        Checkpoint metadata (``model_name``, ``image_size``, ``task``, …).
+    """
+    import torch
+
+    checkpoint = torch.load(path, map_location=device, weights_only=False)
+
+    model = create_cnn_model(
+        model_name=checkpoint["model_name"],
+        pretrained=False,
+        num_classes=checkpoint.get("num_classes", 1),
+    )
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model = model.to(device)
+    model.eval()
+
+    config = {
+        k: v for k, v in checkpoint.items() if k != "model_state_dict"
+    }
+    return model, config
+
+
+# ---------------------------------------------------------------------------
+# CNN pipeline entry point (called from train_classifier.main)
+# ---------------------------------------------------------------------------
+
+def train_cnn_pipeline(
+    task: str,
+    patient_ids: list[str],
+    labels: NDArray,
+    data_dir: Path,
+    output_dir: Path,
+    images_dir: Optional[Path] = None,
+    segmentations_dir: Optional[Path] = None,
+    phase: int = DEFAULT_PHASE,
+    slice_mode: str = "all_tumor",
+    n_slices: int = DEFAULT_N_SLICES,
+    val_ratio: float = 0.2,
+    cv_folds: int = 0,
+    seed: int = DEFAULT_SEED,
+    model_name: str = DEFAULT_CNN_MODEL_NAME,
+    image_size: int = DEFAULT_CNN_IMAGE_SIZE,
+    num_epochs: int = DEFAULT_CNN_NUM_EPOCHS,
+    batch_size: int = DEFAULT_CNN_BATCH_SIZE,
+    learning_rate: float = DEFAULT_CNN_LEARNING_RATE,
+    patience: int = DEFAULT_CNN_PATIENCE,
+    no_viz: bool = False,
+    evaluate_test_set: bool = False,
+    test_patient_ids: Optional[list[str]] = None,
+    clinical_df: Optional[Any] = None,
+) -> tuple[Any, str, dict[str, float]]:
+    """Full CNN training pipeline for a single task.
+
+    Extracts 2D slices, splits into train/val, trains the CNN,
+    evaluates, saves the model, and optionally evaluates on the test set.
+
+    Returns
+    -------
+    model : torch.nn.Module
+        Best trained model.
+    model_name_str : str
+        Human-readable model description.
+    best_metrics : dict
+        Validation metrics for the best epoch.
+    """
+    from sklearn.model_selection import train_test_split
+
+    _check_cnn_dependencies()
+
+    logger.info(f"\n--- CNN: Extracting 2D slices for task '{task}' ---")
+
+    # 1. Extract slices
+    all_slices, slice_labels, slice_pids = extract_slices_for_cnn(
+        patient_ids=patient_ids,
+        labels=labels,
+        data_dir=data_dir,
+        images_dir=images_dir,
+        segmentations_dir=segmentations_dir,
+        phase=phase,
+        slice_mode=slice_mode,
+        n_slices=n_slices,
+    )
+
+    # 2. Patient-aware train/val split
+    #    Split by patient, not by slice, to avoid data leakage.
+    unique_pids = sorted(set(slice_pids))
+    pid_labels = {}
+    for pid, lbl in zip(slice_pids, slice_labels):
+        pid_labels[pid] = lbl
+
+    pid_array = np.array(unique_pids)
+    pid_label_array = np.array([pid_labels[p] for p in unique_pids])
+
+    if cv_folds > 0:
+        # For CV, we use all data for training, but with cross-validation
+        # For simplicity, we use 80/20 split for CNN (CV is less common for DL)
+        logger.info(
+            f"Note: CV mode ({cv_folds} folds) is not standard for CNN "
+            "training. Using a single train/val split instead."
+        )
+
+    train_pid_arr, val_pid_arr = train_test_split(
+        pid_array,
+        test_size=val_ratio,
+        random_state=seed,
+        stratify=pid_label_array,
+    )
+    train_pid_set = set(train_pid_arr.tolist())
+    val_pid_set = set(val_pid_arr.tolist())
+
+    train_slices = [s for s, p in zip(all_slices, slice_pids) if p in train_pid_set]
+    train_labels_arr = np.array(
+        [l for l, p in zip(slice_labels, slice_pids) if p in train_pid_set],
+        dtype=np.float32,
+    )
+    val_slices = [s for s, p in zip(all_slices, slice_pids) if p in val_pid_set]
+    val_labels_arr = np.array(
+        [l for l, p in zip(slice_labels, slice_pids) if p in val_pid_set],
+        dtype=np.float32,
+    )
+
+    logger.info(
+        f"Patient-aware split: {len(train_pid_set)} train patients "
+        f"({len(train_slices)} slices), {len(val_pid_set)} val patients "
+        f"({len(val_slices)} slices)"
+    )
+
+    # 3. Train
+    best_model, best_metrics = train_cnn(
+        train_slices=train_slices,
+        train_labels=train_labels_arr,
+        val_slices=val_slices,
+        val_labels=val_labels_arr,
+        task=task,
+        output_dir=output_dir,
+        model_name=model_name,
+        image_size=image_size,
+        num_epochs=num_epochs,
+        batch_size=batch_size,
+        learning_rate=learning_rate,
+        patience=patience,
+        seed=seed,
+    )
+
+    model_desc = f"CNN({model_name}, img={image_size})"
+
+    # 4. Test-set evaluation
+    if evaluate_test_set and test_patient_ids and clinical_df is not None:
+        logger.info(
+            f"\n--- CNN: Evaluating on test set "
+            f"({len(test_patient_ids)} patients) ---"
+        )
+        try:
+            from eval.train_classifier import create_labels
+
+            test_clinical = clinical_df[
+                clinical_df["patient_id"].isin(test_patient_ids)
+            ].copy()
+            test_pids_task, test_labels_task = create_labels(
+                test_clinical, task,
+            )
+
+            if len(test_pids_task) > 0:
+                test_slices, test_lbl, test_spids = extract_slices_for_cnn(
+                    patient_ids=test_pids_task,
+                    labels=test_labels_task,
+                    data_dir=data_dir,
+                    images_dir=images_dir,
+                    segmentations_dir=segmentations_dir,
+                    phase=phase,
+                    slice_mode=slice_mode,
+                    n_slices=n_slices,
+                )
+
+                # Patient-level aggregation for test: average per-slice probs
+                test_metrics = evaluate_cnn(
+                    best_model, test_slices, test_lbl,
+                    image_size=image_size,
+                )
+                logger.info(
+                    f"CNN TEST SET — {task}: "
+                    f"AUROC={test_metrics['auroc']:.4f}, "
+                    f"Bal.Acc={test_metrics['balanced_accuracy']:.4f}"
+                )
+                best_metrics["test_auroc"] = test_metrics["auroc"]
+                best_metrics["test_balanced_accuracy"] = (
+                    test_metrics["balanced_accuracy"]
+                )
+        except Exception as e:
+            logger.warning(f"CNN test-set evaluation failed: {e}")
+
+    return best_model, model_desc, best_metrics

@@ -603,19 +603,98 @@ class MamaSynthEval:
             ("luminal", y_luminal, METRIC_AUROC_LUMINAL),
             ("tnbc", y_tnbc, METRIC_AUROC_TNBC),
         ]:
-            model_path = None
+            # Check for CNN model first, then radiomics .pkl
+            cnn_model_path = None
+            pkl_model_path = None
             if self.clf_model_dir and self.clf_model_dir.exists():
-                candidate = self.clf_model_dir / f"{task}_classifier.pkl"
-                if candidate.exists():
-                    model_path = candidate
+                cnn_candidate = (
+                    self.clf_model_dir / f"{task}_classifier_cnn.pt"
+                )
+                pkl_candidate = (
+                    self.clf_model_dir / f"{task}_classifier.pkl"
+                )
+                if cnn_candidate.exists():
+                    cnn_model_path = cnn_candidate
+                if pkl_candidate.exists():
+                    pkl_model_path = pkl_candidate
 
-            if model_path:
-                clf = RadiomicsClassifier(task=task, model_path=model_path)
+            if cnn_model_path:
+                # CNN classifier — works on raw images, not features
+                try:
+                    from eval.classification import CNNClassifier
+
+                    cnn_clf = CNNClassifier(
+                        task=task, model_path=cnn_model_path,
+                    )
+                    # Collect raw images and optional masks
+                    cnn_images: list[NDArray] = []
+                    cnn_masks: list[Optional[NDArray]] = []
+                    cnn_y: list[int] = []
+
+                    for _, pred_path in pairs:
+                        stem = self._get_stem(pred_path)
+                        if stem not in labels:
+                            continue
+                        img = self._load_image(pred_path).astype(np.float64)
+                        cnn_images.append(img)
+                        # Try to load mask for better slice selection
+                        mask_arr: Optional[NDArray] = None
+                        if self.masks_path and self.masks_path.exists():
+                            for ext in (".nii.gz", ".nii", ".mha"):
+                                mp = self.masks_path / f"{stem}{ext}"
+                                if mp.exists():
+                                    mask_arr = sitk.GetArrayFromImage(
+                                        sitk.ReadImage(str(mp), sitk.sitkUInt8)
+                                    ).astype(bool)
+                                    break
+                        cnn_masks.append(mask_arr)
+                        cnn_y.append(
+                            labels[stem].get(task, 0)
+                        )
+
+                    if len(cnn_images) >= 2:
+                        y_score = cnn_clf.predict_proba_from_images(
+                            cnn_images, cnn_masks,
+                        )
+                        _y_true_cnn = np.array(cnn_y, dtype=np.int64)
+                        clf_result = evaluate_classification(
+                            _y_true_cnn, y_score,
+                        )
+                        agg[metric_key] = clf_result["auroc"]
+                        detail[f"auroc_{task}"] = clf_result["auroc"]
+                        detail[f"balanced_accuracy_{task}"] = (
+                            clf_result["balanced_accuracy"]
+                        )
+                        detail[f"classifier_type_{task}"] = "cnn"
+                except ImportError:
+                    logger.warning(
+                        f"CNN classifier found for {task} but dependencies "
+                        "unavailable. Falling back to radiomics."
+                    )
+                    # Fall through to radiomics below
+                    if pkl_model_path:
+                        clf = RadiomicsClassifier(
+                            task=task, model_path=pkl_model_path,
+                        )
+                        y_score = clf.predict_proba(feature_matrix)
+                        clf_result = evaluate_classification(y_true, y_score)
+                        agg[metric_key] = clf_result["auroc"]
+                        detail[f"auroc_{task}"] = clf_result["auroc"]
+                        detail[f"balanced_accuracy_{task}"] = (
+                            clf_result["balanced_accuracy"]
+                        )
+
+            elif pkl_model_path:
+                clf = RadiomicsClassifier(
+                    task=task, model_path=pkl_model_path,
+                )
                 y_score = clf.predict_proba(feature_matrix)
                 clf_result = evaluate_classification(y_true, y_score)
                 agg[metric_key] = clf_result["auroc"]
                 detail[f"auroc_{task}"] = clf_result["auroc"]
-                detail[f"balanced_accuracy_{task}"] = clf_result["balanced_accuracy"]
+                detail[f"balanced_accuracy_{task}"] = (
+                    clf_result["balanced_accuracy"]
+                )
             else:
                 detail[f"note_{task}"] = (
                     f"No pre-trained {task} classifier found. "

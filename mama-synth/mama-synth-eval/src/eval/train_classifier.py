@@ -1339,6 +1339,58 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         ),
     )
 
+    # Classifier type
+    parser.add_argument(
+        "--classifier-type",
+        type=str,
+        choices=["radiomics", "cnn"],
+        default="radiomics",
+        help=(
+            "Type of classifier to train. 'radiomics' (default) trains "
+            "sklearn-based models on radiomic features. 'cnn' trains an "
+            "EfficientNet deep learning classifier on raw 2D slices. "
+            "CNN mode auto-defaults --slice-mode to 'all_tumor'."
+        ),
+    )
+
+    # CNN-specific arguments
+    parser.add_argument(
+        "--cnn-model",
+        type=str,
+        default="efficientnet_b0",
+        help="CNN model architecture (timm identifier). Default: efficientnet_b0.",
+    )
+    parser.add_argument(
+        "--cnn-image-size",
+        type=int,
+        default=224,
+        help="CNN input image size (pixels, squared). Default: 224.",
+    )
+    parser.add_argument(
+        "--cnn-epochs",
+        type=int,
+        default=50,
+        help="Maximum CNN training epochs. Default: 50.",
+    )
+    parser.add_argument(
+        "--cnn-batch-size",
+        type=int,
+        default=32,
+        help="CNN mini-batch size. Default: 32.",
+    )
+    parser.add_argument(
+        "--cnn-lr",
+        type=float,
+        default=1e-4,
+        help="CNN peak learning rate. Default: 1e-4.",
+    )
+    parser.add_argument(
+        "--cnn-patience",
+        type=int,
+        default=10,
+        help="CNN early stopping patience (epochs). Default: 10.",
+    )
+
     # Visualisation
     parser.add_argument(
         "--no-viz",
@@ -1388,6 +1440,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     logger.info("=" * 60)
     logger.info(f"Data directory:   {args.data_dir}")
     logger.info(f"Output directory: {args.output_dir}")
+    logger.info(f"Classifier type:  {args.classifier_type}")
     logger.info(f"Tasks:            {args.tasks}")
     logger.info(f"MRI phase:        {args.phase}")
     logger.info(f"Val ratio:        {args.val_ratio}")
@@ -1399,6 +1452,18 @@ def main(argv: Optional[list[str]] = None) -> None:
             logger.info(f"Num slices:       {args.n_slices}")
     else:
         logger.info("Slice mode:       3D (full volume)")
+    if args.classifier_type == "cnn":
+        logger.info(f"CNN model:        {args.cnn_model}")
+        logger.info(f"CNN image size:   {args.cnn_image_size}")
+        logger.info(f"CNN epochs:       {args.cnn_epochs}")
+        logger.info(f"CNN batch size:   {args.cnn_batch_size}")
+        logger.info(f"CNN LR:           {args.cnn_lr}")
+        # Auto-default slice mode to all_tumor for CNN
+        if args.slice_mode is None:
+            args.slice_mode = SliceMode.ALL_TUMOR.value
+            logger.info(
+                "Slice mode auto-set to 'all_tumor' for CNN training."
+            )
     if args.evaluate_test_set:
         logger.info("Test-set eval:    ENABLED")
     if n_cases_limit is not None:
@@ -1456,6 +1521,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     report: dict[str, Any] = {
         "data_dir": str(args.data_dir),
         "output_dir": str(args.output_dir),
+        "classifier_type": args.classifier_type,
         "phase": args.phase,
         "val_ratio": args.val_ratio,
         "cv_folds": args.cv_folds,
@@ -1500,7 +1566,55 @@ def main(argv: Optional[list[str]] = None) -> None:
             patient_ids = patient_ids[:n_cases_limit]
             labels = labels[:n_cases_limit]
 
-        # 2b. Extract features
+        # ---- CNN branch --------------------------------------------------
+        if args.classifier_type == "cnn":
+            from eval.train_cnn_classifier import train_cnn_pipeline
+
+            cnn_model, cnn_name, cnn_metrics = train_cnn_pipeline(
+                task=task,
+                patient_ids=patient_ids,
+                labels=labels,
+                data_dir=args.data_dir,
+                output_dir=args.output_dir,
+                images_dir=args.images_dir,
+                segmentations_dir=args.segmentations_dir,
+                phase=args.phase,
+                slice_mode=args.slice_mode or "all_tumor",
+                n_slices=args.n_slices,
+                val_ratio=args.val_ratio,
+                cv_folds=args.cv_folds,
+                seed=args.seed,
+                model_name=args.cnn_model,
+                image_size=args.cnn_image_size,
+                num_epochs=args.cnn_epochs,
+                batch_size=args.cnn_batch_size,
+                learning_rate=args.cnn_lr,
+                patience=args.cnn_patience,
+                no_viz=args.no_viz,
+                evaluate_test_set=(
+                    args.evaluate_test_set and bool(test_patient_ids_global)
+                ),
+                test_patient_ids=test_patient_ids_global or None,
+                clinical_df=clinical_df,
+            )
+
+            task_elapsed = time.time() - task_start
+            report["tasks"][task] = {
+                "classifier_type": "cnn",
+                "best_model": cnn_name,
+                "val_metrics": cnn_metrics,
+                "n_patients": len(patient_ids),
+                "model_path": str(
+                    args.output_dir
+                    / f"{task}_classifier_cnn.pt"
+                ),
+                "elapsed_seconds": round(task_elapsed, 1),
+            }
+            logger.info(f"Task '{task}' (CNN) completed in {task_elapsed:.1f}s")
+            continue
+        # ---- End CNN branch ----------------------------------------------
+
+        # 2b. Extract features (radiomics path)
         logger.info("\n--- Step 3: Extracting radiomic features ---")
         feature_matrix, valid_pids, valid_indices = extract_features_for_patients(
             patient_ids=patient_ids,

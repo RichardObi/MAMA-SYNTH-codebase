@@ -15,6 +15,15 @@ The MAMA-SYNTH challenge evaluates generative models that translate pre-contrast
 
 Rankings use **Borda-style hierarchical rank aggregation** with tie-break priority: ROI → CLF → SEG → FULL.
 
+## What's New in v0.6.0
+
+- **EfficientNet CNN classifier** — `--classifier-type cnn` trains an EfficientNet-B0 deep learning classifier as a higher-capacity alternative to the radiomics-based models (~0.6 AUROC). Includes ImageNet pre-training, cosine LR scheduling, class-weighted loss, early stopping, and gradient clipping.
+- **Synthesis pipeline** — two new CLI commands (`mamasynth-synthesize` and `mamasynth-synthesize-and-evaluate`) wrap medigan's Pix2PixHD model for one-command synthesis and evaluation. Participants can also point `--predictions-dir` at their own model outputs.
+- **New optional extras** — `[cnn]` (torch + timm), `[synthesis]` (medigan), `[full]` (everything)
+- **Improved radiomics classifiers** — all models now use `Pipeline(StandardScaler → VarianceThreshold → Classifier)` with class-balanced weights; added Logistic Regression (4 configs) and SVM-RBF (3 configs) alongside XGBoost and Random Forest (13 total configs)
+- **Radiomics feature caching improvements** — `all_tumor` mode now caches correctly; added `--clear-cache` CLI flag and `allow_pickle=False` security
+- **282 tests** — 36 new tests for CNN training, synthesis pipeline, and CLI integration
+
 ## What's New in v0.5.0
 
 - **2D slice extraction** — `slice_extraction.py` with `SliceMode.MAX_TUMOR`, `CENTER_TUMOR`, `MULTI_SLICE`, `ALL_TUMOR`, and `MIDDLE` strategies for automated 2D slice extraction from 3D NIfTI volumes, with z-score normalisation
@@ -83,6 +92,9 @@ pip install "eval[segmentation]"      # nnUNet segmentation
 pip install "eval[viz]"               # Visualization (matplotlib + plotly)
 pip install "eval[web]"               # Web interface (streamlit)
 pip install "eval[progress]"          # tqdm progress bars
+pip install "eval[cnn]"              # CNN classifier (torch + timm)
+pip install "eval[synthesis]"         # Synthesis pipeline (medigan)
+pip install "eval[full]"              # All dependencies
 ```
 
 ### From source (development)
@@ -365,6 +377,14 @@ mamasia-train \
 | `--no-viz` | `false` | Skip generation of visualisation artefacts |
 | `--quick-test` | `false` | Quick validation run with 10 cases per task |
 | `--n-cases` | `None` | Limit training to first N cases per task |
+| `--clear-cache` | `false` | Delete cached features before training |
+| `--classifier-type` | `radiomics` | Classifier backend: `radiomics` or `cnn` |
+| `--cnn-model` | `efficientnet_b0` | timm model name (CNN mode only) |
+| `--cnn-image-size` | `224` | Input image size in pixels (CNN mode only) |
+| `--cnn-epochs` | `50` | Maximum training epochs (CNN mode only) |
+| `--cnn-batch-size` | `32` | Batch size (CNN mode only) |
+| `--cnn-lr` | `1e-4` | Initial learning rate (CNN mode only) |
+| `--cnn-patience` | `10` | Early-stopping patience in epochs (CNN mode only) |
 | `-v, --verbose` | `false` | Verbose logging |
 
 ### Training Modes
@@ -409,6 +429,29 @@ python -m eval.train_classifier \
     --output-dir ./models \
     --slice-mode all_tumor
 ```
+
+**CNN classifier** (EfficientNet): Train a deep learning classifier instead of the radiomics-based models. Automatically defaults to `all_tumor` slice mode.
+
+```bash
+# Train an EfficientNet-B0 CNN classifier
+mamasia-train \
+    --data-dir /path/to/mama-mia-dataset \
+    --output-dir ./models \
+    --classifier-type cnn
+
+# Customise CNN hyperparameters
+mamasia-train \
+    --data-dir /path/to/mama-mia-dataset \
+    --output-dir ./models \
+    --classifier-type cnn \
+    --cnn-model efficientnet_b1 \
+    --cnn-epochs 100 \
+    --cnn-batch-size 16 \
+    --cnn-lr 5e-5 \
+    --cnn-patience 15
+```
+
+Requires the `[cnn]` extra: `pip install "eval[cnn]"`
 
 **Test-set evaluation**: Train on the MAMA-MIA training split and automatically evaluate on the test split.
 
@@ -461,8 +504,10 @@ After training, the output directory contains:
 
 ```
 trained-models/
-├── tnbc_classifier.pkl              # TNBC classifier (pickle format)
-├── luminal_classifier.pkl           # Luminal classifier (pickle format)
+├── tnbc_classifier.pkl              # TNBC classifier (radiomics mode)
+├── luminal_classifier.pkl           # Luminal classifier (radiomics mode)
+├── tnbc_classifier_cnn.pt           # TNBC classifier (CNN mode)
+├── luminal_classifier_cnn.pt        # Luminal classifier (CNN mode)
 ├── training_report.json             # Training metadata, metrics, and config
 ├── feature_cache/                   # Cached feature vectors (per patient)
 └── visualizations/
@@ -496,11 +541,15 @@ python -m eval \
 
 ### Model Selection
 
-The training pipeline tries multiple model configurations:
-- **XGBoost** (5 configs): varying `n_estimators`, `max_depth`, `learning_rate`, `subsample`
-- **Random Forest** (3 configs): varying `n_estimators`, `max_depth`, `min_samples_split`
+**Radiomics mode** (`--classifier-type radiomics`, default): The pipeline tries 13 model configurations, each wrapped in a `Pipeline(StandardScaler → VarianceThreshold → Classifier)` with class-balanced weights:
+- **XGBoost** (3 configs): varying `n_estimators`, `max_depth`, `learning_rate`, `scale_pos_weight`
+- **Random Forest** (3 configs): varying `n_estimators`, `max_depth`, `class_weight=balanced`
+- **Logistic Regression** (4 configs): L1/L2 regularisation with `class_weight=balanced`
+- **SVM-RBF** (3 configs): varying `C` and `gamma`, probability calibration, `class_weight=balanced`
 
-If XGBoost is not installed, only Random Forest configurations are tried. The best model is selected by validation AUROC (holdout) or mean cross-validation AUROC.
+If XGBoost is not installed, only the remaining configurations are tried. The best model is selected by validation AUROC (holdout) or mean cross-validation AUROC.
+
+**CNN mode** (`--classifier-type cnn`): Trains an EfficientNet-B0 (or other timm model) end-to-end on 2D MRI slices. Uses AdamW optimiser with linear warmup + cosine decay, BCEWithLogitsLoss with class-weighted `pos_weight`, gradient clipping, and early stopping on validation AUROC. The trained model is saved as a `.pt` checkpoint.
 
 ### Feature Extraction
 
@@ -514,6 +563,82 @@ python -m eval.train_classifier \
     --output-dir ./models \
     --cache-dir ./feature-cache
 ```
+
+## Synthesis Pipeline
+
+Generate post-contrast DCE-MRI images from pre-contrast inputs using medigan's Pix2PixHD baseline model, and optionally evaluate the results in a single command.
+
+### Prerequisites
+
+```bash
+pip install "eval[synthesis]"  # Installs medigan
+```
+
+### Synthesize Only
+
+```bash
+# Generate post-contrast images from MAMA-MIA pre-contrast data
+mamasynth-synthesize \
+    --data-dir /path/to/mama-mia-dataset \
+    --output-dir ./synthesized_images
+
+# Or specify input directory explicitly
+mamasynth-synthesize \
+    --input-dir /path/to/pre-contrast-images \
+    --output-dir ./synthesized_images
+```
+
+### Synthesize and Evaluate (One Command)
+
+```bash
+# Full pipeline: synthesize + evaluate
+mamasynth-synthesize-and-evaluate \
+    --data-dir /path/to/mama-mia-dataset \
+    --output-dir ./synthesized_images \
+    --output-file metrics.json
+
+# Skip synthesis and evaluate existing predictions
+mamasynth-synthesize-and-evaluate \
+    --predictions-dir ./my_model_outputs \
+    --ground-truth-path /path/to/ground-truth \
+    --output-file metrics.json \
+    --masks-path /path/to/masks \
+    --labels-path /path/to/labels.csv \
+    --clf-model-dir /path/to/classifiers
+```
+
+### Using Your Own Model
+
+Participants can skip the built-in synthesis and point directly at their own model outputs:
+
+```bash
+# Just evaluate your own predictions
+mamasynth-synthesize-and-evaluate \
+    --predictions-dir /path/to/your-predictions \
+    --ground-truth-path /path/to/ground-truth \
+    --masks-path /path/to/masks \
+    --labels-path /path/to/labels.csv \
+    --output-file metrics.json
+```
+
+### Synthesis CLI Options
+
+| Flag | Default | Description |
+|---|---|---|
+| `--data-dir` | `None` | MAMA-MIA dataset root (auto-resolves images/GT paths) |
+| `--input-dir` | `None` | Directory with pre-contrast images (overrides `--data-dir`) |
+| `--output-dir` | `./synthesized_output` | Where to save generated images |
+| `--model` | `pix2pixhd` | Synthesis model name |
+| `--model-id` | `23` | medigan model ID |
+| `--phase` | `0` | DCE-MRI phase of input images (0=pre-contrast) |
+| `--predictions-dir` | `None` | Skip synthesis, evaluate existing predictions |
+| `--ground-truth-path` | `None` | Ground-truth directory for evaluation |
+| `--output-file` | `metrics.json` | Evaluation output JSON path |
+| `--masks-path` | `None` | Tumor masks directory |
+| `--labels-path` | `None` | Molecular subtype labels (JSON/CSV) |
+| `--clf-model-dir` | `None` | Pre-trained classifier directory |
+| `--seg-model-path` | `None` | Pre-trained nnUNet model directory |
+| `--skip-synthesis` | `false` | Skip synthesis step in combined command |
 
 ## Docker
 
@@ -577,22 +702,24 @@ mypy src/
 ```
 mama-synth-eval
 ├── src/eval/
-│   ├── __init__.py              # Package exports (v0.5.0)
+│   ├── __init__.py              # Package exports (v0.6.0)
 │   ├── __main__.py              # CLI entry point
 │   ├── evaluation.py            # Main evaluation pipeline (MamaSynthEval, DatasetNormalizer)
 │   ├── metrics.py               # Image-to-image & segmentation metrics
 │   ├── frd.py                   # Fréchet Radiomics Distance (batch, cached)
-│   ├── classification.py        # Molecular subtype classification
+│   ├── classification.py        # Molecular subtype classification (RadiomicsClassifier, CNNClassifier)
 │   ├── train_classifier.py      # Classifier training on MAMA-MIA dataset
+│   ├── train_cnn_classifier.py  # EfficientNet CNN training pipeline
 │   ├── slice_extraction.py      # 2D slice extraction from 3D NIfTI volumes
 │   ├── training_visualization.py # Confusion matrix, ROC, PR, dashboards
 │   ├── segmentation.py          # Tumor segmentation (ThresholdSegmenter, NNUNetSegmenter)
 │   ├── roi_utils.py             # Tumor ROI extraction & mask dilation
 │   ├── ranking.py               # Borda-style rank aggregation
 │   ├── visualization.py         # Result visualization (tables, charts, overlays)
+│   ├── synthesize.py            # Synthesis pipeline (medigan wrapper + CLI)
 │   ├── webapp.py                # Streamlit web interface
 │   └── generate_test_data.py    # Artificial test data generator
-├── tests/                       # 200+ tests (unit + integration + E2E)
+├── tests/                       # 280+ tests (unit + integration + E2E)
 │   ├── conftest.py              # Shared fixtures
 │   ├── test_evaluation.py       # Evaluation & normalizer tests
 │   ├── test_metrics.py          # Metric tests
@@ -603,6 +730,8 @@ mama-synth-eval
 │   ├── test_ranking.py          # Ranking tests
 │   ├── test_e2e.py              # End-to-end integration tests
 │   ├── test_train_classifier.py # Classifier training tests
+│   ├── test_train_cnn_classifier.py # CNN classifier training tests
+│   ├── test_synthesize.py       # Synthesis pipeline tests
 │   ├── test_slice_extraction.py # 2D slice extraction tests
 │   └── test_training_visualization.py # Training visualisation tests
 ├── PDF_ANALYSIS.md              # Contradictions & uncertainties analysis
