@@ -1,4 +1,4 @@
-#  Copyright 2025 mama-sia-eval contributors
+#  Copyright 2025 mama-synth-eval contributors
 #
 #  Licensed under the Apache License, Version 2.0 (the "License");
 #  you may not use this file except in compliance with the License.
@@ -12,7 +12,7 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
-"""Unit tests for the MamaSiaEval evaluation class."""
+"""Unit tests for the MamaSynthEval evaluation class."""
 
 import json
 from pathlib import Path
@@ -21,8 +21,8 @@ import numpy as np
 import pytest
 import SimpleITK as sitk
 
-from mama_sia_eval.evaluation import (
-    MamaSiaEval,
+from eval.evaluation import (
+    MamaSynthEval,
     DatasetNormalizer,
     normalize_intensity,
     METRIC_MSE_FULL,
@@ -59,8 +59,8 @@ class TestNormalizeIntensity:
         assert np.allclose(normed, 0.0)
 
 
-class TestMamaSiaEval:
-    """Tests for the MamaSiaEval class."""
+class TestMamaSynthEval:
+    """Tests for the MamaSynthEval class."""
 
     def test_evaluate_identical_images(self, temp_dirs) -> None:
         """Evaluation should return perfect scores for identical images."""
@@ -70,7 +70,7 @@ class TestMamaSiaEval:
         create_test_image(gt_dir / "case001.nii.gz", shape, value=100.0)
         create_test_image(pred_dir / "case001.nii.gz", shape, value=100.0)
 
-        evaluator = MamaSiaEval(
+        evaluator = MamaSynthEval(
             ground_truth_path=gt_dir,
             predictions_path=pred_dir,
             output_file=output_file,
@@ -106,7 +106,7 @@ class TestMamaSiaEval:
             create_test_image(gt_dir / f"case{i:03d}.nii.gz", shape, value=50.0)
             create_test_image(pred_dir / f"case{i:03d}.nii.gz", shape, value=50.0)
 
-        evaluator = MamaSiaEval(
+        evaluator = MamaSynthEval(
             ground_truth_path=gt_dir,
             predictions_path=pred_dir,
             output_file=output_file,
@@ -129,7 +129,7 @@ class TestMamaSiaEval:
         create_test_image(gt_dir / "case002.nii.gz", shape)
         create_test_image(pred_dir / "case001.nii.gz", shape)
 
-        evaluator = MamaSiaEval(
+        evaluator = MamaSynthEval(
             ground_truth_path=gt_dir,
             predictions_path=pred_dir,
             output_file=output_file,
@@ -156,7 +156,7 @@ class TestMamaSiaEval:
         create_test_image(gt_dir / "test.nii.gz", (5, 16, 16))
         create_test_image(pred_dir / "test.nii.gz", (5, 16, 16))
 
-        evaluator = MamaSiaEval(
+        evaluator = MamaSynthEval(
             ground_truth_path=gt_dir,
             predictions_path=pred_dir,
             output_file=output_file,
@@ -178,7 +178,7 @@ class TestMamaSiaEval:
         assert "cases" in data
 
     def test_nonexistent_gt_path_raises(self, tmp_path: Path) -> None:
-        evaluator = MamaSiaEval(
+        evaluator = MamaSynthEval(
             ground_truth_path=tmp_path / "nonexistent",
             predictions_path=tmp_path,
             output_file=tmp_path / "metrics.json",
@@ -188,7 +188,7 @@ class TestMamaSiaEval:
 
     def test_nonexistent_pred_path_raises(self, temp_dirs) -> None:
         gt_dir, _, _, output_file = temp_dirs
-        evaluator = MamaSiaEval(
+        evaluator = MamaSynthEval(
             ground_truth_path=gt_dir,
             predictions_path=gt_dir.parent / "nonexistent",
             output_file=output_file,
@@ -202,7 +202,7 @@ class TestMamaSiaEval:
         create_test_image(gt_dir / "case001.nii.gz", (5, 16, 16))
         create_test_image(pred_dir / "other_case.nii.gz", (5, 16, 16))
 
-        evaluator = MamaSiaEval(
+        evaluator = MamaSynthEval(
             ground_truth_path=gt_dir,
             predictions_path=pred_dir,
             output_file=output_file,
@@ -217,7 +217,7 @@ class TestMamaSiaEval:
         create_test_image(gt_dir / "case001.mha", shape)
         create_test_image(pred_dir / "case001.mha", shape)
 
-        evaluator = MamaSiaEval(
+        evaluator = MamaSynthEval(
             ground_truth_path=gt_dir,
             predictions_path=pred_dir,
             output_file=output_file,
@@ -233,7 +233,7 @@ class TestMamaSiaEval:
         """Full-image MSE should be present in results and GC aggregates."""
         gt_dir, pred_dir, _, output_file = populated_dirs
 
-        evaluator = MamaSiaEval(
+        evaluator = MamaSynthEval(
             ground_truth_path=gt_dir,
             predictions_path=pred_dir,
             output_file=output_file,
@@ -256,7 +256,7 @@ class TestMamaSiaEval:
         """ROI metrics (SSIM) should be computed when masks are provided."""
         gt_dir, pred_dir, masks_dir, output_file = populated_dirs
 
-        evaluator = MamaSiaEval(
+        evaluator = MamaSynthEval(
             ground_truth_path=gt_dir,
             predictions_path=pred_dir,
             output_file=output_file,
@@ -279,7 +279,7 @@ class TestMamaSiaEval:
         """Segmentation metrics should be computed when masks and flag are set."""
         gt_dir, pred_dir, masks_dir, output_file = populated_dirs
 
-        evaluator = MamaSiaEval(
+        evaluator = MamaSynthEval(
             ground_truth_path=gt_dir,
             predictions_path=pred_dir,
             output_file=output_file,
@@ -300,16 +300,16 @@ class TestGetStem:
     """Tests for the _get_stem static method."""
 
     def test_nii_gz(self) -> None:
-        assert MamaSiaEval._get_stem(Path("/path/to/case001.nii.gz")) == "case001"
+        assert MamaSynthEval._get_stem(Path("/path/to/case001.nii.gz")) == "case001"
 
     def test_nii(self) -> None:
-        assert MamaSiaEval._get_stem(Path("/path/to/case001.nii")) == "case001"
+        assert MamaSynthEval._get_stem(Path("/path/to/case001.nii")) == "case001"
 
     def test_mha(self) -> None:
-        assert MamaSiaEval._get_stem(Path("/path/to/case001.mha")) == "case001"
+        assert MamaSynthEval._get_stem(Path("/path/to/case001.mha")) == "case001"
 
     def test_png(self) -> None:
-        assert MamaSiaEval._get_stem(Path("/path/to/case001.png")) == "case001"
+        assert MamaSynthEval._get_stem(Path("/path/to/case001.png")) == "case001"
 
 
 class TestDatasetNormalizer:
@@ -375,7 +375,7 @@ class TestLoadLabelsCSV:
         create_test_image(gt_dir / "case001.nii.gz", (5, 16, 16))
         create_test_image(pred_dir / "case001.nii.gz", (5, 16, 16))
 
-        evaluator = MamaSiaEval(
+        evaluator = MamaSynthEval(
             ground_truth_path=gt_dir,
             predictions_path=pred_dir,
             output_file=output_file,

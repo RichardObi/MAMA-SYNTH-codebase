@@ -1,4 +1,4 @@
-#  Copyright 2025 mama-sia-eval contributors
+#  Copyright 2025 mama-synth-eval contributors
 #
 #  Licensed under the Apache License, Version 2.0 (the "License");
 #  you may not use this file except in compliance with the License.
@@ -26,7 +26,7 @@ Usage
 -----
 Single-command training::
 
-    python -m mama_sia_eval.train_classifier \\
+    python -m eval.train_classifier \\
         --data-dir /path/to/mama_mia_dataset \\
         --output-dir /path/to/trained_models
 
@@ -50,7 +50,7 @@ Output::
 
 The output .pkl files are directly usable by the evaluation pipeline::
 
-    mamasia-eval --clf-model-dir /path/to/trained_models ...
+    eval --clf-model-dir /path/to/trained_models ...
 
 Reference: MAMA-SYNTH Challenge, Classification assessment.
 """
@@ -69,7 +69,7 @@ from numpy.typing import NDArray
 from sklearn.metrics import balanced_accuracy_score, roc_auc_score
 from sklearn.model_selection import StratifiedKFold, train_test_split
 
-from mama_sia_eval.slice_extraction import SliceMode, extract_2d_slice, extract_multi_slices
+from eval.slice_extraction import SliceMode, extract_2d_slice, extract_multi_slices
 
 logger = logging.getLogger(__name__)
 
@@ -472,7 +472,7 @@ def extract_features_for_patients(
             - valid_patient_ids: Patient IDs that were successfully processed.
             - valid_indices: Original indices of valid patients.
     """
-    from mama_sia_eval.frd import (
+    from eval.frd import (
         FRD_DEFAULT_BIN_WIDTH,
         FRD_FEATURE_CLASSES,
         extract_radiomic_features,
@@ -986,17 +986,17 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         description=(
             "Train TNBC and luminal molecular subtype classifiers on the "
             "MAMA-MIA dataset. Trained models are compatible with the "
-            "mama-sia-eval evaluation pipeline."
+            "mama-synth-eval evaluation pipeline."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Example:\n"
-            "  python -m mama_sia_eval.train_classifier \\\n"
+            "  python -m eval.train_classifier \\\n"
             "      --data-dir /datasets/mama_mia_dataset \\\n"
             "      --output-dir ./trained_models\n"
             "\n"
             "After training, the models can be used for evaluation:\n"
-            "  mamasia-eval --clf-model-dir ./trained_models ...\n"
+            "  eval --clf-model-dir ./trained_models ...\n"
         ),
     )
 
@@ -1363,7 +1363,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         if not args.no_viz:
             logger.info("\n--- Step 5b: Generating validation visualisations ---")
             try:
-                from mama_sia_eval.training_visualization import TrainingVisualizer
+                from eval.training_visualization import TrainingVisualizer
                 viz = TrainingVisualizer(output_dir=viz_dir / task)
 
                 # Compute predictions on validation set (or full set for CV)

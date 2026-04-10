@@ -1,4 +1,4 @@
-#  Copyright 2025 mama-sia-eval contributors
+#  Copyright 2025 mama-synth-eval contributors
 #
 #  Licensed under the Apache License, Version 2.0 (the "License");
 #  you may not use this file except in compliance with the License.
@@ -25,7 +25,7 @@ Generates publication-quality plots for classifier evaluation:
 
 Usage::
 
-    from mama_sia_eval.training_visualization import TrainingVisualizer
+    from eval.training_visualization import TrainingVisualizer
 
     viz = TrainingVisualizer(output_dir="./training_reports")
     viz.confusion_matrix(y_true, y_pred, task="tnbc")

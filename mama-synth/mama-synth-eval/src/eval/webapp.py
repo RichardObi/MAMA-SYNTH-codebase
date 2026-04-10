@@ -1,4 +1,4 @@
-#  Copyright 2025 mama-sia-eval contributors
+#  Copyright 2025 mama-synth-eval contributors
 #  Licensed under the Apache License, Version 2.0
 
 """
@@ -6,11 +6,11 @@ Streamlit-based web interface for the MAMA-SYNTH evaluation pipeline.
 
 Launch with::
 
-    streamlit run src/mama_sia_eval/webapp.py
+    streamlit run src/eval/webapp.py
 
 Or from the package::
 
-    python -m mama_sia_eval.webapp
+    python -m eval.webapp
 
 The interface allows participants to:
   1. Upload ground-truth and prediction directories (or select paths).
@@ -45,7 +45,7 @@ def _check_streamlit() -> None:
         print(
             "The web interface requires Streamlit.\n"
             "Install it with:  pip install streamlit plotly\n"
-            "Then run:  streamlit run src/mama_sia_eval/webapp.py",
+            "Then run:  streamlit run src/eval/webapp.py",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -148,11 +148,11 @@ def main() -> None:
     # Run evaluation
     with st.spinner("Running evaluation pipeline\u2026"):
         try:
-            from mama_sia_eval.evaluation import MamaSiaEval
+            from eval.evaluation import MamaSynthEval
 
             with tempfile.TemporaryDirectory() as tmpdir:
                 out_file = Path(tmpdir) / "metrics.json"
-                evaluator = MamaSiaEval(
+                evaluator = MamaSynthEval(
                     ground_truth_path=gt,
                     predictions_path=pred,
                     output_file=out_file,

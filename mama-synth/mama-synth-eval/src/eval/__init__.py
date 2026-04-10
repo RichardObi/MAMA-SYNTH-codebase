@@ -1,4 +1,4 @@
-#  Copyright 2025 mama-sia-eval contributors
+#  Copyright 2025 mama-synth-eval contributors
 #
 #  Licensed under the Apache License, Version 2.0 (the "License");
 #  you may not use this file except in compliance with the License.
@@ -13,7 +13,7 @@
 #  limitations under the License.
 
 """
-mama-sia-eval: Evaluation suite for the MAMA-SYNTH challenge.
+mama-synth-eval: Evaluation suite for the MAMA-SYNTH challenge.
 
 Pre- to post-contrast translation evaluation for breast DCE-MRI with
 8 equally-weighted metrics across four tasks: full-image comparison
@@ -21,7 +21,7 @@ Pre- to post-contrast translation evaluation for breast DCE-MRI with
 and segmentation (Dice, HD95).
 """
 
-from mama_sia_eval.evaluation import (
+from eval.evaluation import (
     DatasetNormalizer,
     METRIC_AUROC_LUMINAL,
     METRIC_AUROC_TNBC,
@@ -31,10 +31,10 @@ from mama_sia_eval.evaluation import (
     METRIC_LPIPS_FULL,
     METRIC_MSE_FULL,
     METRIC_SSIM_ROI,
-    MamaSiaEval,
+    MamaSynthEval,
     normalize_intensity,
 )
-from mama_sia_eval.metrics import (
+from eval.metrics import (
     compute_dice,
     compute_hd95,
     compute_mae,
@@ -44,15 +44,15 @@ from mama_sia_eval.metrics import (
     compute_psnr,
     compute_ssim,
 )
-from mama_sia_eval.slice_extraction import (
+from eval.slice_extraction import (
     SliceMode,
     extract_2d_slice,
     extract_multi_slices,
 )
-from mama_sia_eval.training_visualization import TrainingVisualizer
+from eval.training_visualization import TrainingVisualizer
 
 __all__ = [
-    "MamaSiaEval",
+    "MamaSynthEval",
     "DatasetNormalizer",
     "normalize_intensity",
     # Challenge metric name constants

@@ -3,14 +3,14 @@ requires = ["setuptools>=42.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "mama-sia-eval"
+name = "mama-synth-eval"
 version = "0.5.0"
 description = "Evaluation methods for pre- to post-contrast translation in breast DCE-MRI (8 equally-weighted metrics, Grand Challenge compatible)"
 readme = "README.md"
 license = {file = "LICENSE"}
 requires-python = ">=3.9"
 authors = [
-    {name = "mama-sia-eval contributors"}
+    {name = "mama-synth-eval contributors"}
 ]
 keywords = [
     "medical imaging",
@@ -76,10 +76,10 @@ progress = [
     "tqdm>=4.60.0",
 ]
 all = [
-    "mama-sia-eval[frd,lpips,classification,training,viz,progress]",
+    "mama-synth-eval[frd,lpips,classification,training,viz,progress]",
 ]
 dev = [
-    "mama-sia-eval[all]",
+    "mama-synth-eval[all]",
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
     "mypy>=1.0.0",
@@ -88,10 +88,10 @@ dev = [
 ]
 
 [project.urls]
-Repository = "https://github.com/RichardObi/mama-sia-eval"
+Repository = "https://github.com/RichardObi/MAMA-SYNTH-codebase"
 
 [project.scripts]
-mamasia-train = "mama_sia_eval.train_classifier:main"
+mamasia-train = "eval.train_classifier:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -135,10 +135,10 @@ ignore = [
 ]
 
 [tool.ruff.lint.isort]
-known-first-party = ["mama_sia_eval"]
+known-first-party = ["eval"]
 
 [tool.coverage.run]
-source = ["src/mama_sia_eval"]
+source = ["src/eval"]
 branch = true
 
 [tool.coverage.report]

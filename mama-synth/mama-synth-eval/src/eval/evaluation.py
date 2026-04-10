@@ -1,4 +1,4 @@
-#  Copyright 2025 mama-sia-eval contributors
+#  Copyright 2025 mama-synth-eval contributors
 #
 #  Licensed under the Apache License, Version 2.0 (the "License");
 #  you may not use this file except in compliance with the License.
@@ -67,7 +67,7 @@ import numpy as np
 import SimpleITK as sitk
 from numpy.typing import NDArray
 
-from mama_sia_eval.metrics import (
+from eval.metrics import (
     compute_mae,
     compute_mse,
     compute_ncc,
@@ -164,7 +164,7 @@ class DatasetNormalizer:
         return normalize_intensity(image, mean=self.mean, std=self.std)
 
 
-class MamaSiaEval:
+class MamaSynthEval:
     """Evaluation class for the MAMA-SYNTH challenge.
 
     Implements the full evaluation pipeline across four tasks with
@@ -391,7 +391,7 @@ class MamaSiaEval:
 
         if self.enable_lpips:
             try:
-                from mama_sia_eval.metrics import compute_lpips
+                from eval.metrics import compute_lpips
 
                 for gt, pred in tqdm(
                     list(zip(real_images, synth_images)),
@@ -419,7 +419,7 @@ class MamaSiaEval:
 
         Returns dict with 'aggregates' and 'detail' sub-keys.
         """
-        from mama_sia_eval.roi_utils import extract_roi_pair
+        from eval.roi_utils import extract_roi_pair
 
         ssim_values: list[float] = []
         real_rois: list[NDArray] = []
@@ -461,7 +461,7 @@ class MamaSiaEval:
 
         if self.enable_frd and len(real_rois) >= 2:
             try:
-                from mama_sia_eval.frd import compute_frd as _frd
+                from eval.frd import compute_frd as _frd
 
                 frd_val = _frd(real_rois, synth_rois)
                 agg[METRIC_FRD_ROI] = frd_val
@@ -484,7 +484,7 @@ class MamaSiaEval:
 
         Returns dict with 'aggregates' and 'detail' sub-keys.
         """
-        from mama_sia_eval.segmentation import (
+        from eval.segmentation import (
             ThresholdSegmenter,
             evaluate_segmentation_pair,
         )
@@ -493,7 +493,7 @@ class MamaSiaEval:
         seg_model: Any
         if self.seg_model_path and self.seg_model_path.exists():
             try:
-                from mama_sia_eval.segmentation import NNUNetSegmenter
+                from eval.segmentation import NNUNetSegmenter
 
                 seg_model = NNUNetSegmenter(model_dir=self.seg_model_path)
                 logger.info(f"Using nnUNet segmenter from {self.seg_model_path}")
@@ -555,11 +555,11 @@ class MamaSiaEval:
             return {}
 
         try:
-            from mama_sia_eval.classification import (
+            from eval.classification import (
                 RadiomicsClassifier,
                 evaluate_classification,
             )
-            from mama_sia_eval.frd import extract_radiomic_features
+            from eval.frd import extract_radiomic_features
         except ImportError:
             logger.warning("Classification dependencies unavailable, skipping.")
             return {}

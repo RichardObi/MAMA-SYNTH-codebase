@@ -1,4 +1,4 @@
-#  Copyright 2025 mama-sia-eval contributors
+#  Copyright 2025 mama-synth-eval contributors
 #
 #  Licensed under the Apache License, Version 2.0 (the "License");
 #  you may not use this file except in compliance with the License.
@@ -35,7 +35,7 @@ from typing import Optional, Protocol, Union
 import numpy as np
 from numpy.typing import NDArray
 
-from mama_sia_eval.metrics import compute_dice, compute_hd95
+from eval.metrics import compute_dice, compute_hd95
 
 logger = logging.getLogger(__name__)
 

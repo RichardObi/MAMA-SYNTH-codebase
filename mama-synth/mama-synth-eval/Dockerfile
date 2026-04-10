@@ -24,17 +24,15 @@ RUN python -m pip install --user -U pip
 COPY --chown=user:user requirements.txt /opt/app/
 RUN python -m pip install --user -r requirements.txt
 
-COPY --chown=user:user . /opt/app/mama-sia-eval
-RUN python -m pip install --user -e "./mama-sia-eval[all]"
+COPY --chown=user:user . /opt/app/mama-synth-eval
+RUN python -m pip install --user -e "./mama-synth-eval[all]"
 
 # Run tests during build to verify integrity
-RUN python -m pytest mama-sia-eval/tests/ -x -q --tb=short \
+RUN python -m pytest mama-synth-eval/tests/ -x -q --tb=short \
     || echo "Warning: some tests require optional dependencies"
 
 # Default entrypoint: run the evaluation
-ENTRYPOINT ["python", "-m", "mama_sia_eval"]
+ENTRYPOINT ["python", "-m", "eval"]
 CMD ["--ground-truth-path", "/opt/ml/input/data/ground_truth/", \
      "--predictions-path", "/input/", \
      "--output-file", "/output/metrics.json"]
-
-ENTRYPOINT [ "python", "-m", "mama_sia_eval" ]

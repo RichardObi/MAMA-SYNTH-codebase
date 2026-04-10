@@ -1,4 +1,4 @@
-# mama-sia-eval
+# mama-synth-eval
 
 Evaluation suite for the **MAMA-SYNTH Challenge** — pre-contrast to post-contrast breast DCE-MRI synthesis. This package implements all four metric groups used for ranking participant submissions on [Grand Challenge](https://grand-challenge.org/).
 
@@ -8,10 +8,10 @@ The MAMA-SYNTH challenge evaluates generative models that translate pre-contrast
 
 | Group | Metrics | Scope |
 |---|---|---|
-| **Classification (CLF)** | AUROC, Balanced Accuracy | Molecular subtype prediction (TNBC / Luminal) on synthesized images |
-| **Segmentation (SEG)** | Dice (DSC), Hausdorff Distance 95 (HD95) | Tumor segmentation quality on synthesized images |
-| **Tumor ROI (ROI)** | MSE, LPIPS, FRD | Image fidelity within dilated tumor mask |
-| **Full Image (FULL)** | MSE, LPIPS, FRD | Image fidelity over the full breast region |
+| **Full Image (FULL)** | MSE, LPIPS | Global image fidelity over the full breast region |
+| **Tumor ROI (ROI)** | SSIM, FRD | Image fidelity within a dilated tumor mask |
+| **Classification (CLF)** | AUROC luminal, AUROC TNBC | Molecular subtype prediction on synthesized images |
+| **Segmentation (SEG)** | Dice, HD95 | Tumor segmentation quality on synthesized images |
 
 Rankings use **Borda-style hierarchical rank aggregation** with tie-break priority: ROI → CLF → SEG → FULL.
 
@@ -44,53 +44,54 @@ Rankings use **Borda-style hierarchical rank aggregation** with tie-break priori
 
 ## Metrics
 
-### Image-to-Image Fidelity
-- **MAE** — Mean Absolute Error
-- **MSE** — Mean Squared Error
-- **NMSE** — Normalized Mean Squared Error
-- **PSNR** — Peak Signal-to-Noise Ratio (dB)
-- **SSIM** — Structural Similarity Index
-- **NCC** — Normalized Cross-Correlation
+Eight equally-weighted metrics — two per task — determine the final ranking:
 
-### Perceptual & Distributional
-- **LPIPS** — Learned Perceptual Image Patch Similarity (requires `torch` + `lpips`)
-- **FRD** — Fréchet Radiomics Distance using IBSI-compliant pyradiomics features (requires `pyradiomics`)
+| Task | Metric | Key in `metrics.json` |
+|---|---|---|
+| **Full Image** | MSE — Mean Squared Error | `mse_full_image` |
+| **Full Image** | LPIPS — Perceptual similarity (requires `torch` + `lpips`) | `lpips_full_image` |
+| **Tumor ROI** | SSIM — Structural Similarity Index | `ssim_roi` |
+| **Tumor ROI** | FRD — Fréchet Radiomics Distance (requires `pyradiomics`) | `frd_roi` |
+| **Classification** | AUROC luminal — Area under ROC, Luminal subtype | `auroc_luminal` |
+| **Classification** | AUROC TNBC — Area under ROC, triple-negative subtype | `auroc_tnbc` |
+| **Segmentation** | Dice — Overlap coefficient | `dice` |
+| **Segmentation** | HD95 — 95th-percentile Hausdorff distance | `hausdorff95` |
 
-### Downstream Tasks
-- **Dice / HD95** — Segmentation overlap & boundary distance
-- **AUROC / Balanced Accuracy** — Classification of molecular subtypes
+All image-based metrics are computed on **dataset-level z-score-normalized** images. Additional per-case statistics (MAE, NMSE, PSNR, NCC) are stored in the `results` array of the output JSON for reference but are **not used for ranking**.
 
 ## Installation
 
 ### Core (image-to-image metrics only)
 
 ```bash
-pip install git+https://github.com/RichardObi/mama-sia-eval
+pip install git+https://github.com/RichardObi/MAMA-SYNTH-codebase/tree/main/mama-synth/mama-synth-eval
 ```
 
 ### With all optional dependencies
 
 ```bash
-pip install "mama-sia-eval[all] @ git+https://github.com/RichardObi/mama-sia-eval"
+pip install "eval[all] @ git+https://github.com/RichardObi/MAMA-SYNTH-codebase/tree/main/mama-synth/mama-synth-eval"
 ```
 
 ### Individual extras
 
 ```bash
-pip install "mama-sia-eval[frd]"              # FRD (pyradiomics)
-pip install "mama-sia-eval[lpips]"             # LPIPS (torch + lpips)
-pip install "mama-sia-eval[classification]"    # Classification (xgboost)
-pip install "mama-sia-eval[segmentation]"      # nnUNet segmentation
-pip install "mama-sia-eval[viz]"               # Visualization (matplotlib + plotly)
-pip install "mama-sia-eval[web]"               # Web interface (streamlit)
-pip install "mama-sia-eval[progress]"          # tqdm progress bars
+pip install "eval[frd]"              # FRD (pyradiomics)
+pip install "eval[lpips]"             # LPIPS (torch + lpips)
+pip install "eval[classification]"    # Classification (xgboost)
+pip install "eval[segmentation]"      # nnUNet segmentation
+pip install "eval[viz]"               # Visualization (matplotlib + plotly)
+pip install "eval[web]"               # Web interface (streamlit)
+pip install "eval[progress]"          # tqdm progress bars
 ```
 
 ### From source (development)
 
 ```bash
-git clone https://github.com/RichardObi/mama-sia-eval.git
-cd mama-sia-eval
+git clone https://github.com/RichardObi/MAMA-SYNTH-codebase.git
+cd MAMA-SYNTH-codebase
+cd mama-synth
+cd mama-synth-eval
 pip install -e ".[dev]"
 ```
 
@@ -100,13 +101,13 @@ pip install -e ".[dev]"
 
 ```bash
 # Basic evaluation (image-to-image metrics)
-python -m mama_sia_eval \
+python -m eval \
     --ground-truth-path /path/to/ground-truth \
     --predictions-path /path/to/predictions \
     --output-file metrics.json
 
 # Full evaluation with all four metric groups
-python -m mama_sia_eval \
+python -m eval \
     --ground-truth-path /path/to/ground-truth \
     --predictions-path /path/to/predictions \
     --masks-path /path/to/tumor-masks \
@@ -141,7 +142,7 @@ python -m mama_sia_eval \
 
 ```bash
 # Create an artificial dataset for pipeline testing
-python -m mama_sia_eval.generate_test_data \
+python -m eval.generate_test_data \
     --output-dir ./test_data \
     --n-cases 20 \
     --shape 64 64 \
@@ -151,7 +152,7 @@ python -m mama_sia_eval.generate_test_data \
 ### Visualize Results
 
 ```python
-from mama_sia_eval.visualization import ResultVisualizer
+from eval.visualization import ResultVisualizer
 
 viz = ResultVisualizer("metrics.json", output_dir="reports")
 viz.generate_all()  # Creates summary tables, bar charts, radar plots, CSVs
@@ -161,7 +162,7 @@ viz.generate_all()  # Creates summary tables, bar charts, radar plots, CSVs
 
 ```bash
 pip install streamlit plotly pandas
-streamlit run src/mama_sia_eval/webapp.py
+streamlit run src/eval/webapp.py
 ```
 
 The dashboard allows participants to:
@@ -173,9 +174,9 @@ The dashboard allows participants to:
 ### Python API
 
 ```python
-from mama_sia_eval import MamaSiaEval
+from eval import MamaSynthEval
 
-evaluator = MamaSiaEval(
+evaluator = MamaSynthEval(
     ground_truth_path="path/to/ground-truth",
     predictions_path="path/to/predictions",
     output_file="path/to/metrics.json",
@@ -197,7 +198,7 @@ results = evaluator.evaluate()
 
 ```python
 import numpy as np
-from mama_sia_eval import compute_ssim, compute_psnr, compute_dice, compute_hd95
+from eval import compute_ssim, compute_psnr, compute_dice, compute_hd95
 
 prediction = np.load("prediction.npy")
 ground_truth = np.load("ground_truth.npy")
@@ -217,7 +218,7 @@ print(f"Dice: {dice:.4f}, HD95: {hd95:.2f} mm")
 ### FRD (Fréchet Radiomics Distance)
 
 ```python
-from mama_sia_eval.frd import compute_frd_from_features
+from eval.frd import compute_frd_from_features
 import numpy as np
 
 # Pre-extracted radiomics feature matrices (n_samples x n_features)
@@ -230,11 +231,11 @@ print(f"FRD: {frd:.4f}")
 ### Ranking Submissions
 
 ```python
-from mama_sia_eval.ranking import rank_submissions
+from eval.ranking import rank_submissions
 
 submissions = {
-    "team_a": {"mse_roi": 5.0, "frd_roi": 2.0, "mse_full": 4.0, ...},
-    "team_b": {"mse_roi": 8.0, "frd_roi": 3.0, "mse_full": 6.0, ...},
+    "team_a": {"mse_full_image": 5.0, "lpips_full_image": 0.12, "ssim_roi": 0.88, "frd_roi": 2.0, "auroc_luminal": 0.82, "auroc_tnbc": 0.79, "dice": 0.84, "hausdorff95": 3.1},
+    "team_b": {"mse_full_image": 8.0, "lpips_full_image": 0.21, "ssim_roi": 0.75, "frd_roi": 3.5, "auroc_luminal": 0.71, "auroc_tnbc": 0.68, "dice": 0.77, "hausdorff95": 5.4},
 }
 rankings = rank_submissions(submissions)
 for team, info in sorted(rankings.items(), key=lambda x: x[1]["overall_rank"]):
@@ -275,44 +276,26 @@ case_002,0,1
 
 ```json
 {
-    "aggregate": {
-        "mae": {"mean": 0.1, "std": 0.05, "min": 0.01, "max": 0.2, "n_samples": 10},
-        "mse": {"mean": 0.02, "std": 0.01, ...},
-        "psnr": {"mean": 30.5, "std": 2.1, ...},
-        "ssim": {"mean": 0.95, "std": 0.02, ...},
-        ...
+    "aggregates": {
+        "mse_full_image":   {"mean": 0.02, "std": 0.01},
+        "lpips_full_image": {"mean": 0.15, "std": 0.05},
+        "ssim_roi":         {"mean": 0.87, "std": 0.06},
+        "frd_roi":          8.91,
+        "auroc_luminal":    0.79,
+        "auroc_tnbc":       0.85,
+        "dice":             {"mean": 0.82, "std": 0.08},
+        "hausdorff95":      {"mean": 3.14, "std": 1.20}
     },
-    "full_image": {
-        "mse": {"mean": ..., "std": ...},
-        "lpips": {"mean": ..., "std": ...},
-        "frd": 12.34
-    },
-    "roi": {
-        "mse": {"mean": ..., "std": ...},
-        "lpips": {"mean": ..., "std": ...},
-        "frd": 8.91
-    },
-    "segmentation": {
-        "dice": {"mean": 0.82, "std": 0.08, ...},
-        "hd95": {"mean": 3.14, "std": 1.2, ...}
-    },
-    "classification": {
-        "auroc_tnbc": 0.85,
-        "auroc_luminal": 0.79,
-        "balanced_accuracy_tnbc": 0.81,
-        "balanced_accuracy_luminal": 0.78
-    },
-    "missing_predictions": ["case_005"],
-    "cases": [
-        {"case_id": "case001", "mae": 0.1, "mse": 0.02, ...},
-        {"case_id": "case005", "mae": 0.2, "_imputed": true, ...}
+    "results": [
+        {"case_id": "case001", "mse_full_image": 0.02, "ssim_roi": 0.88, "dice": 0.84, ...},
+        {"case_id": "case005", "_imputed": true, ...}
     ]
 }
 ```
 
 ## Classifier Training
 
-Train molecular subtype classifiers (TNBC and Luminal) on the [MAMA-MIA](https://github.com/RichardObi/MAMA-MIA) dataset. Trained models are saved as `.pkl` files directly compatible with the evaluation pipeline.
+Train molecular subtype classifiers (TNBC and Luminal) on the [MAMA-MIA](https://github.com/LidiaGarrucho/MAMA-MIA) dataset. Trained models are saved as `.pkl` files directly compatible with the evaluation pipeline.
 
 ### Prerequisites
 
@@ -320,7 +303,7 @@ Train molecular subtype classifiers (TNBC and Luminal) on the [MAMA-MIA](https:/
 2. Install with training dependencies:
 
 ```bash
-pip install "mama-sia-eval[training] @ git+https://github.com/RichardObi/mama-sia-eval"
+pip install "eval[training] @ git+https://github.com/RichardObi/MAMA-SYNTH-codebase/tree/main/mama-synth/mama-synth-eval/"
 ```
 
 ### Expected Dataset Layout
@@ -346,7 +329,7 @@ mama-mia-dataset/
 
 ```bash
 # Train both classifiers (TNBC and Luminal)
-python -m mama_sia_eval.train_classifier \
+python -m eval.train_classifier \
     --data-dir /path/to/mama-mia-dataset \
     --output-dir /path/to/trained-models
 ```
@@ -389,7 +372,7 @@ mamasia-train \
 **Holdout mode** (default): Splits data into train/val sets. Best model is selected by validation AUROC.
 
 ```bash
-python -m mama_sia_eval.train_classifier \
+python -m eval.train_classifier \
     --data-dir /path/to/mama-mia-dataset \
     --output-dir ./models \
     --val-ratio 0.2
@@ -398,7 +381,7 @@ python -m mama_sia_eval.train_classifier \
 **Cross-validation mode**: Uses k-fold CV to select the best hyperparameters, then retrains on the full dataset.
 
 ```bash
-python -m mama_sia_eval.train_classifier \
+python -m eval.train_classifier \
     --data-dir /path/to/mama-mia-dataset \
     --output-dir ./models \
     --cv-folds 5
@@ -408,13 +391,13 @@ python -m mama_sia_eval.train_classifier \
 
 ```bash
 # Use the slice with the largest tumour cross-section
-python -m mama_sia_eval.train_classifier \
+python -m eval.train_classifier \
     --data-dir /path/to/mama-mia-dataset \
     --output-dir ./models \
     --slice-mode max_tumor
 
 # Multi-slice feature extraction (concatenate features from 5 slices)
-python -m mama_sia_eval.train_classifier \
+python -m eval.train_classifier \
     --data-dir /path/to/mama-mia-dataset \
     --output-dir ./models \
     --slice-mode multi_slice \
@@ -424,7 +407,7 @@ python -m mama_sia_eval.train_classifier \
 **Test-set evaluation**: Train on the MAMA-MIA training split and automatically evaluate on the test split.
 
 ```bash
-python -m mama_sia_eval.train_classifier \
+python -m eval.train_classifier \
     --data-dir /path/to/mama-mia-dataset \
     --output-dir ./models \
     --evaluate-test-set
@@ -433,7 +416,7 @@ python -m mama_sia_eval.train_classifier \
 ### 2D Slice Extraction (Python API)
 
 ```python
-from mama_sia_eval.slice_extraction import extract_2d_slice, SliceMode
+from eval.slice_extraction import extract_2d_slice, SliceMode
 
 # Load a 3D NIfTI volume (D, H, W)
 import SimpleITK as sitk
@@ -452,7 +435,7 @@ print(f"Selected slice {slice_idx}, shape: {img_2d.shape}")
 ### Training Visualisations (Python API)
 
 ```python
-from mama_sia_eval.training_visualization import TrainingVisualizer
+from eval.training_visualization import TrainingVisualizer
 
 viz = TrainingVisualizer(output_dir="./reports")
 viz.generate_all(
@@ -497,7 +480,7 @@ trained-models/
 The `.pkl` files are directly usable with the evaluation pipeline:
 
 ```bash
-python -m mama_sia_eval \
+python -m eval \
     --ground-truth-path /path/to/ground-truth \
     --predictions-path /path/to/predictions \
     --clf-model-dir /path/to/trained-models \
@@ -520,7 +503,7 @@ Training uses the same radiomic feature extraction pipeline as evaluation (`extr
 Use `--cache-dir` to cache extracted features across runs:
 
 ```bash
-python -m mama_sia_eval.train_classifier \
+python -m eval.train_classifier \
     --data-dir /path/to/mama-mia-dataset \
     --output-dir ./models \
     --cache-dir ./feature-cache
@@ -531,7 +514,7 @@ python -m mama_sia_eval.train_classifier \
 ### Build
 
 ```bash
-docker build -t mama-sia-eval .
+docker build -t eval .
 ```
 
 ### Run
@@ -541,7 +524,7 @@ docker run --rm \
     -v /path/to/ground-truth:/opt/app/ground-truth:ro \
     -v /path/to/predictions:/input:ro \
     -v /path/to/output:/output \
-    mama-sia-eval
+    eval
 ```
 
 ### Run with all inputs
@@ -553,7 +536,7 @@ docker run --rm \
     -v /path/to/masks:/opt/app/masks:ro \
     -v /path/to/labels.csv:/opt/app/labels.csv:ro \
     -v /path/to/output:/output \
-    mama-sia-eval \
+    eval \
     --masks-path /opt/app/masks \
     --labels-path /opt/app/labels.csv
 ```
@@ -567,7 +550,7 @@ docker run --rm \
 pytest tests/ -v
 
 # With coverage
-pytest tests/ -v --cov=mama_sia_eval --cov-report=term-missing
+pytest tests/ -v --cov=eval --cov-report=term-missing
 
 # E2E integration tests only
 pytest tests/test_e2e.py -v
@@ -586,11 +569,11 @@ mypy src/
 ## Project Structure
 
 ```
-mama-sia-eval/
-├── src/mama_sia_eval/
+mama-synth-eval
+├── src/eval/
 │   ├── __init__.py              # Package exports (v0.5.0)
 │   ├── __main__.py              # CLI entry point
-│   ├── evaluation.py            # Main evaluation pipeline (MamaSiaEval, DatasetNormalizer)
+│   ├── evaluation.py            # Main evaluation pipeline (MamaSynthEval, DatasetNormalizer)
 │   ├── metrics.py               # Image-to-image & segmentation metrics
 │   ├── frd.py                   # Fréchet Radiomics Distance (batch, cached)
 │   ├── classification.py        # Molecular subtype classification
@@ -635,6 +618,6 @@ If you use this evaluation code in your research, please cite the MAMA-SYNTH cha
 @misc{mama_synth_2025,
     title={MAMA-SYNTH: Pre-contrast to Post-contrast Breast DCE-MRI Synthesis Challenge},
     year={2025},
-    url={https://github.com/RichardObi/mama-sia-eval}
+    url={https://github.com/RichardObi/MAMA-SYNTH-codebase}
 }
 ```

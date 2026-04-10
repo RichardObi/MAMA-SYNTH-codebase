@@ -1,4 +1,4 @@
-#  Copyright 2025 mama-sia-eval contributors
+#  Copyright 2025 mama-synth-eval contributors
 #
 #  Licensed under the Apache License, Version 2.0 (the "License");
 #  you may not use this file except in compliance with the License.
@@ -19,7 +19,7 @@ Tests for 2D slice extraction from 3D DCE-MRI NIfTI volumes.
 import numpy as np
 import pytest
 
-from mama_sia_eval.slice_extraction import (
+from eval.slice_extraction import (
     SliceMode,
     extract_2d_slice,
     extract_multi_slices,

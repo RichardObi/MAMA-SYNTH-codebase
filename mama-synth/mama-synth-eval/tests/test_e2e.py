@@ -1,4 +1,4 @@
-#  Copyright 2025 mama-sia-eval contributors
+#  Copyright 2025 mama-synth-eval contributors
 #  Licensed under the Apache License, Version 2.0
 
 """End-to-end integration tests using artificial test data.
@@ -14,9 +14,9 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from mama_sia_eval.evaluation import MamaSiaEval, DatasetNormalizer
-from mama_sia_eval.generate_test_data import generate_case, save_dataset
-from mama_sia_eval.visualization import ResultVisualizer
+from eval.evaluation import MamaSynthEval, DatasetNormalizer
+from eval.generate_test_data import generate_case, save_dataset
+from eval.visualization import ResultVisualizer
 
 
 # ---------------------------------------------------------------------------
@@ -36,7 +36,7 @@ def synthetic_dataset(tmp_path_factory) -> Path:
 def eval_results(synthetic_dataset: Path) -> dict:
     """Run the full evaluation on the synthetic dataset."""
     out = synthetic_dataset / "output" / "metrics.json"
-    evaluator = MamaSiaEval(
+    evaluator = MamaSynthEval(
         ground_truth_path=synthetic_dataset / "ground-truth",
         predictions_path=synthetic_dataset / "predictions",
         output_file=out,
@@ -258,7 +258,7 @@ class TestMissingPredictionE2E:
         removed.unlink()
 
         out = tmp / "output2" / "metrics.json"
-        evaluator = MamaSiaEval(
+        evaluator = MamaSynthEval(
             ground_truth_path=tmp / "ground-truth",
             predictions_path=pred_dir,
             output_file=out,

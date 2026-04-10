@@ -1,4 +1,4 @@
-#  Copyright 2025 mama-sia-eval contributors
+#  Copyright 2025 mama-synth-eval contributors
 #  Licensed under the Apache License, Version 2.0
 
 """
@@ -16,7 +16,7 @@ for interactive HTML output.
 
 Usage::
 
-    from mama_sia_eval.visualization import ResultVisualizer
+    from eval.visualization import ResultVisualizer
     viz = ResultVisualizer(results_json="metrics.json", output_dir="reports")
     viz.generate_all()
 """
@@ -37,7 +37,7 @@ class ResultVisualizer:
     """Generate visual reports from MAMA-SYNTH evaluation results.
 
     Args:
-        results: Either a dict (from ``MamaSiaEval.evaluate()``) or a
+        results: Either a dict (from ``MamaSynthEval.evaluate()``) or a
                  path to the JSON file produced by the CLI.
         output_dir: Directory where report artefacts are saved.
     """

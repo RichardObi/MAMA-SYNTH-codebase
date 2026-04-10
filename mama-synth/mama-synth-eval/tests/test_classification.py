@@ -3,7 +3,7 @@
 import numpy as np
 import pytest
 
-from mama_sia_eval.classification import (
+from eval.classification import (
     compute_auroc,
     compute_balanced_accuracy,
     evaluate_classification,

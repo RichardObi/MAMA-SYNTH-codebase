@@ -3,7 +3,7 @@
 import numpy as np
 import pytest
 
-from mama_sia_eval.segmentation import (
+from eval.segmentation import (
     ThresholdSegmenter,
     evaluate_segmentation_pair,
     evaluate_segmentation,

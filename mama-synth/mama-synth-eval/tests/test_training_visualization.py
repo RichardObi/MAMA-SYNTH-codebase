@@ -1,4 +1,4 @@
-#  Copyright 2025 mama-sia-eval contributors
+#  Copyright 2025 mama-synth-eval contributors
 #
 #  Licensed under the Apache License, Version 2.0 (the "License");
 #  you may not use this file except in compliance with the License.
@@ -23,7 +23,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from mama_sia_eval.training_visualization import TrainingVisualizer
+from eval.training_visualization import TrainingVisualizer
 
 
 # ---------------------------------------------------------------------------
@@ -247,7 +247,7 @@ class TestSplitTrainTestPatients:
     def test_with_split_column(self):
         """Test splitting when a split column exists."""
         import pandas as pd
-        from mama_sia_eval.train_classifier import split_train_test_patients
+        from eval.train_classifier import split_train_test_patients
 
         df = pd.DataFrame({
             "patient_id": ["P001", "P002", "P003", "P004", "P005"],
@@ -261,7 +261,7 @@ class TestSplitTrainTestPatients:
     def test_no_split_column(self):
         """All patients should be training when no split column exists."""
         import pandas as pd
-        from mama_sia_eval.train_classifier import split_train_test_patients
+        from eval.train_classifier import split_train_test_patients
 
         df = pd.DataFrame({
             "patient_id": ["P001", "P002", "P003"],
@@ -275,7 +275,7 @@ class TestSplitTrainTestPatients:
     def test_explicit_split_column(self):
         """Test with an explicitly specified column name."""
         import pandas as pd
-        from mama_sia_eval.train_classifier import split_train_test_patients
+        from eval.train_classifier import split_train_test_patients
 
         df = pd.DataFrame({
             "patient_id": ["P001", "P002", "P003"],
@@ -292,7 +292,7 @@ class TestSplitTrainTestPatients:
 class TestDetectSplitColumn:
     def test_detects_dataset_split(self):
         import pandas as pd
-        from mama_sia_eval.train_classifier import detect_split_column
+        from eval.train_classifier import detect_split_column
 
         df = pd.DataFrame({
             "patient_id": ["P001", "P002"],
@@ -302,7 +302,7 @@ class TestDetectSplitColumn:
 
     def test_detects_split(self):
         import pandas as pd
-        from mama_sia_eval.train_classifier import detect_split_column
+        from eval.train_classifier import detect_split_column
 
         df = pd.DataFrame({
             "patient_id": ["P001", "P002"],
@@ -312,7 +312,7 @@ class TestDetectSplitColumn:
 
     def test_no_split_returns_none(self):
         import pandas as pd
-        from mama_sia_eval.train_classifier import detect_split_column
+        from eval.train_classifier import detect_split_column
 
         df = pd.DataFrame({
             "patient_id": ["P001", "P002"],
@@ -328,7 +328,7 @@ class TestDetectSplitColumn:
 
 class TestNewParseArgs:
     def test_slice_mode_flag(self):
-        from mama_sia_eval.train_classifier import parse_args
+        from eval.train_classifier import parse_args
 
         args = parse_args([
             "--data-dir", "/tmp/data",
@@ -338,7 +338,7 @@ class TestNewParseArgs:
         assert args.slice_mode == "max_tumor"
 
     def test_slice_mode_default_none(self):
-        from mama_sia_eval.train_classifier import parse_args
+        from eval.train_classifier import parse_args
 
         args = parse_args([
             "--data-dir", "/tmp/data",
@@ -347,7 +347,7 @@ class TestNewParseArgs:
         assert args.slice_mode is None
 
     def test_n_slices_flag(self):
-        from mama_sia_eval.train_classifier import parse_args
+        from eval.train_classifier import parse_args
 
         args = parse_args([
             "--data-dir", "/tmp/data",
@@ -358,7 +358,7 @@ class TestNewParseArgs:
         assert args.n_slices == 10
 
     def test_evaluate_test_set_flag(self):
-        from mama_sia_eval.train_classifier import parse_args
+        from eval.train_classifier import parse_args
 
         args = parse_args([
             "--data-dir", "/tmp/data",
@@ -368,7 +368,7 @@ class TestNewParseArgs:
         assert args.evaluate_test_set is True
 
     def test_no_viz_flag(self):
-        from mama_sia_eval.train_classifier import parse_args
+        from eval.train_classifier import parse_args
 
         args = parse_args([
             "--data-dir", "/tmp/data",
@@ -378,7 +378,7 @@ class TestNewParseArgs:
         assert args.no_viz is True
 
     def test_split_column_flag(self):
-        from mama_sia_eval.train_classifier import parse_args
+        from eval.train_classifier import parse_args
 
         args = parse_args([
             "--data-dir", "/tmp/data",
@@ -388,7 +388,7 @@ class TestNewParseArgs:
         assert args.split_column == "my_split"
 
     def test_invalid_slice_mode_rejected(self):
-        from mama_sia_eval.train_classifier import parse_args
+        from eval.train_classifier import parse_args
 
         with pytest.raises(SystemExit):
             parse_args([

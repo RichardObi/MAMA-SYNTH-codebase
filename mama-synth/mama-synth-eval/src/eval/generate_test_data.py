@@ -1,4 +1,4 @@
-#  Copyright 2025 mama-sia-eval contributors
+#  Copyright 2025 mama-synth-eval contributors
 #  Licensed under the Apache License, Version 2.0
 
 """
@@ -12,7 +12,7 @@ Creates a toy dataset mimicking the MAMA-SYNTH challenge data layout:
   - Molecular subtype labels CSV
 
 Usage:
-    python -m mama_sia_eval.generate_test_data --output-dir ./test_data --n-cases 20
+    python -m eval.generate_test_data --output-dir ./test_data --n-cases 20
 """
 
 import argparse

@@ -3,7 +3,7 @@
 import numpy as np
 import pytest
 
-from mama_sia_eval.frd import compute_frechet_distance, compute_frd_from_features
+from eval.frd import compute_frechet_distance, compute_frd_from_features
 
 
 class TestFrechetDistance:

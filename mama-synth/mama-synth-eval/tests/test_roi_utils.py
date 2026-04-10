@@ -3,7 +3,7 @@
 import numpy as np
 import pytest
 
-from mama_sia_eval.roi_utils import dilate_mask, extract_roi, extract_roi_pair
+from eval.roi_utils import dilate_mask, extract_roi, extract_roi_pair
 
 
 class TestDilateMask:

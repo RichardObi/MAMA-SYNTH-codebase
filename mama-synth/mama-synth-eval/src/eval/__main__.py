@@ -1,4 +1,4 @@
-#  Copyright 2025 mama-sia-eval contributors
+#  Copyright 2025 mama-synth-eval contributors
 #
 #  Licensed under the Apache License, Version 2.0 (the "License");
 #  you may not use this file except in compliance with the License.
@@ -16,7 +16,7 @@
 Command-line interface for the MAMA-SYNTH evaluation suite.
 
 Usage:
-    python -m mama_sia_eval \\
+    python -m eval \\
         --ground-truth-path /path/to/gt \\
         --predictions-path /path/to/pred \\
         --output-file /path/to/metrics.json \\
@@ -36,7 +36,7 @@ import logging
 import sys
 from pathlib import Path
 
-from mama_sia_eval import MamaSiaEval
+from eval import MamaSynthEval
 
 
 def setup_logging(verbose: bool = False) -> None:
@@ -145,7 +145,7 @@ def main() -> int:
     logger = logging.getLogger(__name__)
 
     try:
-        evaluator = MamaSiaEval(
+        evaluator = MamaSynthEval(
             ground_truth_path=args.ground_truth_path,
             predictions_path=args.predictions_path,
             output_file=args.output_file,

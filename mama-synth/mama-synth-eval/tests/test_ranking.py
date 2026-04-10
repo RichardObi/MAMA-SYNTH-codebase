@@ -2,7 +2,7 @@
 
 import pytest
 
-from mama_sia_eval.ranking import (
+from eval.ranking import (
     CHALLENGE_METRICS,
     METRIC_TASKS,
     rank_submissions,

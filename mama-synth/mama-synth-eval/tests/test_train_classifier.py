@@ -1,4 +1,4 @@
-#  Copyright 2025 mama-sia-eval contributors
+#  Copyright 2025 mama-synth-eval contributors
 #
 #  Licensed under the Apache License, Version 2.0 (the "License");
 #  you may not use this file except in compliance with the License.
@@ -29,7 +29,7 @@ import numpy as np
 import pytest
 from sklearn.ensemble import RandomForestClassifier
 
-from mama_sia_eval.train_classifier import (
+from eval.train_classifier import (
     ALL_SUBTYPES,
     CLINICAL_EXCEL_FILENAME,
     CLINICAL_SHEET_NAME,
@@ -414,7 +414,7 @@ class TestSaveModel:
 
     def test_saved_model_works_with_radiomics_classifier(self, tmp_output_dir):
         """End-to-end: save model → load with RadiomicsClassifier → predict."""
-        from mama_sia_eval.classification import RadiomicsClassifier
+        from eval.classification import RadiomicsClassifier
 
         model = RandomForestClassifier(n_estimators=5, random_state=42)
         X = np.random.randn(20, 5)
@@ -586,14 +586,14 @@ class TestLoadClinicalData:
 class TestFeatureExtraction:
     """Tests for feature extraction with mocked NIfTI loading."""
 
-    @patch("mama_sia_eval.train_classifier._load_mask_as_array")
-    @patch("mama_sia_eval.train_classifier._load_nifti_as_array")
-    @patch("mama_sia_eval.frd.extract_radiomic_features")
+    @patch("eval.train_classifier._load_mask_as_array")
+    @patch("eval.train_classifier._load_nifti_as_array")
+    @patch("eval.frd.extract_radiomic_features")
     def test_extract_features_basic(
         self, mock_extract, mock_load_img, mock_load_mask
     ):
         """Test basic feature extraction with mocked IO."""
-        from mama_sia_eval.train_classifier import extract_features_for_patients
+        from eval.train_classifier import extract_features_for_patients
 
         # Mock return values
         mock_load_img.return_value = np.random.randn(10, 64, 64)
@@ -622,12 +622,12 @@ class TestFeatureExtraction:
         assert len(valid_pids) == 3
         assert valid_idx == [0, 1, 2]
 
-    @patch("mama_sia_eval.frd.extract_radiomic_features")
-    @patch("mama_sia_eval.train_classifier._load_mask_as_array")
-    @patch("mama_sia_eval.train_classifier._load_nifti_as_array")
+    @patch("eval.frd.extract_radiomic_features")
+    @patch("eval.train_classifier._load_mask_as_array")
+    @patch("eval.train_classifier._load_nifti_as_array")
     def test_extract_features_missing_image(self, mock_load_img, mock_load_mask, mock_extract):
         """Test that missing images are gracefully skipped (partial failure)."""
-        from mama_sia_eval.train_classifier import extract_features_for_patients
+        from eval.train_classifier import extract_features_for_patients
 
         # First patient fails, second and third succeed
         mock_load_img.side_effect = [
@@ -651,10 +651,10 @@ class TestFeatureExtraction:
         assert "P001" not in valid_pids
         assert valid_idx == [1, 2]
 
-    @patch("mama_sia_eval.train_classifier._load_nifti_as_array")
+    @patch("eval.train_classifier._load_nifti_as_array")
     def test_all_images_missing_raises(self, mock_load_img):
         """Test that RuntimeError is raised when no features can be extracted."""
-        from mama_sia_eval.train_classifier import extract_features_for_patients
+        from eval.train_classifier import extract_features_for_patients
 
         mock_load_img.side_effect = FileNotFoundError("not found")
 
@@ -665,14 +665,14 @@ class TestFeatureExtraction:
                     data_dir=Path(tmp_dir),
                 )
 
-    @patch("mama_sia_eval.train_classifier._load_mask_as_array")
-    @patch("mama_sia_eval.train_classifier._load_nifti_as_array")
-    @patch("mama_sia_eval.frd.extract_radiomic_features")
+    @patch("eval.train_classifier._load_mask_as_array")
+    @patch("eval.train_classifier._load_nifti_as_array")
+    @patch("eval.frd.extract_radiomic_features")
     def test_feature_caching(
         self, mock_extract, mock_load_img, mock_load_mask
     ):
         """Test that features are cached and loaded from cache."""
-        from mama_sia_eval.train_classifier import extract_features_for_patients
+        from eval.train_classifier import extract_features_for_patients
 
         expected_feat = np.random.randn(93)
         mock_load_img.return_value = np.random.randn(10, 64, 64)

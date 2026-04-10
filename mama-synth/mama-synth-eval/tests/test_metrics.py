@@ -1,4 +1,4 @@
-#  Copyright 2025 mama-sia-eval contributors
+#  Copyright 2025 mama-synth-eval contributors
 #
 #  Licensed under the Apache License, Version 2.0 (the "License");
 #  you may not use this file except in compliance with the License.
@@ -17,7 +17,7 @@
 import numpy as np
 import pytest
 
-from mama_sia_eval.metrics import (
+from eval.metrics import (
     compute_dice,
     compute_hd95,
     compute_mae,
