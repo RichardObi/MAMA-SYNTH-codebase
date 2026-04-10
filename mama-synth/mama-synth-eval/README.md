@@ -17,7 +17,7 @@ Rankings use **Borda-style hierarchical rank aggregation** with tie-break priori
 
 ## What's New in v0.5.0
 
-- **2D slice extraction** — `slice_extraction.py` with `SliceMode.MAX_TUMOR`, `CENTER_TUMOR`, `MULTI_SLICE`, and `MIDDLE` strategies for automated 2D slice extraction from 3D NIfTI volumes, with z-score normalisation
+- **2D slice extraction** — `slice_extraction.py` with `SliceMode.MAX_TUMOR`, `CENTER_TUMOR`, `MULTI_SLICE`, `ALL_TUMOR`, and `MIDDLE` strategies for automated 2D slice extraction from 3D NIfTI volumes, with z-score normalisation
 - **`--slice-mode` flag** — integrate 2D slice extraction into the classifier training pipeline (`--slice-mode max_tumor`)
 - **MAMA-MIA test set evaluation** — `--evaluate-test-set` flag auto-detects the train/test split column in the clinical Excel and evaluates the trained model on left-out test patients
 - **Training visualisations** — `TrainingVisualizer` class generates confusion matrices, ROC curves, precision–recall curves, feature importance plots, classification reports, and a combined dashboard figure
@@ -358,7 +358,7 @@ mamasia-train \
 | `--seed` | `42` | Random seed for reproducibility |
 | `--cache-dir` | `None` | Cache directory for extracted features |
 | `--n-workers` | `1` | Number of parallel workers for feature extraction |
-| `--slice-mode` | `None` | 2D extraction strategy: `max_tumor`, `center_tumor`, `multi_slice`, `middle` |
+| `--slice-mode` | `None` | 2D extraction strategy: `max_tumor`, `center_tumor`, `multi_slice`, `all_tumor`, `middle` |
 | `--n-slices` | `5` | Number of slices for `multi_slice` mode |
 | `--evaluate-test-set` | `false` | Evaluate on MAMA-MIA test split after training |
 | `--split-column` | `None` | Column name in clinical Excel for train/test split (auto-detected) |
@@ -402,6 +402,12 @@ python -m eval.train_classifier \
     --output-dir ./models \
     --slice-mode multi_slice \
     --n-slices 5
+
+# All tumour slices: every slice with ≥1 mask voxel becomes a training sample
+python -m eval.train_classifier \
+    --data-dir /path/to/mama-mia-dataset \
+    --output-dir ./models \
+    --slice-mode all_tumor
 ```
 
 **Test-set evaluation**: Train on the MAMA-MIA training split and automatically evaluate on the test split.

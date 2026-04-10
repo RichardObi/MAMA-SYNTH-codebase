@@ -42,6 +42,11 @@ Strategies
     the axial axis. Features from each slice are concatenated or
     aggregated, giving a richer representation of tumour heterogeneity.
 
+``all_tumor``
+    Extract **every** axial slice that contains at least one foreground
+    mask voxel. Each slice becomes an independent training sample,
+    maximising the amount of per-patient training data.
+
 ``middle``
     Select the middle axial slice of the volume (no mask required).
     Useful as a mask-free fallback.
@@ -78,6 +83,7 @@ __all__ = [
     "SliceMode",
     "extract_2d_slice",
     "extract_multi_slices",
+    "extract_all_tumor_slices",
     "zscore_normalize_slice",
     "find_max_tumor_slice",
     "find_center_tumor_slice",
@@ -97,12 +103,14 @@ class SliceMode(str, enum.Enum):
         MAX_TUMOR:    Axial slice with the largest tumour cross-section.
         CENTER_TUMOR: Axial slice through the tumour centre of mass.
         MULTI_SLICE:  Multiple equally-spaced slices across tumour extent.
+        ALL_TUMOR:    Every slice with ≥1 foreground mask voxel.
         MIDDLE:       Middle axial slice (no mask required).
     """
 
     MAX_TUMOR = "max_tumor"
     CENTER_TUMOR = "center_tumor"
     MULTI_SLICE = "multi_slice"
+    ALL_TUMOR = "all_tumor"
     MIDDLE = "middle"
 
 
@@ -392,6 +400,68 @@ def extract_multi_slices(
     logger.debug(
         f"Extracted {len(indices)} slices from range [{start}, {end}] "
         f"(requested {n_slices}, axis={axis})"
+    )
+
+    return image_slices, mask_slices, indices
+
+
+def extract_all_tumor_slices(
+    volume: NDArray[np.floating],
+    mask: NDArray[np.bool_],
+    axis: int = 0,
+    normalize: bool = True,
+    clip_range: tuple[float, float] = (-5.0, 5.0),
+) -> tuple[list[NDArray[np.floating]], list[NDArray[np.bool_]], list[int]]:
+    """Extract every axial slice that contains at least one tumour voxel.
+
+    Unlike :func:`extract_multi_slices` (which sub-samples *k* slices),
+    this returns **all** slices with foreground mask pixels.  Each slice
+    is intended to become an independent training sample.
+
+    Args:
+        volume: 3D image array (D, H, W).
+        mask: 3D boolean segmentation mask (**required**, must contain
+            at least one foreground voxel).
+        axis: Axis along which to slice (0 = axial).
+        normalize: Whether to apply z-score normalisation.
+        clip_range: Clipping bounds when normalising.
+
+    Returns:
+        Tuple of (image_slices, mask_slices, slice_indices).
+
+    Raises:
+        ValueError: If the mask is empty or *volume* / *mask* are not 3D.
+    """
+    if volume.ndim != 3:
+        raise ValueError(f"Expected 3D volume, got {volume.ndim}D.")
+    if mask.ndim != 3:
+        raise ValueError(f"Expected 3D mask, got {mask.ndim}D.")
+    if not np.any(mask):
+        raise ValueError("Mask contains no foreground voxels.")
+
+    # Per-slice foreground count → select slices with ≥1 voxel
+    sum_axes = tuple(i for i in range(3) if i != axis)
+    areas = np.sum(mask, axis=sum_axes)           # shape (D,)
+    indices = list(np.nonzero(areas)[0].astype(int))
+
+    image_slices: list[NDArray[np.floating]] = []
+    mask_slices: list[NDArray[np.bool_]] = []
+
+    for idx in indices:
+        slicer = [slice(None)] * 3
+        slicer[axis] = idx
+        img = volume[tuple(slicer)].astype(np.float64)
+        msk = mask[tuple(slicer)].astype(bool)
+
+        if normalize:
+            img = zscore_normalize_slice(img, mask_slice=msk, clip_range=clip_range)
+
+        image_slices.append(img)
+        mask_slices.append(msk)
+
+    logger.debug(
+        f"Extracted {len(indices)} all-tumour slices from "
+        f"{volume.shape[axis]} total (axis={axis})"
     )
 
     return image_slices, mask_slices, indices

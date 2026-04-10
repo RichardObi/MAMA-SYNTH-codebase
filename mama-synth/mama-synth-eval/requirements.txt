@@ -5,7 +5,7 @@ scipy>=1.7.0
 scikit-learn>=1.0.0
 
 # Optional: Progress bars
-# tqdm>=4.60.0
+tqdm>=4.60.0
 
 # Optional: PNG support (auto-installed with matplotlib)
 # Pillow>=9.0.0

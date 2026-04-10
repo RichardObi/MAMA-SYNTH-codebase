@@ -69,7 +69,12 @@ from numpy.typing import NDArray
 from sklearn.metrics import balanced_accuracy_score, roc_auc_score
 from sklearn.model_selection import StratifiedKFold, train_test_split
 
-from eval.slice_extraction import SliceMode, extract_2d_slice, extract_multi_slices
+from eval.slice_extraction import (
+    SliceMode,
+    extract_2d_slice,
+    extract_all_tumor_slices,
+    extract_multi_slices,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -118,9 +123,10 @@ DEFAULT_N_SLICES = 5
 # We try each in order.
 SPLIT_COLUMN_CANDIDATES = ["dataset_split", "split", "dataset"]
 
-# Values that identify test-set patients in the split column
-TEST_SPLIT_VALUES = {"test", "testing", "Test", "Testing"}
-TRAIN_SPLIT_VALUES = {"train", "training", "Train", "Training"}
+# Values that identify test-set patients in the split column.
+# Matching is done *case-insensitively* — only lowercase forms are needed here.
+TEST_SPLIT_VALUES = {"test", "testing"}
+TRAIN_SPLIT_VALUES = {"train", "training"}
 
 
 # ---------------------------------------------------------------------------
@@ -306,8 +312,8 @@ def detect_split_column(clinical_df: "pd.DataFrame") -> Optional[str]:
     """Auto-detect the train/test split column in the clinical data.
 
     Tries each candidate column name from :data:`SPLIT_COLUMN_CANDIDATES`
-    and returns the first that exists and contains recognisable split
-    values.
+    (case-insensitive) and returns the first that exists and contains
+    recognisable split values.
 
     Args:
         clinical_df: Clinical data DataFrame.
@@ -315,18 +321,29 @@ def detect_split_column(clinical_df: "pd.DataFrame") -> Optional[str]:
     Returns:
         Column name if found, else ``None``.
     """
-    for col in SPLIT_COLUMN_CANDIDATES:
-        if col in clinical_df.columns:
-            unique = set(clinical_df[col].dropna().astype(str).unique())
-            # Check if it has recognisable train/test values
-            has_test = bool(unique & TEST_SPLIT_VALUES)
-            has_train = bool(unique & TRAIN_SPLIT_VALUES)
+    # Build a lower-case → actual-name lookup for the DataFrame columns
+    col_lower_map = {c.lower().strip(): c for c in clinical_df.columns}
+
+    for candidate in SPLIT_COLUMN_CANDIDATES:
+        actual_col = col_lower_map.get(candidate.lower())
+        if actual_col is not None:
+            unique = set(clinical_df[actual_col].dropna().astype(str).unique())
+            unique_lower = {v.lower().strip() for v in unique}
+            has_test = bool(unique_lower & TEST_SPLIT_VALUES)
+            has_train = bool(unique_lower & TRAIN_SPLIT_VALUES)
             if has_test or has_train:
                 logger.info(
-                    f"Detected split column '{col}' with values: "
+                    f"Detected split column '{actual_col}' with values: "
                     f"{sorted(unique)}"
                 )
-                return col
+                return actual_col
+
+    # No match — log available columns for debugging
+    logger.debug(
+        f"No split column detected. Tried candidates "
+        f"{SPLIT_COLUMN_CANDIDATES} (case-insensitive). "
+        f"Available columns: {list(clinical_df.columns)}"
+    )
     return None
 
 
@@ -358,9 +375,10 @@ def split_train_test_patients(
         return clinical_df["patient_id"].tolist(), []
 
     col_values = clinical_df[split_column].fillna("").astype(str)
+    col_values_lower = col_values.str.lower().str.strip()
 
-    train_mask = col_values.isin(TRAIN_SPLIT_VALUES)
-    test_mask = col_values.isin(TEST_SPLIT_VALUES)
+    train_mask = col_values_lower.isin(TRAIN_SPLIT_VALUES)
+    test_mask = col_values_lower.isin(TEST_SPLIT_VALUES)
 
     train_ids = clinical_df.loc[train_mask, "patient_id"].tolist()
     test_ids = clinical_df.loc[test_mask, "patient_id"].tolist()
@@ -452,6 +470,8 @@ def extract_features_for_patients(
     - ``"center_tumor"``: Axial slice through the tumour centre of mass.
     - ``"multi_slice"``: ``n_slices`` equally-spaced slices across tumour
       extent; features are concatenated.
+    - ``"all_tumor"``: Every axial slice with ≥1 tumour voxel.  Each
+      slice becomes an independent sample (multiplies dataset size).
     - ``"middle"``: Middle axial slice (no mask required).
     - ``None``: Use the full 3D volume (default, backward-compatible).
 
@@ -555,7 +575,8 @@ def extract_features_for_patients(
 
         # Load mask (required for mask-dependent slice modes, optional otherwise)
         _mask_dependent = _slice_mode in (
-            SliceMode.MAX_TUMOR, SliceMode.CENTER_TUMOR, SliceMode.MULTI_SLICE
+            SliceMode.MAX_TUMOR, SliceMode.CENTER_TUMOR,
+            SliceMode.MULTI_SLICE, SliceMode.ALL_TUMOR,
         )
         mask_array: Optional[NDArray[np.bool_]] = None
         try:
@@ -598,7 +619,40 @@ def extract_features_for_patients(
         # ----- 2D slice extraction (if enabled) -----
         if _slice_mode is not None and image_array.ndim == 3:
             try:
-                if _slice_mode == SliceMode.MULTI_SLICE:
+                if _slice_mode == SliceMode.ALL_TUMOR:
+                    # All-tumour: every slice with ≥1 mask voxel →
+                    # each becomes an independent training sample.
+                    at_imgs, at_masks, at_idxs = extract_all_tumor_slices(
+                        image_array, mask=mask_array, normalize=True,
+                    )
+                    n_slices_ok = 0
+                    for s_img, s_msk in zip(at_imgs, at_masks):
+                        sf = extract_radiomic_features(
+                            s_img, mask=s_msk,
+                            feature_classes=FRD_FEATURE_CLASSES,
+                            bin_width=FRD_DEFAULT_BIN_WIDTH,
+                        )
+                        if sf.size == 0 or np.all(sf == 0):
+                            continue
+                        features_list.append(sf)
+                        valid_patient_ids.append(pid)
+                        valid_indices.append(i)
+                        n_slices_ok += 1
+                    if n_slices_ok == 0:
+                        logger.warning(
+                            f"All tumour slices yielded empty features for "
+                            f"{pid}, skipping."
+                        )
+                        n_failed += 1
+                    else:
+                        logger.debug(
+                            f"{pid}: {n_slices_ok}/{len(at_idxs)} tumour "
+                            f"slices produced valid features."
+                        )
+                        n_extracted += 1
+                    # Skip the common append block below — already handled.
+                    continue
+                elif _slice_mode == SliceMode.MULTI_SLICE:
                     # Multi-slice: extract features per slice and concatenate
                     slices_2d, masks_2d, _ = extract_multi_slices(
                         image_array, mask=mask_array,
@@ -663,10 +717,12 @@ def extract_features_for_patients(
         valid_indices.append(i)
         n_extracted += 1
 
+    n_unique_patients = len(set(valid_patient_ids))
     logger.info(
         f"Feature extraction complete: {n_extracted} extracted, "
         f"{n_cached} from cache, {n_failed} failed "
-        f"({len(valid_patient_ids)}/{len(patient_ids)} patients valid)"
+        f"({n_unique_patients}/{len(patient_ids)} patients valid, "
+        f"{len(features_list)} total samples)"
     )
 
     if len(features_list) == 0:
@@ -700,7 +756,7 @@ def extract_features_for_patients(
 
     logger.info(
         f"Feature matrix shape: {feature_matrix.shape} "
-        f"({feature_matrix.shape[0]} patients × {feature_matrix.shape[1]} features)"
+        f"({feature_matrix.shape[0]} samples × {feature_matrix.shape[1]} features)"
     )
 
     return feature_matrix, valid_patient_ids, valid_indices
@@ -1280,10 +1336,26 @@ def main(argv: Optional[list[str]] = None) -> None:
             clinical_df, split_column=args.split_column,
         )
         if len(test_patient_ids_global) == 0:
-            logger.warning(
-                "No test-set patients found. --evaluate-test-set will be "
-                "skipped. Ensure the clinical data contains a split column "
-                f"(tried: {SPLIT_COLUMN_CANDIDATES})."
+            logger.error(
+                "=" * 60 + "\n"
+                "TEST-SET EVALUATION ABORTED: No test-set patients found.\n"
+                "\n"
+                "The clinical data does not contain a recognisable train/test\n"
+                "split column, or the column values do not match the expected\n"
+                f"labels (test: {sorted(TEST_SPLIT_VALUES)}, "
+                f"train: {sorted(TRAIN_SPLIT_VALUES)}).\n"
+                "\n"
+                f"Column candidates tried (case-insensitive): "
+                f"{SPLIT_COLUMN_CANDIDATES}\n"
+                f"Columns found in data: {list(clinical_df.columns)}\n"
+                "\n"
+                "Hint: use --split-column <name> to specify the column\n"
+                "explicitly.  Training will proceed WITHOUT test-set\n"
+                "evaluation.\n" + "=" * 60
+            )
+        else:
+            logger.info(
+                f"Found {len(test_patient_ids_global)} test-set patients."
             )
 
     # Training report to save at the end
@@ -1548,6 +1620,31 @@ def main(argv: Optional[list[str]] = None) -> None:
     logger.info(f"Models saved in: {args.output_dir}")
     if not args.no_viz:
         logger.info(f"Visualisations in: {viz_dir}")
+
+    # Print a clear test-set summary so it can't be missed.
+    if args.evaluate_test_set:
+        any_test_metrics = any(
+            "test_metrics" in report["tasks"].get(t, {})
+            for t in args.tasks
+        )
+        if any_test_metrics:
+            logger.info("-" * 60)
+            logger.info("TEST-SET RESULTS:")
+            for t in args.tasks:
+                tm = report["tasks"].get(t, {}).get("test_metrics")
+                if tm is not None:
+                    logger.info(
+                        f"  {t}: AUROC={tm['auroc']:.4f}, "
+                        f"Bal.Acc={tm['balanced_accuracy']:.4f}"
+                    )
+                else:
+                    logger.info(f"  {t}: (no test results)")
+        else:
+            logger.warning(
+                "TEST-SET RESULTS: No test-set metrics were produced. "
+                "Check warnings above."
+            )
+
     logger.info("=" * 60)
 
 
