@@ -1,9 +1,18 @@
 FROM python:3.10-slim
 
+# Grand Challenge evaluation container
+# Reference: https://grand-challenge.org/documentation/automated-evaluation/
+#
+# Expected paths:
+#   - /input/                              Predictions from algorithm
+#   - /opt/ml/input/data/ground_truth/     Ground truth (uploaded separately)
+#   - /output/metrics.json                 Results file (we write here)
+
 RUN groupadd -r user && useradd -m --no-log-init -r -g user user
 
-RUN mkdir -p /opt/app /input /output /opt/app/ground-truth \
-    && chown user:user /opt/app /input /output /opt/app/ground-truth
+RUN mkdir -p /opt/app /input /output \
+             /opt/ml/input/data/ground_truth \
+    && chown -R user:user /opt/app /input /output /opt/ml/input/data/ground_truth
 
 USER user
 WORKDIR /opt/app
@@ -21,5 +30,11 @@ RUN python -m pip install --user -e "./mama-sia-eval[all]"
 # Run tests during build to verify integrity
 RUN python -m pytest mama-sia-eval/tests/ -x -q --tb=short \
     || echo "Warning: some tests require optional dependencies"
+
+# Default entrypoint: run the evaluation
+ENTRYPOINT ["python", "-m", "mama_sia_eval"]
+CMD ["--ground-truth-path", "/opt/ml/input/data/ground_truth/", \
+     "--predictions-path", "/input/", \
+     "--output-file", "/output/metrics.json"]
 
 ENTRYPOINT [ "python", "-m", "mama_sia_eval" ]

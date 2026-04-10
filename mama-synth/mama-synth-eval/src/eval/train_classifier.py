@@ -69,6 +69,8 @@ from numpy.typing import NDArray
 from sklearn.metrics import balanced_accuracy_score, roc_auc_score
 from sklearn.model_selection import StratifiedKFold, train_test_split
 
+from mama_sia_eval.slice_extraction import SliceMode, extract_2d_slice, extract_multi_slices
+
 logger = logging.getLogger(__name__)
 
 
@@ -104,6 +106,21 @@ DEFAULT_VAL_RATIO = 0.2
 
 # Random seed for reproducibility
 DEFAULT_SEED = 42
+
+# Default 2D slice extraction mode (None means use full 3D volume)
+DEFAULT_SLICE_MODE: Optional[str] = None
+
+# Number of slices for multi-slice mode
+DEFAULT_N_SLICES = 5
+
+# MAMA-MIA dataset split column used to separate train/test patients.
+# The clinical Excel may use 'dataset_split', 'split', or 'dataset'.
+# We try each in order.
+SPLIT_COLUMN_CANDIDATES = ["dataset_split", "split", "dataset"]
+
+# Values that identify test-set patients in the split column
+TEST_SPLIT_VALUES = {"test", "testing", "Test", "Testing"}
+TRAIN_SPLIT_VALUES = {"train", "training", "Train", "Training"}
 
 
 # ---------------------------------------------------------------------------
@@ -285,6 +302,88 @@ def create_labels(
     return patient_ids, labels
 
 
+def detect_split_column(clinical_df: "pd.DataFrame") -> Optional[str]:
+    """Auto-detect the train/test split column in the clinical data.
+
+    Tries each candidate column name from :data:`SPLIT_COLUMN_CANDIDATES`
+    and returns the first that exists and contains recognisable split
+    values.
+
+    Args:
+        clinical_df: Clinical data DataFrame.
+
+    Returns:
+        Column name if found, else ``None``.
+    """
+    for col in SPLIT_COLUMN_CANDIDATES:
+        if col in clinical_df.columns:
+            unique = set(clinical_df[col].dropna().astype(str).unique())
+            # Check if it has recognisable train/test values
+            has_test = bool(unique & TEST_SPLIT_VALUES)
+            has_train = bool(unique & TRAIN_SPLIT_VALUES)
+            if has_test or has_train:
+                logger.info(
+                    f"Detected split column '{col}' with values: "
+                    f"{sorted(unique)}"
+                )
+                return col
+    return None
+
+
+def split_train_test_patients(
+    clinical_df: "pd.DataFrame",
+    split_column: Optional[str] = None,
+) -> tuple[list[str], list[str]]:
+    """Split patient IDs into train and test sets using the clinical data.
+
+    If no split column is detected, all patients are returned as training
+    patients and the test list is empty.
+
+    Args:
+        clinical_df: Clinical data DataFrame.
+        split_column: Column name containing split labels. If None,
+            auto-detection is attempted.
+
+    Returns:
+        Tuple of (train_patient_ids, test_patient_ids).
+    """
+    if split_column is None:
+        split_column = detect_split_column(clinical_df)
+
+    if split_column is None:
+        logger.warning(
+            "No train/test split column found in clinical data. "
+            "Returning all patients as training set."
+        )
+        return clinical_df["patient_id"].tolist(), []
+
+    col_values = clinical_df[split_column].fillna("").astype(str)
+
+    train_mask = col_values.isin(TRAIN_SPLIT_VALUES)
+    test_mask = col_values.isin(TEST_SPLIT_VALUES)
+
+    train_ids = clinical_df.loc[train_mask, "patient_id"].tolist()
+    test_ids = clinical_df.loc[test_mask, "patient_id"].tolist()
+
+    # Patients not matching either split go to training
+    unassigned = ~(train_mask | test_mask)
+    n_unassigned = int(unassigned.sum())
+    if n_unassigned > 0:
+        logger.info(
+            f"{n_unassigned} patients have unrecognised split value — "
+            f"assigning to training set."
+        )
+        train_ids.extend(
+            clinical_df.loc[unassigned, "patient_id"].tolist()
+        )
+
+    logger.info(
+        f"Dataset split: {len(train_ids)} training, {len(test_ids)} test "
+        f"(column='{split_column}')"
+    )
+    return train_ids, test_ids
+
+
 # ---------------------------------------------------------------------------
 # Feature extraction
 # ---------------------------------------------------------------------------
@@ -336,12 +435,25 @@ def extract_features_for_patients(
     phase: int = DEFAULT_PHASE,
     cache_dir: Optional[Path] = None,
     n_workers: int = 1,
+    slice_mode: Optional[str] = None,
+    n_slices: int = DEFAULT_N_SLICES,
 ) -> tuple[NDArray[np.floating], list[str], list[int]]:
     """Extract radiomic features for a list of patients.
 
     Loads each patient's post-contrast MRI image and segmentation mask,
-    then extracts radiomic features using pyradiomics (same pipeline as
-    the evaluation code).
+    then extracts radiomic features using pyradiomics. Supports both
+    full 3D volume extraction and 2D slice extraction.
+
+    When ``slice_mode`` is set, the 3D volume is first reduced to one or
+    more 2D slices (with z-score normalisation) before feature extraction.
+    Available modes:
+
+    - ``"max_tumor"``: Axial slice with the largest tumour cross-section.
+    - ``"center_tumor"``: Axial slice through the tumour centre of mass.
+    - ``"multi_slice"``: ``n_slices`` equally-spaced slices across tumour
+      extent; features are concatenated.
+    - ``"middle"``: Middle axial slice (no mask required).
+    - ``None``: Use the full 3D volume (default, backward-compatible).
 
     Args:
         patient_ids: List of patient identifiers.
@@ -351,6 +463,8 @@ def extract_features_for_patients(
         phase: MRI phase to use (default: 1 = first post-contrast).
         cache_dir: Directory for caching per-patient feature files.
         n_workers: Number of parallel workers (currently sequential).
+        slice_mode: 2D slice extraction strategy or None for full 3D.
+        n_slices: Number of slices for ``"multi_slice"`` mode.
 
     Returns:
         Tuple of:
@@ -384,6 +498,18 @@ def extract_features_for_patients(
     except ImportError:
         iterator = enumerate(patient_ids)
 
+    # Resolve slice mode
+    _slice_mode: Optional[SliceMode] = None
+    if slice_mode is not None:
+        try:
+            _slice_mode = SliceMode(slice_mode)
+        except ValueError:
+            raise ValueError(
+                f"Invalid slice_mode '{slice_mode}'. "
+                f"Choose from: {[m.value for m in SliceMode]}"
+            )
+        logger.info(f"2D slice extraction enabled: mode={_slice_mode.value}")
+
     features_list: list[NDArray[np.floating]] = []
     valid_patient_ids: list[str] = []
     valid_indices: list[int] = []
@@ -391,10 +517,16 @@ def extract_features_for_patients(
     n_extracted = 0
     n_failed = 0
 
+    # Cache suffix differentiates 3D vs 2D cached features
+    cache_suffix = (
+        f"_phase{phase}.npy" if _slice_mode is None
+        else f"_phase{phase}_{_slice_mode.value}.npy"
+    )
+
     for i, pid in iterator:
         # Check cache first
         if cache_dir is not None:
-            cache_file = cache_dir / f"{pid}_phase{phase}.npy"
+            cache_file = cache_dir / f"{pid}{cache_suffix}"
             if cache_file.exists():
                 try:
                     feat = np.load(cache_file)
@@ -432,18 +564,55 @@ def extract_features_for_patients(
                 f"Failed to load segmentation for {pid}: {e}, using full image."
             )
 
-        # Extract radiomic features
-        try:
-            feat = extract_radiomic_features(
-                image_array,
-                mask=mask_array,
-                feature_classes=FRD_FEATURE_CLASSES,
-                bin_width=FRD_DEFAULT_BIN_WIDTH,
-            )
-        except Exception as e:
-            logger.warning(f"Feature extraction failed for {pid}: {e}, skipping.")
-            n_failed += 1
-            continue
+        # ----- 2D slice extraction (if enabled) -----
+        if _slice_mode is not None and image_array.ndim == 3:
+            try:
+                if _slice_mode == SliceMode.MULTI_SLICE:
+                    # Multi-slice: extract features per slice and concatenate
+                    slices_2d, masks_2d, _ = extract_multi_slices(
+                        image_array, mask=mask_array,
+                        n_slices=n_slices, normalize=True,
+                    )
+                    slice_feats = []
+                    for s_img, s_msk in zip(slices_2d, masks_2d):
+                        sf = extract_radiomic_features(
+                            s_img, mask=s_msk,
+                            feature_classes=FRD_FEATURE_CLASSES,
+                            bin_width=FRD_DEFAULT_BIN_WIDTH,
+                        )
+                        slice_feats.append(sf)
+                    feat = np.concatenate(slice_feats)
+                else:
+                    # Single-slice modes (max_tumor, center_tumor, middle)
+                    img_2d, msk_2d, slice_idx = extract_2d_slice(
+                        image_array, mask=mask_array,
+                        mode=_slice_mode, normalize=True,
+                    )
+                    feat = extract_radiomic_features(
+                        img_2d, mask=msk_2d,
+                        feature_classes=FRD_FEATURE_CLASSES,
+                        bin_width=FRD_DEFAULT_BIN_WIDTH,
+                    )
+            except Exception as e:
+                logger.warning(
+                    f"2D slice extraction/feature extraction failed for {pid}: {e}, "
+                    f"skipping."
+                )
+                n_failed += 1
+                continue
+        else:
+            # ----- Full 3D feature extraction (default) -----
+            try:
+                feat = extract_radiomic_features(
+                    image_array,
+                    mask=mask_array,
+                    feature_classes=FRD_FEATURE_CLASSES,
+                    bin_width=FRD_DEFAULT_BIN_WIDTH,
+                )
+            except Exception as e:
+                logger.warning(f"Feature extraction failed for {pid}: {e}, skipping.")
+                n_failed += 1
+                continue
 
         # Validate feature vector
         if feat.size == 0 or np.all(feat == 0):
@@ -454,7 +623,7 @@ def extract_features_for_patients(
         # Cache features
         if cache_dir is not None:
             try:
-                np.save(cache_dir / f"{pid}_phase{phase}.npy", feat)
+                np.save(cache_dir / f"{pid}{cache_suffix}", feat)
             except Exception as e:
                 logger.debug(f"Failed to cache features for {pid}: {e}")
 
@@ -928,6 +1097,82 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         help="Number of parallel workers for feature extraction. Default: 1.",
     )
 
+    # Quick test / subset
+    parser.add_argument(
+        "--quick-test",
+        action="store_true",
+        help=(
+            "Quick validation run with only 10 cases per task. "
+            "Useful for verifying that the full training pipeline works "
+            "before launching a full training run."
+        ),
+    )
+    parser.add_argument(
+        "--n-cases",
+        type=int,
+        default=None,
+        help=(
+            "Limit training to the first N cases (per task). "
+            "Overrides --quick-test. Default: all available cases."
+        ),
+    )
+
+    # 2D Slice extraction
+    slice_choices = [m.value for m in SliceMode]
+    parser.add_argument(
+        "--slice-mode",
+        type=str,
+        choices=slice_choices,
+        default=None,
+        help=(
+            "Extract 2D slices from 3D NIfTI volumes before feature "
+            "extraction.  Choices: "
+            + ", ".join(f"'{c}'" for c in slice_choices)
+            + ".  Default: None (use full 3D volume)."
+        ),
+    )
+    parser.add_argument(
+        "--n-slices",
+        type=int,
+        default=DEFAULT_N_SLICES,
+        help=(
+            f"Number of slices to extract in 'multi_slice' mode. "
+            f"Default: {DEFAULT_N_SLICES}."
+        ),
+    )
+
+    # MAMA-MIA test set evaluation
+    parser.add_argument(
+        "--evaluate-test-set",
+        action="store_true",
+        help=(
+            "After training, evaluate the model on the MAMA-MIA test set "
+            "split. Requires a 'dataset_split' (or similar) column in the "
+            "clinical Excel file. Test results including confusion matrix, "
+            "ROC curve, and classification report are saved alongside the "
+            "training outputs."
+        ),
+    )
+    parser.add_argument(
+        "--split-column",
+        type=str,
+        default=None,
+        help=(
+            "Column name in the clinical Excel containing train/test split "
+            "labels. If not specified, auto-detection is attempted."
+        ),
+    )
+
+    # Visualisation
+    parser.add_argument(
+        "--no-viz",
+        action="store_true",
+        help=(
+            "Disable generation of visualisation artefacts (confusion "
+            "matrix, ROC curve, PR curve, feature importance, dashboard)."
+        ),
+    )
+
     # Logging
     parser.add_argument(
         "--verbose", "-v",
@@ -954,8 +1199,16 @@ def main(argv: Optional[list[str]] = None) -> None:
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
+    # Resolve --quick-test → --n-cases
+    n_cases_limit: Optional[int] = args.n_cases
+    if args.quick_test and n_cases_limit is None:
+        n_cases_limit = 10
+
     logger.info("=" * 60)
-    logger.info("MAMA-MIA Classifier Training Pipeline")
+    if n_cases_limit is not None:
+        logger.info(f"MAMA-MIA Classifier Training Pipeline  [LIMITED: {n_cases_limit} cases]")
+    else:
+        logger.info("MAMA-MIA Classifier Training Pipeline")
     logger.info("=" * 60)
     logger.info(f"Data directory:   {args.data_dir}")
     logger.info(f"Output directory: {args.output_dir}")
@@ -964,14 +1217,41 @@ def main(argv: Optional[list[str]] = None) -> None:
     logger.info(f"Val ratio:        {args.val_ratio}")
     logger.info(f"CV folds:         {args.cv_folds}")
     logger.info(f"Seed:             {args.seed}")
+    if args.slice_mode is not None:
+        logger.info(f"Slice mode:       {args.slice_mode}")
+        if args.slice_mode == SliceMode.MULTI_SLICE.value:
+            logger.info(f"Num slices:       {args.n_slices}")
+    else:
+        logger.info("Slice mode:       3D (full volume)")
+    if args.evaluate_test_set:
+        logger.info("Test-set eval:    ENABLED")
+    if n_cases_limit is not None:
+        logger.info(f"Case limit:       {n_cases_limit} {'(--quick-test)' if args.quick_test else ''}")
 
     # Set default cache dir
     if args.cache_dir is None:
         args.cache_dir = args.output_dir / "feature_cache"
 
+    # Create visualisation output directory
+    viz_dir = args.output_dir / "visualizations"
+
     # 1. Load clinical data
     logger.info("\n--- Step 1: Loading clinical data ---")
     clinical_df = load_clinical_data(args.data_dir, args.clinical_data)
+
+    # Detect test-set split if requested
+    test_patient_ids_global: list[str] = []
+    if args.evaluate_test_set:
+        logger.info("\n--- Detecting MAMA-MIA train/test split ---")
+        _, test_patient_ids_global = split_train_test_patients(
+            clinical_df, split_column=args.split_column,
+        )
+        if len(test_patient_ids_global) == 0:
+            logger.warning(
+                "No test-set patients found. --evaluate-test-set will be "
+                "skipped. Ensure the clinical data contains a split column "
+                f"(tried: {SPLIT_COLUMN_CANDIDATES})."
+            )
 
     # Training report to save at the end
     report: dict[str, Any] = {
@@ -981,6 +1261,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         "val_ratio": args.val_ratio,
         "cv_folds": args.cv_folds,
         "seed": args.seed,
+        "slice_mode": args.slice_mode,
         "total_patients": len(clinical_df),
         "tasks": {},
     }
@@ -996,6 +1277,30 @@ def main(argv: Optional[list[str]] = None) -> None:
         logger.info("\n--- Step 2: Creating labels ---")
         patient_ids, labels = create_labels(clinical_df, task)
 
+        # If evaluating test set, exclude test patients from training
+        if args.evaluate_test_set and test_patient_ids_global:
+            test_set = set(test_patient_ids_global)
+            train_mask = [pid not in test_set for pid in patient_ids]
+            patient_ids_train = [
+                pid for pid, keep in zip(patient_ids, train_mask) if keep
+            ]
+            labels_train = labels[train_mask]
+            logger.info(
+                f"Excluded {len(patient_ids) - len(patient_ids_train)} test "
+                f"patients from training set."
+            )
+            patient_ids = patient_ids_train
+            labels = labels_train
+
+        # Apply case limit if set (--quick-test or --n-cases)
+        if n_cases_limit is not None and len(patient_ids) > n_cases_limit:
+            logger.info(
+                f"Limiting to {n_cases_limit} cases out of {len(patient_ids)} "
+                f"for task '{task}'"
+            )
+            patient_ids = patient_ids[:n_cases_limit]
+            labels = labels[:n_cases_limit]
+
         # 2b. Extract features
         logger.info("\n--- Step 3: Extracting radiomic features ---")
         feature_matrix, valid_pids, valid_indices = extract_features_for_patients(
@@ -1006,6 +1311,8 @@ def main(argv: Optional[list[str]] = None) -> None:
             phase=args.phase,
             cache_dir=args.cache_dir,
             n_workers=args.n_workers,
+            slice_mode=args.slice_mode,
+            n_slices=args.n_slices,
         )
 
         # Filter labels to match valid patients
@@ -1052,8 +1359,135 @@ def main(argv: Optional[list[str]] = None) -> None:
         logger.info("\n--- Step 5: Saving model ---")
         model_path = save_model(best_model, task, args.output_dir)
 
+        # 2e. Generate validation visualisations
+        if not args.no_viz:
+            logger.info("\n--- Step 5b: Generating validation visualisations ---")
+            try:
+                from mama_sia_eval.training_visualization import TrainingVisualizer
+                viz = TrainingVisualizer(output_dir=viz_dir / task)
+
+                # Compute predictions on validation set (or full set for CV)
+                if args.cv_folds > 0:
+                    _viz_X, _viz_y = feature_matrix, valid_labels
+                    _viz_label = "Full (CV retrained)"
+                else:
+                    _viz_X, _viz_y = X_val, y_val
+                    _viz_label = "Validation"
+
+                _viz_proba = best_model.predict_proba(_viz_X)
+                _viz_score = (
+                    _viz_proba[:, 1] if _viz_proba.ndim == 2 else _viz_proba
+                )
+                _viz_pred = (_viz_score >= 0.5).astype(np.int64)
+
+                viz_paths = viz.generate_all(
+                    y_true=_viz_y,
+                    y_pred=_viz_pred,
+                    y_score=_viz_score,
+                    model=best_model,
+                    task=task,
+                    dataset_label=_viz_label,
+                )
+                logger.info(
+                    f"Generated {len(viz_paths)} visualisation artefacts for "
+                    f"task '{task}'"
+                )
+            except Exception as e:
+                logger.warning(f"Visualisation generation failed: {e}")
+
+        # 2f. Evaluate on MAMA-MIA test set (if enabled)
+        test_metrics: Optional[dict[str, float]] = None
+        if args.evaluate_test_set and test_patient_ids_global:
+            logger.info(
+                f"\n--- Step 6: Evaluating on MAMA-MIA test set "
+                f"({len(test_patient_ids_global)} patients) ---"
+            )
+            try:
+                # Create labels for test patients
+                test_pids_task, test_labels_task = create_labels(
+                    clinical_df[
+                        clinical_df["patient_id"].isin(test_patient_ids_global)
+                    ].copy(),
+                    task,
+                )
+
+                if len(test_pids_task) == 0:
+                    logger.warning(
+                        f"No test patients with valid labels for task '{task}'."
+                    )
+                else:
+                    # Extract test features
+                    test_features, test_valid_pids, test_valid_idx = (
+                        extract_features_for_patients(
+                            patient_ids=test_pids_task,
+                            data_dir=args.data_dir,
+                            images_dir=args.images_dir,
+                            segmentations_dir=args.segmentations_dir,
+                            phase=args.phase,
+                            cache_dir=args.cache_dir,
+                            n_workers=args.n_workers,
+                            slice_mode=args.slice_mode,
+                            n_slices=args.n_slices,
+                        )
+                    )
+
+                    test_labels_valid = test_labels_task[test_valid_idx]
+
+                    if len(test_labels_valid) < 2:
+                        logger.warning(
+                            f"Fewer than 2 valid test patients for '{task}'."
+                        )
+                    else:
+                        # Predict on test set
+                        test_metrics = evaluate_model(
+                            best_model, test_features, test_labels_valid
+                        )
+                        logger.info(
+                            f"TEST SET — {task}: "
+                            f"AUROC={test_metrics['auroc']:.4f}, "
+                            f"Bal.Acc={test_metrics['balanced_accuracy']:.4f}"
+                        )
+
+                        # Generate test-set visualisations
+                        if not args.no_viz:
+                            try:
+                                test_viz = TrainingVisualizer(
+                                    output_dir=viz_dir / f"{task}_test"
+                                )
+                                test_proba = best_model.predict_proba(
+                                    test_features
+                                )
+                                test_score = (
+                                    test_proba[:, 1]
+                                    if test_proba.ndim == 2
+                                    else test_proba
+                                )
+                                test_pred = (
+                                    (test_score >= 0.5).astype(np.int64)
+                                )
+
+                                test_viz_paths = test_viz.generate_all(
+                                    y_true=test_labels_valid,
+                                    y_pred=test_pred,
+                                    y_score=test_score,
+                                    model=best_model,
+                                    task=task,
+                                    dataset_label="MAMA-MIA Test",
+                                )
+                                logger.info(
+                                    f"Generated {len(test_viz_paths)} test-set "
+                                    f"visualisations for '{task}'"
+                                )
+                            except Exception as e:
+                                logger.warning(
+                                    f"Test-set visualisation failed: {e}"
+                                )
+
+            except Exception as e:
+                logger.warning(f"Test-set evaluation failed for '{task}': {e}")
+
         task_elapsed = time.time() - task_start
-        report["tasks"][task] = {
+        task_report: dict[str, Any] = {
             "best_model": best_name,
             "val_metrics": best_metrics,
             "n_patients_total": len(patient_ids),
@@ -1064,6 +1498,12 @@ def main(argv: Optional[list[str]] = None) -> None:
             "model_path": str(model_path),
             "elapsed_seconds": round(task_elapsed, 1),
         }
+        if args.slice_mode is not None:
+            task_report["slice_mode"] = args.slice_mode
+        if test_metrics is not None:
+            task_report["test_metrics"] = test_metrics
+
+        report["tasks"][task] = task_report
 
         logger.info(f"Task '{task}' completed in {task_elapsed:.1f}s")
 
@@ -1073,6 +1513,8 @@ def main(argv: Optional[list[str]] = None) -> None:
     logger.info("\n" + "=" * 60)
     logger.info("Training pipeline complete!")
     logger.info(f"Models saved in: {args.output_dir}")
+    if not args.no_viz:
+        logger.info(f"Visualisations in: {viz_dir}")
     logger.info("=" * 60)
 
 

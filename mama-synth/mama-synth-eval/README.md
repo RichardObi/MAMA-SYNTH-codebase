@@ -15,6 +15,16 @@ The MAMA-SYNTH challenge evaluates generative models that translate pre-contrast
 
 Rankings use **Borda-style hierarchical rank aggregation** with tie-break priority: ROI → CLF → SEG → FULL.
 
+## What's New in v0.5.0
+
+- **2D slice extraction** — `slice_extraction.py` with `SliceMode.MAX_TUMOR`, `CENTER_TUMOR`, `MULTI_SLICE`, and `MIDDLE` strategies for automated 2D slice extraction from 3D NIfTI volumes, with z-score normalisation
+- **`--slice-mode` flag** — integrate 2D slice extraction into the classifier training pipeline (`--slice-mode max_tumor`)
+- **MAMA-MIA test set evaluation** — `--evaluate-test-set` flag auto-detects the train/test split column in the clinical Excel and evaluates the trained model on left-out test patients
+- **Training visualisations** — `TrainingVisualizer` class generates confusion matrices, ROC curves, precision–recall curves, feature importance plots, classification reports, and a combined dashboard figure
+- **`--no-viz` flag** — disable automatic visusalisation generation during training
+- **`--split-column` flag** — explicitly specify the column name containing train/test split labels
+- **203+ tests** — 63 new tests for slice extraction, training visualisation, split detection, and new CLI flags
+
 ## What's New in v0.3.0
 
 - **Dataset-level z-score normalization** — `DatasetNormalizer` fits globally on all GT images (as per challenge protocol)
@@ -365,6 +375,13 @@ mamasia-train \
 | `--seed` | `42` | Random seed for reproducibility |
 | `--cache-dir` | `None` | Cache directory for extracted features |
 | `--n-workers` | `1` | Number of parallel workers for feature extraction |
+| `--slice-mode` | `None` | 2D extraction strategy: `max_tumor`, `center_tumor`, `multi_slice`, `middle` |
+| `--n-slices` | `5` | Number of slices for `multi_slice` mode |
+| `--evaluate-test-set` | `false` | Evaluate on MAMA-MIA test split after training |
+| `--split-column` | `None` | Column name in clinical Excel for train/test split (auto-detected) |
+| `--no-viz` | `false` | Skip generation of visualisation artefacts |
+| `--quick-test` | `false` | Quick validation run with 10 cases per task |
+| `--n-cases` | `None` | Limit training to first N cases per task |
 | `-v, --verbose` | `false` | Verbose logging |
 
 ### Training Modes
@@ -387,16 +404,94 @@ python -m mama_sia_eval.train_classifier \
     --cv-folds 5
 ```
 
+**2D slice extraction**: Extract the most informative 2D slice from each 3D MRI volume before feature extraction. Recommended for classification tasks where a single representative slice captures the essential tumour characteristics.
+
+```bash
+# Use the slice with the largest tumour cross-section
+python -m mama_sia_eval.train_classifier \
+    --data-dir /path/to/mama-mia-dataset \
+    --output-dir ./models \
+    --slice-mode max_tumor
+
+# Multi-slice feature extraction (concatenate features from 5 slices)
+python -m mama_sia_eval.train_classifier \
+    --data-dir /path/to/mama-mia-dataset \
+    --output-dir ./models \
+    --slice-mode multi_slice \
+    --n-slices 5
+```
+
+**Test-set evaluation**: Train on the MAMA-MIA training split and automatically evaluate on the test split.
+
+```bash
+python -m mama_sia_eval.train_classifier \
+    --data-dir /path/to/mama-mia-dataset \
+    --output-dir ./models \
+    --evaluate-test-set
+```
+
+### 2D Slice Extraction (Python API)
+
+```python
+from mama_sia_eval.slice_extraction import extract_2d_slice, SliceMode
+
+# Load a 3D NIfTI volume (D, H, W)
+import SimpleITK as sitk
+import numpy as np
+
+vol = sitk.GetArrayFromImage(sitk.ReadImage("path/to/volume.nii.gz"))
+mask = sitk.GetArrayFromImage(sitk.ReadImage("path/to/mask.nii.gz")).astype(bool)
+
+# Extract the slice with the largest tumour area
+img_2d, mask_2d, slice_idx = extract_2d_slice(
+    vol, mask, mode=SliceMode.MAX_TUMOR, normalize=True
+)
+print(f"Selected slice {slice_idx}, shape: {img_2d.shape}")
+```
+
+### Training Visualisations (Python API)
+
+```python
+from mama_sia_eval.training_visualization import TrainingVisualizer
+
+viz = TrainingVisualizer(output_dir="./reports")
+viz.generate_all(
+    y_true=y_true, y_pred=y_pred, y_score=y_score,
+    model=trained_model, task="tnbc",
+    dataset_label="Validation",
+)
+# Creates: confusion_matrix_tnbc.png, roc_curve_tnbc.png,
+#          pr_curve_tnbc.png, feature_importance_tnbc.png,
+#          dashboard_tnbc.png, classification_report_tnbc.{txt,json},
+#          confusion_matrix_tnbc.json
+```
+
 ### Training Output
 
 After training, the output directory contains:
 
 ```
 trained-models/
-├── tnbc_classifier.pkl          # TNBC classifier (pickle format)
-├── luminal_classifier.pkl       # Luminal classifier (pickle format)
-├── tnbc_training_report.json    # Training metrics and config
-└── luminal_training_report.json # Training metrics and config
+├── tnbc_classifier.pkl              # TNBC classifier (pickle format)
+├── luminal_classifier.pkl           # Luminal classifier (pickle format)
+├── training_report.json             # Training metadata, metrics, and config
+├── feature_cache/                   # Cached feature vectors (per patient)
+└── visualizations/
+    ├── tnbc/                        # Validation-set visualisations
+    │   ├── confusion_matrix_tnbc.png
+    │   ├── confusion_matrix_tnbc.json
+    │   ├── roc_curve_tnbc.png
+    │   ├── pr_curve_tnbc.png
+    │   ├── feature_importance_tnbc.png
+    │   ├── classification_report_tnbc.txt
+    │   ├── classification_report_tnbc.json
+    │   └── dashboard_tnbc.png       # Combined 2×2 dashboard
+    ├── tnbc_test/                   # Test-set visualisations (if --evaluate-test-set)
+    │   └── ...
+    ├── luminal/
+    │   └── ...
+    └── luminal_test/
+        └── ...
 ```
 
 The `.pkl` files are directly usable with the evaluation pipeline:
@@ -493,20 +588,22 @@ mypy src/
 ```
 mama-sia-eval/
 ├── src/mama_sia_eval/
-│   ├── __init__.py              # Package exports (v0.3.0)
+│   ├── __init__.py              # Package exports (v0.5.0)
 │   ├── __main__.py              # CLI entry point
 │   ├── evaluation.py            # Main evaluation pipeline (MamaSiaEval, DatasetNormalizer)
 │   ├── metrics.py               # Image-to-image & segmentation metrics
 │   ├── frd.py                   # Fréchet Radiomics Distance (batch, cached)
 │   ├── classification.py        # Molecular subtype classification
 │   ├── train_classifier.py      # Classifier training on MAMA-MIA dataset
+│   ├── slice_extraction.py      # 2D slice extraction from 3D NIfTI volumes
+│   ├── training_visualization.py # Confusion matrix, ROC, PR, dashboards
 │   ├── segmentation.py          # Tumor segmentation (ThresholdSegmenter, NNUNetSegmenter)
 │   ├── roi_utils.py             # Tumor ROI extraction & mask dilation
 │   ├── ranking.py               # Borda-style rank aggregation
 │   ├── visualization.py         # Result visualization (tables, charts, overlays)
 │   ├── webapp.py                # Streamlit web interface
 │   └── generate_test_data.py    # Artificial test data generator
-├── tests/                       # 160+ tests (unit + integration + E2E)
+├── tests/                       # 200+ tests (unit + integration + E2E)
 │   ├── conftest.py              # Shared fixtures
 │   ├── test_evaluation.py       # Evaluation & normalizer tests
 │   ├── test_metrics.py          # Metric tests
@@ -516,7 +613,9 @@ mama-sia-eval/
 │   ├── test_roi_utils.py        # ROI utility tests
 │   ├── test_ranking.py          # Ranking tests
 │   ├── test_e2e.py              # End-to-end integration tests
-│   └── test_train_classifier.py # Classifier training tests
+│   ├── test_train_classifier.py # Classifier training tests
+│   ├── test_slice_extraction.py # 2D slice extraction tests
+│   └── test_training_visualization.py # Training visualisation tests
 ├── PDF_ANALYSIS.md              # Contradictions & uncertainties analysis
 ├── Dockerfile                   # Grand Challenge container
 ├── pyproject.toml               # Package configuration

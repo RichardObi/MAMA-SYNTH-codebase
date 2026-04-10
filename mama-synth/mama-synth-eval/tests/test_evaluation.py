@@ -21,7 +21,15 @@ import numpy as np
 import pytest
 import SimpleITK as sitk
 
-from mama_sia_eval.evaluation import MamaSiaEval, DatasetNormalizer, normalize_intensity
+from mama_sia_eval.evaluation import (
+    MamaSiaEval,
+    DatasetNormalizer,
+    normalize_intensity,
+    METRIC_MSE_FULL,
+    METRIC_SSIM_ROI,
+    METRIC_DICE,
+    METRIC_HD95,
+)
 from tests.conftest import save_sitk_image, IMG_SHAPE_2D
 
 
@@ -73,6 +81,10 @@ class TestMamaSiaEval:
         )
         results = evaluator.evaluate()
 
+        # GC-compatible keys
+        assert "aggregates" in results
+        assert "results" in results
+        # Legacy keys
         assert "aggregate" in results
         assert "cases" in results
         assert len(results["cases"]) == 1
@@ -82,6 +94,9 @@ class TestMamaSiaEval:
         assert case["mse"] == 0.0
         assert case["ssim"] == pytest.approx(1.0)
         assert case["ncc"] == pytest.approx(1.0)
+
+        # GC aggregates should have the full-image MSE
+        assert METRIC_MSE_FULL in results["aggregates"]
 
     def test_evaluate_multiple_cases(self, temp_dirs) -> None:
         gt_dir, pred_dir, _, output_file = temp_dirs
@@ -157,6 +172,8 @@ class TestMamaSiaEval:
         with open(output_file) as f:
             data = json.load(f)
 
+        assert "aggregates" in data
+        assert "results" in data
         assert "aggregate" in data
         assert "cases" in data
 
@@ -213,7 +230,7 @@ class TestMamaSiaEval:
         assert len(results["cases"]) == 1
 
     def test_full_image_metrics_in_results(self, populated_dirs) -> None:
-        """Full-image MSE should be present in results."""
+        """Full-image MSE should be present in results and GC aggregates."""
         gt_dir, pred_dir, _, output_file = populated_dirs
 
         evaluator = MamaSiaEval(
@@ -231,8 +248,12 @@ class TestMamaSiaEval:
         assert "mse" in results["full_image"]
         assert results["full_image"]["mse"]["mean"] >= 0
 
+        # GC aggregates
+        assert METRIC_MSE_FULL in results["aggregates"]
+        assert results["aggregates"][METRIC_MSE_FULL]["mean"] >= 0
+
     def test_roi_metrics_with_masks(self, populated_dirs) -> None:
-        """ROI metrics should be computed when masks are provided."""
+        """ROI metrics (SSIM) should be computed when masks are provided."""
         gt_dir, pred_dir, masks_dir, output_file = populated_dirs
 
         evaluator = MamaSiaEval(
@@ -248,8 +269,11 @@ class TestMamaSiaEval:
         results = evaluator.evaluate()
 
         assert "roi" in results
-        assert "mse" in results["roi"]
-        assert results["roi"]["mse"]["mean"] >= 0
+        assert "ssim" in results["roi"]
+        assert results["roi"]["ssim"]["mean"] >= 0
+
+        # GC aggregates
+        assert METRIC_SSIM_ROI in results["aggregates"]
 
     def test_segmentation_eval_with_masks(self, populated_dirs) -> None:
         """Segmentation metrics should be computed when masks and flag are set."""

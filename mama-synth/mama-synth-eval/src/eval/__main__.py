@@ -54,14 +54,16 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
             "MAMA-SYNTH Challenge Evaluation: evaluate pre- to post-contrast "
-            "breast DCE-MRI synthesis across four metric groups (CLF, SEG, ROI, FULL)."
+            "breast DCE-MRI synthesis across 8 equally-weighted metrics — "
+            "MSE, LPIPS (full image), SSIM, FRD (ROI), AUROC luminal, "
+            "AUROC TNBC (classification), Dice, HD95 (segmentation)."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
         "-g", "--ground-truth-path",
         type=Path,
-        default=Path("/opt/app/ground-truth/"),
+        default=Path("/opt/ml/input/data/ground_truth/"),
         help="Path to the ground truth directory containing reference images.",
     )
     parser.add_argument(
@@ -160,15 +162,18 @@ def main() -> int:
         )
         results = evaluator.evaluate()
 
-        # Print summary to stdout
-        if "aggregate" in results:
-            print("\n=== Per-Case Image Metrics (aggregate) ===")
-            for metric, stats in results["aggregate"].items():
-                if isinstance(stats, dict) and "mean" in stats:
-                    print(f"  {metric.upper()}: {stats['mean']:.4f} +/- {stats['std']:.4f}")
+        # Print Grand-Challenge aggregates (the 8 official metrics)
+        if "aggregates" in results and results["aggregates"]:
+            print("\n=== Challenge Metrics (aggregates) ===")
+            for metric, value in results["aggregates"].items():
+                if isinstance(value, dict) and "mean" in value:
+                    print(f"  {metric}: {value['mean']:.4f} +/- {value.get('std', 0):.4f}")
+                elif isinstance(value, (int, float)):
+                    print(f"  {metric}: {value:.4f}")
 
+        # Print per-task detail
         if "full_image" in results:
-            print("\n=== Full-Image Metrics ===")
+            print("\n=== Task 1: Full-Image Metrics ===")
             for metric, stats in results["full_image"].items():
                 if isinstance(stats, dict) and "mean" in stats:
                     print(f"  {metric.upper()}: {stats['mean']:.4f} +/- {stats['std']:.4f}")
@@ -176,23 +181,33 @@ def main() -> int:
                     print(f"  {metric.upper()}: {stats:.4f}")
 
         if "roi" in results:
-            print("\n=== Tumor ROI Metrics ===")
+            print("\n=== Task 2: Tumor ROI Metrics ===")
             for metric, stats in results["roi"].items():
                 if isinstance(stats, dict) and "mean" in stats:
                     print(f"  {metric.upper()}: {stats['mean']:.4f} +/- {stats['std']:.4f}")
                 elif isinstance(stats, (int, float)):
                     print(f"  {metric.upper()}: {stats:.4f}")
 
+        if "classification" in results:
+            print("\n=== Task 3: Classification Metrics ===")
+            for key, val in results["classification"].items():
+                if isinstance(val, (int, float)):
+                    print(f"  {key}: {val:.4f}")
+                else:
+                    print(f"  {key}: {val}")
+
         if "segmentation" in results:
-            print("\n=== Segmentation Metrics ===")
+            print("\n=== Task 4: Segmentation Metrics ===")
             for metric, stats in results["segmentation"].items():
                 if isinstance(stats, dict) and "mean" in stats:
                     print(f"  {metric.upper()}: {stats['mean']:.4f} +/- {stats['std']:.4f}")
 
-        if "classification" in results:
-            print("\n=== Classification Metrics ===")
-            for key, val in results["classification"].items():
-                print(f"  {key}: {val}")
+        # Legacy per-case aggregate
+        if "aggregate" in results:
+            print("\n=== Per-Case Image Metrics (legacy aggregate) ===")
+            for metric, stats in results["aggregate"].items():
+                if isinstance(stats, dict) and "mean" in stats:
+                    print(f"  {metric.upper()}: {stats['mean']:.4f} +/- {stats['std']:.4f}")
 
         if "missing_predictions" in results:
             n_missing = len(results["missing_predictions"])

@@ -15,13 +15,22 @@
 """
 mama-sia-eval: Evaluation suite for the MAMA-SYNTH challenge.
 
-Pre- to post-contrast translation evaluation for breast DCE-MRI,
-covering image fidelity, distributional realism (FRD), downstream
-segmentation, and downstream classification metrics.
+Pre- to post-contrast translation evaluation for breast DCE-MRI with
+8 equally-weighted metrics across four tasks: full-image comparison
+(MSE, LPIPS), tumor ROI comparison (SSIM, FRD), classification (AUROC),
+and segmentation (Dice, HD95).
 """
 
 from mama_sia_eval.evaluation import (
     DatasetNormalizer,
+    METRIC_AUROC_LUMINAL,
+    METRIC_AUROC_TNBC,
+    METRIC_DICE,
+    METRIC_FRD_ROI,
+    METRIC_HD95,
+    METRIC_LPIPS_FULL,
+    METRIC_MSE_FULL,
+    METRIC_SSIM_ROI,
     MamaSiaEval,
     normalize_intensity,
 )
@@ -35,11 +44,26 @@ from mama_sia_eval.metrics import (
     compute_psnr,
     compute_ssim,
 )
+from mama_sia_eval.slice_extraction import (
+    SliceMode,
+    extract_2d_slice,
+    extract_multi_slices,
+)
+from mama_sia_eval.training_visualization import TrainingVisualizer
 
 __all__ = [
     "MamaSiaEval",
     "DatasetNormalizer",
     "normalize_intensity",
+    # Challenge metric name constants
+    "METRIC_MSE_FULL",
+    "METRIC_LPIPS_FULL",
+    "METRIC_SSIM_ROI",
+    "METRIC_FRD_ROI",
+    "METRIC_AUROC_LUMINAL",
+    "METRIC_AUROC_TNBC",
+    "METRIC_DICE",
+    "METRIC_HD95",
     # Image-to-image metrics
     "compute_mae",
     "compute_mse",
@@ -52,6 +76,12 @@ __all__ = [
     "compute_hd95",
     # Classifier training
     "train_classifier",
+    # 2D slice extraction
+    "SliceMode",
+    "extract_2d_slice",
+    "extract_multi_slices",
+    # Training visualisation
+    "TrainingVisualizer",
 ]
 
-__version__ = "0.3.0"
+__version__ = "0.5.0"

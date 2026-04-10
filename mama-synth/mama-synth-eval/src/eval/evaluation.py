@@ -16,14 +16,42 @@
 Main evaluation module for the MAMA-SYNTH challenge.
 
 Evaluates generative models that translate pre-contrast to post-contrast
-breast DCE-MRI images across four metric groups (each contributing 25%
-to the final ranking):
+breast DCE-MRI images across four tasks with **8 equally-weighted metrics**
+(2 per task):
 
-  1. **Classification (CLF)**: TNBC and Luminal subtype classification
-     (AUROC and balanced accuracy).
-  2. **Segmentation (SEG)**: Tumor segmentation (Dice and HD95).
-  3. **Tumor ROI metrics**: MSE, LPIPS, and FRD within a dilated tumor ROI.
-  4. **Full-image metrics**: MSE, LPIPS, and FRD over the full breast image.
+  Task 1 — Full-image comparison:
+      1.1  MSE   (pixel-wise image comparison)
+      1.2  LPIPS (perceptual image comparison)
+
+  Task 2 — Tumor ROI comparison:
+      2.1  SSIM  (pixel-based tumor-area intensity & texture comparison)
+      2.2  FRD   (distributional comparison of tumor-area realism)
+
+  Task 3 — Classification:
+      3.1  AUROC luminal     (standard medical AUC metric)
+      3.2  AUROC triple-neg. (same metric, second subtype)
+
+  Task 4 — Segmentation:
+      4.1  Dice  (classic standardised segmentation metric)
+      4.2  HD95  (complementary boundary-distance metric)
+
+All 8 metrics are ranked equally in a flat Borda-count ranking.
+
+The output ``metrics.json`` uses a Grand-Challenge-compatible structure::
+
+    {
+      "aggregates": {
+          "mse_full_image": {"mean": ..., "std": ...},
+          "lpips_full_image": {"mean": ..., "std": ...},
+          "ssim_roi": {"mean": ..., "std": ...},
+          "frd_roi": ...,
+          "auroc_luminal": ...,
+          "auroc_tnbc": ...,
+          "dice": {"mean": ..., "std": ...},
+          "hausdorff95": {"mean": ..., "std": ...}
+      },
+      "results": [ ... per-case details ... ]
+    }
 
 All image-based metrics are computed on intensity-normalized images using
 **dataset-level z-score normalization** as specified in the challenge protocol.
@@ -49,6 +77,20 @@ from mama_sia_eval.metrics import (
 )
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Challenge metric names (Grand Challenge jsonpath keys)
+# ---------------------------------------------------------------------------
+
+# The 8 official challenge metrics
+METRIC_MSE_FULL = "mse_full_image"
+METRIC_LPIPS_FULL = "lpips_full_image"
+METRIC_SSIM_ROI = "ssim_roi"
+METRIC_FRD_ROI = "frd_roi"
+METRIC_AUROC_LUMINAL = "auroc_luminal"
+METRIC_AUROC_TNBC = "auroc_tnbc"
+METRIC_DICE = "dice"
+METRIC_HD95 = "hausdorff95"
 
 # Optional: tqdm progress bars
 try:
@@ -125,9 +167,16 @@ class DatasetNormalizer:
 class MamaSiaEval:
     """Evaluation class for the MAMA-SYNTH challenge.
 
-    Implements the full evaluation pipeline across four metric groups:
-    image-to-image fidelity, distributional realism (FRD), downstream
-    segmentation, and downstream classification.
+    Implements the full evaluation pipeline across four tasks with
+    8 equally-weighted metrics (2 per task):
+
+    - Task 1 (Full Image): MSE + LPIPS
+    - Task 2 (ROI):        SSIM + FRD
+    - Task 3 (CLF):        AUROC luminal + AUROC TNBC
+    - Task 4 (SEG):        Dice + Hausdorff95
+
+    Output is a Grand-Challenge-compatible ``metrics.json`` with
+    ``aggregates`` dict using flat JSON paths.
 
     Attributes:
         ground_truth_path: Path to directory with ground truth post-contrast images.
@@ -187,7 +236,9 @@ class MamaSiaEval:
         """Run the complete evaluation pipeline.
 
         Returns:
-            Dictionary containing all computed metrics organized by group.
+            Dictionary containing all computed metrics in
+            Grand-Challenge-compatible format with ``aggregates`` and
+            ``results`` keys.
 
         Raises:
             FileNotFoundError: If required directories don't exist.
@@ -245,41 +296,56 @@ class MamaSiaEval:
         # Load optional masks
         masks = self._load_masks([p[0] for p in pairs]) if self.masks_path else None
 
-        # ---- Group 4: Full-Image metrics (MSE, LPIPS, FRD) ----
-        full_image_metrics = self._evaluate_full_image(pairs, gt_images_raw)
+        # --- Aggregates dict (Grand-Challenge-compatible) ---
+        aggregates: dict[str, Any] = {}
 
-        # ---- Group 3: Tumor ROI metrics (MSE, LPIPS, FRD) ----
-        roi_metrics = self._evaluate_roi(pairs, masks) if masks else {}
+        # ---- Task 1: Full-Image metrics (MSE + LPIPS) ----
+        full_image_results = self._evaluate_full_image(pairs, gt_images_raw)
+        aggregates.update(full_image_results.get("aggregates", {}))
 
-        # ---- Group 2: Segmentation (DSC, HD95) ----
-        seg_metrics = self._evaluate_segmentation(pairs, masks) if (
-            self.enable_segmentation and masks
-        ) else {}
+        # ---- Task 2: Tumor ROI metrics (SSIM + FRD) ----
+        roi_results: dict[str, Any] = {}
+        if masks:
+            roi_results = self._evaluate_roi(pairs, masks)
+            aggregates.update(roi_results.get("aggregates", {}))
 
-        # ---- Group 1: Classification (AUROC, balanced accuracy) ----
-        clf_metrics = self._evaluate_classification(pairs) if (
-            self.enable_classification and self.labels_path
-        ) else {}
+        # ---- Task 3: Classification (AUROC luminal + AUROC TNBC) ----
+        clf_results: dict[str, Any] = {}
+        if self.enable_classification and self.labels_path:
+            clf_results = self._evaluate_classification(pairs)
+            aggregates.update(clf_results.get("aggregates", {}))
 
-        # ---- Legacy per-case image metrics (backward compatibility) ----
-        case_metrics, aggregate = self._evaluate_pairwise_legacy(pairs)
+        # ---- Task 4: Segmentation (Dice + HD95) ----
+        seg_results: dict[str, Any] = {}
+        if self.enable_segmentation and masks:
+            seg_results = self._evaluate_segmentation(pairs, masks)
+            aggregates.update(seg_results.get("aggregates", {}))
+
+        # ---- Per-case results (legacy + GC results list) ----
+        case_metrics, legacy_aggregate = self._evaluate_pairwise_legacy(pairs)
 
         # Apply worst-score imputation for missing predictions
         if missing_stems:
-            self._impute_missing(case_metrics, aggregate, missing_stems)
+            self._impute_missing(case_metrics, legacy_aggregate, missing_stems)
 
-        # Assemble results
+        # Assemble Grand-Challenge-compatible results
         results: dict[str, Any] = {
-            "aggregate": aggregate,
-            "full_image": full_image_metrics,
+            "aggregates": aggregates,
+            "results": case_metrics,
+            # Legacy keys for backward compatibility
+            "aggregate": legacy_aggregate,
             "cases": case_metrics,
         }
-        if roi_metrics:
-            results["roi"] = roi_metrics
-        if seg_metrics:
-            results["segmentation"] = seg_metrics
-        if clf_metrics:
-            results["classification"] = clf_metrics
+
+        # Task-level detail (for debugging / visualization)
+        if full_image_results.get("detail"):
+            results["full_image"] = full_image_results["detail"]
+        if roi_results.get("detail"):
+            results["roi"] = roi_results["detail"]
+        if seg_results.get("detail"):
+            results["segmentation"] = seg_results["detail"]
+        if clf_results.get("detail"):
+            results["classification"] = clf_results["detail"]
         if missing_stems:
             results["missing_predictions"] = missing_stems
 
@@ -287,7 +353,7 @@ class MamaSiaEval:
         return results
 
     # ------------------------------------------------------------------
-    # Group 4: Full-image metrics
+    # Task 1: Full-image metrics (MSE + LPIPS)
     # ------------------------------------------------------------------
 
     def _evaluate_full_image(
@@ -295,7 +361,10 @@ class MamaSiaEval:
         pairs: list[tuple[Path, Path]],
         gt_images_raw: list[NDArray],
     ) -> dict[str, Any]:
-        """Compute full-image MSE, optionally LPIPS and FRD."""
+        """Compute full-image MSE and LPIPS.
+
+        Returns dict with 'aggregates' and 'detail' sub-keys.
+        """
         mse_values: list[float] = []
         lpips_values: list[float] = []
         real_images: list[NDArray] = []
@@ -313,9 +382,12 @@ class MamaSiaEval:
             real_images.append(gt)
             synth_images.append(pred)
 
-        result: dict[str, Any] = {
-            "mse": self._aggregate(mse_values),
-        }
+        agg: dict[str, Any] = {}
+        detail: dict[str, Any] = {}
+
+        if mse_values:
+            agg[METRIC_MSE_FULL] = self._aggregate(mse_values)
+            detail["mse"] = self._aggregate(mse_values)
 
         if self.enable_lpips:
             try:
@@ -327,23 +399,15 @@ class MamaSiaEval:
                     leave=False,
                 ):
                     lpips_values.append(compute_lpips(pred, gt))
-                result["lpips"] = self._aggregate(lpips_values)
+                agg[METRIC_LPIPS_FULL] = self._aggregate(lpips_values)
+                detail["lpips"] = self._aggregate(lpips_values)
             except ImportError:
                 logger.warning("LPIPS unavailable (torch/lpips not installed), skipping.")
 
-        if self.enable_frd and len(real_images) >= 2:
-            try:
-                from mama_sia_eval.frd import compute_frd as _frd
-
-                frd_val = _frd(real_images, synth_images)
-                result["frd"] = frd_val
-            except ImportError:
-                logger.warning("FRD unavailable (pyradiomics not installed), skipping.")
-
-        return result
+        return {"aggregates": agg, "detail": detail}
 
     # ------------------------------------------------------------------
-    # Group 3: Tumor ROI metrics
+    # Task 2: Tumor ROI metrics (SSIM + FRD)
     # ------------------------------------------------------------------
 
     def _evaluate_roi(
@@ -351,11 +415,13 @@ class MamaSiaEval:
         pairs: list[tuple[Path, Path]],
         masks: dict[str, NDArray[np.bool_]],
     ) -> dict[str, Any]:
-        """Compute tumor-ROI restricted MSE, optionally LPIPS and FRD."""
+        """Compute tumor-ROI SSIM and FRD.
+
+        Returns dict with 'aggregates' and 'detail' sub-keys.
+        """
         from mama_sia_eval.roi_utils import extract_roi_pair
 
-        mse_values: list[float] = []
-        lpips_values: list[float] = []
+        ssim_values: list[float] = []
         real_rois: list[NDArray] = []
         synth_rois: list[NDArray] = []
 
@@ -372,44 +438,41 @@ class MamaSiaEval:
             real_roi, synth_roi, _ = extract_roi_pair(
                 gt, pred, mask, margin_mm=self.roi_margin_mm
             )
-            mse_values.append(float(np.mean((synth_roi - real_roi) ** 2)))
+
+            # Compute SSIM within the ROI
+            data_range = float(np.max(real_roi) - np.min(real_roi))
+            if data_range > 0:
+                ssim_val = compute_ssim(synth_roi, real_roi, data_range=data_range)
+            else:
+                ssim_val = 1.0  # identical constant images
+            ssim_values.append(ssim_val)
+
             real_rois.append(real_roi)
             synth_rois.append(synth_roi)
 
-        if not mse_values:
+        if not ssim_values:
             return {}
 
-        result: dict[str, Any] = {
-            "mse": self._aggregate(mse_values),
-        }
+        agg: dict[str, Any] = {}
+        detail: dict[str, Any] = {}
 
-        if self.enable_lpips:
-            try:
-                from mama_sia_eval.metrics import compute_lpips
-
-                for gt_roi, pred_roi in tqdm(
-                    list(zip(real_rois, synth_rois)),
-                    desc="LPIPS (ROI)",
-                    leave=False,
-                ):
-                    lpips_values.append(compute_lpips(pred_roi, gt_roi))
-                result["lpips"] = self._aggregate(lpips_values)
-            except ImportError:
-                logger.warning("LPIPS unavailable for ROI, skipping.")
+        agg[METRIC_SSIM_ROI] = self._aggregate(ssim_values)
+        detail["ssim"] = self._aggregate(ssim_values)
 
         if self.enable_frd and len(real_rois) >= 2:
             try:
                 from mama_sia_eval.frd import compute_frd as _frd
 
                 frd_val = _frd(real_rois, synth_rois)
-                result["frd"] = frd_val
+                agg[METRIC_FRD_ROI] = frd_val
+                detail["frd"] = frd_val
             except ImportError:
-                logger.warning("FRD unavailable for ROI, skipping.")
+                logger.warning("FRD unavailable (pyradiomics not installed), skipping.")
 
-        return result
+        return {"aggregates": agg, "detail": detail}
 
     # ------------------------------------------------------------------
-    # Group 2: Segmentation
+    # Task 4: Segmentation (Dice + HD95)
     # ------------------------------------------------------------------
 
     def _evaluate_segmentation(
@@ -417,7 +480,10 @@ class MamaSiaEval:
         pairs: list[tuple[Path, Path]],
         masks: dict[str, NDArray[np.bool_]],
     ) -> dict[str, Any]:
-        """Evaluate segmentation on synthetic images."""
+        """Evaluate segmentation on synthetic images.
+
+        Returns dict with 'aggregates' and 'detail' sub-keys.
+        """
         from mama_sia_eval.segmentation import (
             ThresholdSegmenter,
             evaluate_segmentation_pair,
@@ -462,20 +528,29 @@ class MamaSiaEval:
         if not dice_values:
             return {}
 
-        return {
+        agg: dict[str, Any] = {
+            METRIC_DICE: self._aggregate(dice_values),
+            METRIC_HD95: self._aggregate(hd95_values),
+        }
+        detail: dict[str, Any] = {
             "dice": self._aggregate(dice_values),
             "hd95": self._aggregate(hd95_values),
         }
 
+        return {"aggregates": agg, "detail": detail}
+
     # ------------------------------------------------------------------
-    # Group 1: Classification
+    # Task 3: Classification (AUROC luminal + AUROC TNBC)
     # ------------------------------------------------------------------
 
     def _evaluate_classification(
         self,
         pairs: list[tuple[Path, Path]],
     ) -> dict[str, Any]:
-        """Evaluate molecular subtype classification on synthetic images."""
+        """Evaluate molecular subtype classification on synthetic images.
+
+        Returns dict with 'aggregates' and 'detail' sub-keys.
+        """
         if self.labels_path is None or not self.labels_path.exists():
             return {}
 
@@ -520,10 +595,14 @@ class MamaSiaEval:
         y_tnbc = np.array(tnbc_true, dtype=np.int64)
         y_luminal = np.array(luminal_true, dtype=np.int64)
 
-        result: dict[str, Any] = {"n_cases": len(features_list)}
+        agg: dict[str, Any] = {}
+        detail: dict[str, Any] = {"n_cases": len(features_list)}
 
         # Try loading pre-trained organizer models
-        for task, y_true in [("tnbc", y_tnbc), ("luminal", y_luminal)]:
+        for task, y_true, metric_key in [
+            ("luminal", y_luminal, METRIC_AUROC_LUMINAL),
+            ("tnbc", y_tnbc, METRIC_AUROC_TNBC),
+        ]:
             model_path = None
             if self.clf_model_dir and self.clf_model_dir.exists():
                 candidate = self.clf_model_dir / f"{task}_classifier.pkl"
@@ -534,24 +613,29 @@ class MamaSiaEval:
                 clf = RadiomicsClassifier(task=task, model_path=model_path)
                 y_score = clf.predict_proba(feature_matrix)
                 clf_result = evaluate_classification(y_true, y_score)
-                result[f"auroc_{task}"] = clf_result["auroc"]
-                result[f"balanced_accuracy_{task}"] = clf_result["balanced_accuracy"]
+                agg[metric_key] = clf_result["auroc"]
+                detail[f"auroc_{task}"] = clf_result["auroc"]
+                detail[f"balanced_accuracy_{task}"] = clf_result["balanced_accuracy"]
             else:
-                result[f"note_{task}"] = (
+                detail[f"note_{task}"] = (
                     f"No pre-trained {task} classifier found. "
                     "Provide model via --clf-model-dir."
                 )
 
-        return result
+        return {"aggregates": agg, "detail": detail}
 
     # ------------------------------------------------------------------
-    # Legacy per-case metrics (backward compatibility)
+    # Per-case metrics (backward compatibility + GC results list)
     # ------------------------------------------------------------------
 
     def _evaluate_pairwise_legacy(
         self, pairs: list[tuple[Path, Path]]
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-        """Compute per-case image-to-image metrics (backward compatible)."""
+        """Compute per-case image-to-image metrics.
+
+        Returns per-case list and aggregate dict (backward compatible).
+        These also populate the ``results`` list in GC output.
+        """
         all_metrics: dict[str, list[float]] = {
             "mae": [], "mse": [], "nmse": [], "psnr": [], "ssim": [], "ncc": [],
         }

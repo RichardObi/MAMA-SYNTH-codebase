@@ -122,6 +122,10 @@ class TestE2EPipeline:
     """End-to-end evaluation pipeline tests."""
 
     def test_results_has_expected_keys(self, eval_results: dict) -> None:
+        # GC-compatible keys
+        assert "aggregates" in eval_results
+        assert "results" in eval_results
+        # Legacy keys
         assert "aggregate" in eval_results
         assert "cases" in eval_results
         assert "full_image" in eval_results
@@ -143,7 +147,7 @@ class TestE2EPipeline:
 
     def test_roi_metrics_present(self, eval_results: dict) -> None:
         assert "roi" in eval_results
-        assert "mse" in eval_results["roi"]
+        assert "ssim" in eval_results["roi"]
 
     def test_segmentation_metrics_present(self, eval_results: dict) -> None:
         assert "segmentation" in eval_results
