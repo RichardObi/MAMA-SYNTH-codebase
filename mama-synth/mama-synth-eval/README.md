@@ -350,7 +350,7 @@ mamasia-train \
 | `--output-dir` | *required* | Where to save trained model `.pkl` files |
 | `--clinical-data` | `None` | Path to Excel file (auto-detected in `--data-dir` if omitted) |
 | `--images-dir` | `None` | Images directory (default: `<data-dir>/images`) |
-| `--segmentations-dir` | `None` | Segmentations directory (default: `<data-dir>/segmentations`) |
+| `--segmentations-dir` / `--masks-path` | `None` | Path to segmentation masks folder (default: `<data-dir>/segmentations`). Use this when masks are not in the default location. |
 | `--tasks` | `tnbc,luminal` | Comma-separated list of tasks to train |
 | `--phase` | `1` | DCE-MRI phase to use (0=pre-contrast, 1=first post-contrast) |
 | `--val-ratio` | `0.2` | Fraction of data for validation (holdout mode) |

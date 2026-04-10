@@ -553,16 +553,47 @@ def extract_features_for_patients(
             n_failed += 1
             continue
 
-        # Load mask (optional - use full image if not available)
+        # Load mask (required for mask-dependent slice modes, optional otherwise)
+        _mask_dependent = _slice_mode in (
+            SliceMode.MAX_TUMOR, SliceMode.CENTER_TUMOR, SliceMode.MULTI_SLICE
+        )
         mask_array: Optional[NDArray[np.bool_]] = None
         try:
             mask_array = _load_mask_as_array(seg_path)
+            if not np.any(mask_array):
+                msg = f"Segmentation mask is empty (all zeros) for {pid}: {seg_path}"
+                if _mask_dependent:
+                    logger.warning(
+                        f"{msg}. Slice mode '{slice_mode}' requires a valid mask — "
+                        f"skipping patient to avoid feature extraction from wrong region."
+                    )
+                    n_failed += 1
+                    continue
+                else:
+                    logger.debug(f"{msg}, using full image for feature extraction.")
+                    mask_array = None
         except FileNotFoundError:
-            logger.debug(f"No segmentation for {pid}, using full image.")
+            if _mask_dependent:
+                logger.warning(
+                    f"No segmentation mask found for {pid} but slice_mode='{slice_mode}' "
+                    f"requires one — skipping patient. Expected: {seg_path}"
+                )
+                n_failed += 1
+                continue
+            else:
+                logger.debug(f"No segmentation for {pid} ({seg_path}), using full image.")
         except Exception as e:
-            logger.warning(
-                f"Failed to load segmentation for {pid}: {e}, using full image."
-            )
+            if _mask_dependent:
+                logger.warning(
+                    f"Failed to load segmentation for {pid}: {e} — "
+                    f"skipping (slice_mode='{slice_mode}' requires a mask)."
+                )
+                n_failed += 1
+                continue
+            else:
+                logger.warning(
+                    f"Failed to load segmentation for {pid}: {e}, using full image."
+                )
 
         # ----- 2D slice extraction (if enabled) -----
         if _slice_mode is not None and image_array.ndim == 3:
@@ -1034,12 +1065,14 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         help=f"Override path to images folder. Default: <data-dir>/{IMAGES_SUBDIR}",
     )
     parser.add_argument(
-        "--segmentations-dir",
+        "--segmentations-dir", "--masks-path",
+        dest="segmentations_dir",
         type=Path,
         default=None,
         help=(
-            f"Override path to segmentations folder. "
-            f"Default: <data-dir>/{SEGMENTATIONS_SUBDIR}"
+            f"Path to the segmentation masks folder. "
+            f"Default: <data-dir>/{SEGMENTATIONS_SUBDIR}. "
+            "Alias: --masks-path (consistent with the evaluation CLI)."
         ),
     )
 
