@@ -17,14 +17,14 @@ Rankings use **Borda-style hierarchical rank aggregation** with tie-break priori
 
 ## What's New in v0.8.0
 
+- **CSV-based train/test split** — the MAMA-MIA dataset ships a `train_test_splits.csv` file with `train_split` and `test_split` columns listing patient IDs. This is now auto-detected in `--data-dir` and used as the primary split mechanism. Use `--split-csv /path/to/file.csv` to point to a custom location. Falls back to column-based detection when no CSV is found.
 - **CNN slice caching** (`--cache-dir`) — extracted 2-D slices are written to disk on the first run and re-loaded on subsequent runs, avoiding repeated NIfTI I/O. Each patient's slices are stored in a `.npz` file keyed by extraction parameters (phase, slice mode, dual-phase, mask channel), so different configurations use separate caches.
 - **GPU / device selection** (`--device`) — new CLI flag for CNN training and evaluation: `auto` (default, selects CUDA → MPS → CPU), `cpu`, `cuda`, or `mps`. Previously the device was always auto-detected with no way to override.
-- **MAMA-MIA test split by dataset** (`--test-split-values`) — use arbitrary column values as the test set. The MAMA-MIA clinical Excel has a `dataset` column with values `DUKE`, `ISPY1`, `ISPY2`, `NACT` but no train/test split. With `--split-column dataset --test-split-values DUKE`, all DUKE patients become the test set. The improved error message now explains this and suggests the correct flags.
+- **MAMA-MIA test split by dataset** (`--test-split-values`) — use arbitrary column values as the test set when no CSV is available. With `--split-column dataset --test-split-values DUKE`, all DUKE patients become the test set.
 - **Bug fixes**:
   - Fixed `NameError` in `train_cnn()` — `dual_phase` parameter was referenced but not declared in the function signature.
   - Fixed `evaluate_cnn()` crashing on GPU/MPS — `.cpu()` was missing before `.numpy()` on tensors.
   - Fixed dual-phase evaluation crash when pre-contrast files are partially missing — zero-padding is now applied to maintain consistent feature widths.
-- **321 tests** — 21 new tests covering CNN slice caching, device selection, test-split-values CLI, and bug fix verification.
 
 ## What's New in v0.7.0
 
@@ -396,7 +396,9 @@ mamasia-train \
 | `--slice-mode` | `None` | 2D extraction strategy: `max_tumor`, `center_tumor`, `multi_slice`, `all_tumor`, `middle` |
 | `--n-slices` | `5` | Number of slices for `multi_slice` mode |
 | `--evaluate-test-set` | `false` | Evaluate on MAMA-MIA test split after training |
+| `--split-csv` | `None` | Path to `train_test_splits.csv` (auto-detected in `--data-dir`) |
 | `--split-column` | `None` | Column name in clinical Excel for train/test split (auto-detected) |
+| `--test-split-values` | `None` | Custom test-set values for `--split-column` (e.g. `DUKE ISPY1`) |
 | `--no-viz` | `false` | Skip generation of visualisation artefacts |
 | `--quick-test` | `false` | Quick validation run with 10 cases per task |
 | `--n-cases` | `None` | Limit training to first N cases per task |
@@ -546,7 +548,7 @@ python -m eval \
 ```
 
 
-**Test-set evaluation**: Train on the MAMA-MIA training split and automatically evaluate on the test split.
+**Test-set evaluation**: Train on the MAMA-MIA training split and automatically evaluate on the test split. The split is loaded from `train_test_splits.csv` (auto-detected in `--data-dir`).
 
 ```bash
 python -m eval.train_classifier \
@@ -555,7 +557,17 @@ python -m eval.train_classifier \
     --evaluate-test-set
 ```
 
-**Test-set evaluation with MAMA-MIA datasets**: Use specific source datasets (e.g. DUKE) as test set.
+**Test-set evaluation with explicit split CSV**: Point to a specific split file.
+
+```bash
+python -m eval.train_classifier \
+    --data-dir /path/to/mama-mia-dataset \
+    --output-dir ./models \
+    --evaluate-test-set \
+    --split-csv /path/to/train_test_splits.csv
+```
+
+**Test-set evaluation by dataset source**: Use specific source datasets (e.g. DUKE) as test set (fallback when no split CSV is available).
 
 ```bash
 python -m eval.train_classifier \

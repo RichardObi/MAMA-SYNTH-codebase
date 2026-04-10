@@ -126,6 +126,14 @@ DEFAULT_N_SLICES = 5
 # We try each in order.
 SPLIT_COLUMN_CANDIDATES = ["dataset_split", "split", "dataset"]
 
+# Auto-detected filenames for the CSV-based train/test split shipped with
+# the MAMA-MIA dataset.  The file has two ragged columns: ``train_split``
+# and ``test_split``, each cell is a patient ID.
+SPLIT_CSV_CANDIDATES = [
+    "train_test_splits.csv",
+    "train_test_split.csv",
+]
+
 # Values that identify test-set patients in the split column.
 # Matching is done *case-insensitively* — only lowercase forms are needed here.
 TEST_SPLIT_VALUES = {"test", "testing"}
@@ -386,6 +394,79 @@ def create_labels(
     return patient_ids, labels
 
 
+def load_split_csv(
+    csv_path: Path,
+) -> tuple[list[str], list[str]]:
+    """Load train/test patient IDs from a MAMA-MIA split CSV file.
+
+    The expected format has two columns — ``train_split`` and
+    ``test_split`` — each cell containing a patient ID.  Columns may
+    have different lengths (ragged); empty cells are silently ignored.
+
+    Args:
+        csv_path: Path to the CSV file.
+
+    Returns:
+        Tuple of ``(train_ids, test_ids)``.
+
+    Raises:
+        FileNotFoundError: If *csv_path* does not exist.
+        ValueError: If the expected columns are not found.
+    """
+    import pandas as pd
+
+    if not csv_path.exists():
+        raise FileNotFoundError(f"Split CSV not found: {csv_path}")
+
+    df = pd.read_csv(csv_path)
+
+    # Normalise column names
+    col_map = {c.lower().strip(): c for c in df.columns}
+
+    train_col = col_map.get("train_split")
+    test_col = col_map.get("test_split")
+
+    if train_col is None and test_col is None:
+        raise ValueError(
+            f"Split CSV {csv_path} does not contain expected columns "
+            f"'train_split' and/or 'test_split'.  Found: {list(df.columns)}"
+        )
+
+    train_ids: list[str] = []
+    test_ids: list[str] = []
+
+    if train_col is not None:
+        train_ids = (
+            df[train_col].dropna().astype(str).str.strip()
+            .loc[lambda s: s != ""].tolist()
+        )
+    if test_col is not None:
+        test_ids = (
+            df[test_col].dropna().astype(str).str.strip()
+            .loc[lambda s: s != ""].tolist()
+        )
+
+    logger.info(
+        f"Loaded split CSV: {len(train_ids)} train, {len(test_ids)} test "
+        f"patients from {csv_path.name}"
+    )
+    return train_ids, test_ids
+
+
+def _find_split_csv(data_dir: Path) -> Optional[Path]:
+    """Auto-detect a split CSV file in *data_dir*.
+
+    Tries each filename in :data:`SPLIT_CSV_CANDIDATES` (case-sensitive)
+    and returns the first match, or ``None``.
+    """
+    for candidate in SPLIT_CSV_CANDIDATES:
+        p = data_dir / candidate
+        if p.exists():
+            logger.info(f"Auto-detected split CSV: {p}")
+            return p
+    return None
+
+
 def detect_split_column(
     clinical_df: "pd.DataFrame",
     custom_test_values: Optional[list[str]] = None,
@@ -457,31 +538,71 @@ def split_train_test_patients(
     clinical_df: "pd.DataFrame",
     split_column: Optional[str] = None,
     test_split_values: Optional[list[str]] = None,
+    split_csv: Optional[Path] = None,
+    data_dir: Optional[Path] = None,
 ) -> tuple[list[str], list[str]]:
-    """Split patient IDs into train and test sets using the clinical data.
+    """Split patient IDs into train and test sets.
 
-    If *test_split_values* is provided the split column is matched against
-    those values (case-insensitive).  Patients whose value matches are
-    treated as test, all others as training.
+    The function tries three strategies in order of priority:
 
-    If no split column is detected and no custom values are given, all
-    patients are returned as training patients and the test list is empty.
+    1. **CSV file** — A dedicated CSV with ``train_split`` /
+       ``test_split`` columns listing patient IDs.  This is the format
+       shipped with the MAMA-MIA dataset (``train_test_splits.csv``).
+       Pass the path explicitly via *split_csv*, or let auto-detection
+       find it in *data_dir*.
+    2. **Column + custom values** — A column in the clinical Excel is
+       matched against *test_split_values* (case-insensitive).
+    3. **Column + standard labels** — A column whose values contain
+       ``train`` / ``test``.
+
+    If none of the above succeeds, all patients are returned as training
+    patients and the test list is empty.
 
     Args:
         clinical_df: Clinical data DataFrame.
-        split_column: Column name containing split labels. If None,
+        split_column: Column name containing split labels. If ``None``,
             auto-detection is attempted.
         test_split_values: Custom test-set value(s) for the split column.
-            When provided, any patient whose column value
-            (case-insensitive) matches is placed in the test set;
-            all remaining patients go to the training set.
+        split_csv: Explicit path to a split CSV file.  When ``None``,
+            the function looks for ``train_test_splits.csv`` (or similar)
+            inside *data_dir*.
+        data_dir: MAMA-MIA dataset root — used for auto-detecting the
+            split CSV.  Ignored when *split_csv* is given explicitly.
 
     Returns:
-        Tuple of (train_patient_ids, test_patient_ids).
+        Tuple of ``(train_patient_ids, test_patient_ids)``.
     """
-    # --- Resolve split column ---
+    # --- Strategy 1: CSV-based split ---
+    csv_path = split_csv
+    if csv_path is None and data_dir is not None:
+        csv_path = _find_split_csv(data_dir)
+
+    if csv_path is not None:
+        try:
+            csv_train, csv_test = load_split_csv(csv_path)
+            # Cross-reference with clinical_df patient IDs so that we
+            # only return IDs that actually exist in the data.
+            valid_pids = set(clinical_df["patient_id"].astype(str).tolist())
+            train_ids = [p for p in csv_train if p in valid_pids]
+            test_ids = [p for p in csv_test if p in valid_pids]
+            n_train_dropped = len(csv_train) - len(train_ids)
+            n_test_dropped = len(csv_test) - len(test_ids)
+            if n_train_dropped or n_test_dropped:
+                logger.info(
+                    f"Split CSV cross-ref: dropped {n_train_dropped} train "
+                    f"and {n_test_dropped} test IDs not present in clinical "
+                    f"data ({len(valid_pids)} patients)."
+                )
+            logger.info(
+                f"Dataset split (CSV): {len(train_ids)} training, "
+                f"{len(test_ids)} test"
+            )
+            return train_ids, test_ids
+        except (FileNotFoundError, ValueError) as exc:
+            logger.warning(f"Failed to load split CSV: {exc}")
+
+    # --- Strategy 2 & 3: column-based split ---
     if split_column is None and test_split_values is not None:
-        # User gave custom values but no column — try auto-detect
         split_column = detect_split_column(
             clinical_df, custom_test_values=test_split_values,
         )
@@ -1483,10 +1604,24 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         action="store_true",
         help=(
             "After training, evaluate the model on the MAMA-MIA test set "
-            "split. Requires a 'dataset_split' (or similar) column in the "
-            "clinical Excel file. Test results including confusion matrix, "
-            "ROC curve, and classification report are saved alongside the "
-            "training outputs."
+            "split. The split is loaded from the CSV file "
+            "'train_test_splits.csv' in --data-dir (auto-detected), or "
+            "from the path given by --split-csv. Alternatively, a split "
+            "column in the clinical Excel can be used (--split-column). "
+            "Test results including confusion matrix, ROC curve, and "
+            "classification report are saved alongside the training outputs."
+        ),
+    )
+    parser.add_argument(
+        "--split-csv",
+        type=Path,
+        default=None,
+        help=(
+            "Path to a CSV file with 'train_split' and 'test_split' "
+            "columns listing patient IDs.  This is the standard split "
+            "format shipped with the MAMA-MIA dataset. When omitted, "
+            "auto-detection looks for 'train_test_splits.csv' in "
+            "--data-dir."
         ),
     )
     parser.add_argument(
@@ -1736,32 +1871,34 @@ def main(argv: Optional[list[str]] = None) -> None:
 
     # Detect test-set split if requested
     test_patient_ids_global: list[str] = []
+    train_patient_ids_global: list[str] = []
     if args.evaluate_test_set:
         logger.info("\n--- Detecting MAMA-MIA train/test split ---")
-        _, test_patient_ids_global = split_train_test_patients(
+        train_patient_ids_global, test_patient_ids_global = split_train_test_patients(
             clinical_df,
             split_column=args.split_column,
             test_split_values=getattr(args, "test_split_values", None),
+            split_csv=getattr(args, "split_csv", None),
+            data_dir=args.data_dir,
         )
         if len(test_patient_ids_global) == 0:
             logger.error(
                 "=" * 60 + "\n"
                 "TEST-SET EVALUATION ABORTED: No test-set patients found.\n"
                 "\n"
-                "The clinical data does not contain a recognisable train/test\n"
-                "split column, or the column values do not match the expected\n"
-                f"labels (test: {sorted(TEST_SPLIT_VALUES)}, "
-                f"train: {sorted(TRAIN_SPLIT_VALUES)}).\n"
+                "No 'train_test_splits.csv' was found in --data-dir, and\n"
+                "the clinical data does not contain a recognisable train/test\n"
+                "split column.\n"
                 "\n"
-                f"Column candidates tried (case-insensitive): "
-                f"{SPLIT_COLUMN_CANDIDATES}\n"
-                f"Columns found in data: {list(clinical_df.columns)}\n"
+                f"CSV files tried: {SPLIT_CSV_CANDIDATES}\n"
+                f"Column candidates tried: {SPLIT_COLUMN_CANDIDATES}\n"
+                f"Columns in data: {list(clinical_df.columns)}\n"
                 "\n"
-                "Hint: use --split-column <name> to specify the column\n"
-                "explicitly, and --test-split-values <val1> <val2> ... to\n"
-                "treat specific values as test patients.\n"
-                "Example for MAMA-MIA (split by source dataset):\n"
-                "  --split-column dataset --test-split-values DUKE\n"
+                "Hints:\n"
+                "  1. Place 'train_test_splits.csv' (with train_split and\n"
+                "     test_split columns) in the --data-dir folder.\n"
+                "  2. Or use --split-csv /path/to/train_test_splits.csv\n"
+                "  3. Or use --split-column <col> --test-split-values <val>\n"
                 "\n"
                 "Training will proceed WITHOUT test-set evaluation.\n"
                 + "=" * 60
