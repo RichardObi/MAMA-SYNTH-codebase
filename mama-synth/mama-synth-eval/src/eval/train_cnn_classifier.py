@@ -111,8 +111,13 @@ class MRISliceDataset:
     """PyTorch-compatible dataset for 2D MRI slices.
 
     Each item returns a ``(tensor, label)`` pair where *tensor* has shape
-    ``(3, image_size, image_size)`` (3-channel replicated grayscale) and
-    *label* is a scalar ``float32`` (0.0 or 1.0).
+    ``(C, image_size, image_size)`` and *label* is a scalar ``float32``
+    (0.0 or 1.0).
+
+    When *masks* is ``None``, the output has 3 channels (replicated
+    grayscale for pretrained backbones).  When *masks* is provided the
+    output has 4 channels — the first three are the replicated image and
+    the fourth is the binary segmentation mask.
 
     Parameters
     ----------
@@ -124,6 +129,9 @@ class MRISliceDataset:
         Output spatial resolution (squared).
     augment : bool
         Whether to apply training-time data augmentation.
+    masks : list[NDArray] | None
+        Optional list of 2D binary mask arrays aligned with *slices*.
+        When given, a 4th channel is appended to each sample.
     """
 
     def __init__(
@@ -132,6 +140,7 @@ class MRISliceDataset:
         labels: NDArray,
         image_size: int = DEFAULT_CNN_IMAGE_SIZE,
         augment: bool = False,
+        masks: Optional[list[NDArray]] = None,
     ) -> None:
         import torch  # noqa: F811 — lazy import
 
@@ -139,8 +148,9 @@ class MRISliceDataset:
         self.labels = np.asarray(labels, dtype=np.float32)
         self.image_size = image_size
         self.augment = augment
+        self.masks = masks
 
-        # Build augmentation pipeline (operates on 3-channel tensors)
+        # Build augmentation pipeline (operates on C-channel tensors)
         if augment:
             from torchvision import transforms
 
@@ -162,29 +172,77 @@ class MRISliceDataset:
         import torch
         import torch.nn.functional as F
 
-        img = self.slices[idx].astype(np.float32)
+        raw = self.slices[idx]
         label = self.labels[idx]
 
-        # Per-slice min-max normalisation → [0, 1]
-        vmin, vmax = float(img.min()), float(img.max())
-        if vmax - vmin > 1e-8:
-            img = (img - vmin) / (vmax - vmin)
+        # --- Dual-phase input: (2, H, W) → (6, H, W) ---------------------
+        if raw.ndim == 3 and raw.shape[0] == 2:
+            channels: list[torch.Tensor] = []
+            for ch_idx in range(2):
+                ch = raw[ch_idx].astype(np.float32)
+                vmin, vmax = float(ch.min()), float(ch.max())
+                if vmax - vmin > 1e-8:
+                    ch = (ch - vmin) / (vmax - vmin)
+                else:
+                    ch = np.zeros_like(ch)
+                t = torch.from_numpy(ch).unsqueeze(0)  # (1, H, W)
+                t = F.interpolate(
+                    t.unsqueeze(0),
+                    size=(self.image_size, self.image_size),
+                    mode="bilinear",
+                    align_corners=False,
+                ).squeeze(0)  # (1, H, W)
+                channels.append(t.repeat(3, 1, 1))  # (3, H, W)
+            tensor = torch.cat(channels, dim=0)  # (6, H, W)
+
+            # Optional mask channel for dual-phase
+            if self.masks is not None:
+                mask_arr = self.masks[idx].astype(np.float32)
+                if mask_arr.ndim == 3:
+                    mask_arr = mask_arr[0]
+                mask_t = torch.from_numpy(mask_arr).unsqueeze(0)  # (1, H, W)
+                mask_t = F.interpolate(
+                    mask_t.unsqueeze(0),
+                    size=(self.image_size, self.image_size),
+                    mode="nearest",
+                ).squeeze(0)
+                tensor = torch.cat([tensor, mask_t], dim=0)  # (7, H, W)
+
         else:
-            img = np.zeros_like(img)
+            # --- Single-phase input (original flow) -----------------------
+            img = raw.astype(np.float32)
 
-        # → (1, H, W) tensor
-        tensor = torch.from_numpy(img).unsqueeze(0)
+            # Per-slice min-max normalisation → [0, 1]
+            vmin, vmax = float(img.min()), float(img.max())
+            if vmax - vmin > 1e-8:
+                img = (img - vmin) / (vmax - vmin)
+            else:
+                img = np.zeros_like(img)
 
-        # Resize to (image_size, image_size)
-        tensor = F.interpolate(
-            tensor.unsqueeze(0),
-            size=(self.image_size, self.image_size),
-            mode="bilinear",
-            align_corners=False,
-        ).squeeze(0)
+            # → (1, H, W) tensor
+            tensor = torch.from_numpy(img).unsqueeze(0)
 
-        # Replicate to 3 channels for pretrained backbone
-        tensor = tensor.repeat(3, 1, 1)
+            # Resize to (image_size, image_size)
+            tensor = F.interpolate(
+                tensor.unsqueeze(0),
+                size=(self.image_size, self.image_size),
+                mode="bilinear",
+                align_corners=False,
+            ).squeeze(0)
+
+            # Replicate to 3 channels for pretrained backbone
+            tensor = tensor.repeat(3, 1, 1)
+
+            # Optionally add mask as 4th channel
+            if self.masks is not None:
+                mask_arr = self.masks[idx].astype(np.float32)
+                mask_t = torch.from_numpy(mask_arr).unsqueeze(0)  # (1, H, W)
+                mask_t = F.interpolate(
+                    mask_t.unsqueeze(0),
+                    size=(self.image_size, self.image_size),
+                    mode="nearest",
+                ).squeeze(0)  # (1, image_size, image_size)
+                tensor = torch.cat([tensor, mask_t], dim=0)  # (4, H, W)
 
         # Data augmentation (training only)
         if self.transform is not None:
@@ -201,6 +259,7 @@ def create_cnn_model(
     model_name: str = DEFAULT_CNN_MODEL_NAME,
     pretrained: bool = True,
     num_classes: int = 1,
+    in_chans: int = 3,
 ):
     """Create a ``timm`` CNN model.
 
@@ -213,18 +272,92 @@ def create_cnn_model(
     num_classes : int
         Number of output units (1 for binary classification with
         BCEWithLogitsLoss).
+    in_chans : int
+        Number of input channels.  When set to 4 (mask-channel mode) and
+        *pretrained* is ``True``, the first convolutional layer is
+        expanded by copying the pretrained 3-channel weights and
+        zero-initialising the 4th channel so that the model starts from
+        a sensible state.
 
     Returns
     -------
     model : torch.nn.Module
     """
     import timm
+    import torch
 
+    if in_chans == 3 or not pretrained:
+        # Standard case — timm handles in_chans natively
+        model = timm.create_model(
+            model_name,
+            pretrained=pretrained,
+            num_classes=num_classes,
+            in_chans=in_chans,
+        )
+        return model
+
+    # Pretrained + non-standard in_chans: load 3-channel pretrained first,
+    # then manually extend the first conv layer.
     model = timm.create_model(
         model_name,
-        pretrained=pretrained,
+        pretrained=True,
         num_classes=num_classes,
+        in_chans=3,
     )
+
+    # Find the first Conv2d layer
+    first_conv = None
+    first_conv_name = ""
+    for name, module in model.named_modules():
+        if isinstance(module, torch.nn.Conv2d):
+            first_conv = module
+            first_conv_name = name
+            break
+
+    if first_conv is not None and first_conv.in_channels == 3:
+        old_weight = first_conv.weight.data  # (out, 3, kH, kW)
+        new_in = in_chans
+        new_conv = torch.nn.Conv2d(
+            new_in,
+            first_conv.out_channels,
+            kernel_size=first_conv.kernel_size,
+            stride=first_conv.stride,
+            padding=first_conv.padding,
+            dilation=first_conv.dilation,
+            groups=first_conv.groups,
+            bias=first_conv.bias is not None,
+            padding_mode=first_conv.padding_mode,
+        )
+        # Copy pretrained weights for first 3 channels, zero-init extra
+        with torch.no_grad():
+            new_conv.weight[:, :3, :, :] = old_weight
+            new_conv.weight[:, 3:, :, :] = 0.0
+            if first_conv.bias is not None and new_conv.bias is not None:
+                new_conv.bias.copy_(first_conv.bias)
+
+        # Replace the layer in the model
+        parts = first_conv_name.split(".")
+        parent = model
+        for p in parts[:-1]:
+            parent = getattr(parent, p)
+        setattr(parent, parts[-1], new_conv)
+
+        logger.info(
+            f"Expanded first conv '{first_conv_name}' from 3 → {new_in} "
+            f"input channels (extra channels zero-initialised)."
+        )
+    else:
+        logger.warning(
+            f"Could not find 3-channel Conv2d to expand. Using timm "
+            f"default in_chans={in_chans} handling."
+        )
+        model = timm.create_model(
+            model_name,
+            pretrained=pretrained,
+            num_classes=num_classes,
+            in_chans=in_chans,
+        )
+
     return model
 
 
@@ -241,7 +374,9 @@ def extract_slices_for_cnn(
     phase: int = DEFAULT_PHASE,
     slice_mode: str = "all_tumor",
     n_slices: int = DEFAULT_N_SLICES,
-) -> tuple[list[NDArray], NDArray, list[str]]:
+    return_masks: bool = False,
+    dual_phase: bool = False,
+) -> tuple[list[NDArray], NDArray, list[str], Optional[list[NDArray]]]:
     """Extract raw 2D slices for CNN training.
 
     Similar to :func:`extract_features_for_patients` in
@@ -264,6 +399,10 @@ def extract_slices_for_cnn(
         Slice extraction strategy (see :class:`SliceMode`).
     n_slices : int
         Number of slices for ``multi_slice`` mode.
+    return_masks : bool
+        If ``True``, also return the corresponding 2D mask slices
+        (for mask-channel mode).  When a mask is unavailable for a
+        particular slice, a zero-filled array of the same shape is used.
 
     Returns
     -------
@@ -274,6 +413,9 @@ def extract_slices_for_cnn(
         when ``all_tumor`` mode produces multiple slices per patient).
     slice_pids : list[str]
         Patient ID for each slice.
+    slice_masks : list[NDArray] | None
+        Corresponding 2D mask arrays (only when *return_masks* is
+        ``True``; otherwise ``None``).
     """
     from eval.slice_extraction import (
         SliceMode,
@@ -312,12 +454,40 @@ def extract_slices_for_cnn(
     all_slices: list[NDArray] = []
     all_labels: list[float] = []
     all_pids: list[str] = []
+    all_masks: list[NDArray] = []  # only populated when return_masks=True
     n_failed = 0
+
+    def _maybe_stack_dual(
+        s: NDArray, vol0: "Optional[NDArray]", si: int,
+    ) -> NDArray:
+        """If dual_phase, stack phase-0 slice under the phase-1 slice."""
+        if not dual_phase or vol0 is None:
+            return s
+        if vol0.ndim == 3 and 0 <= si < vol0.shape[0]:
+            p0 = vol0[si].astype(np.float32)
+        elif vol0.ndim == 2:
+            p0 = vol0.astype(np.float32)
+        else:
+            p0 = np.zeros_like(s, dtype=np.float32)
+        return np.stack([s, p0], axis=0)  # (2, H, W)
 
     for i, pid in iterator:
         try:
             img_path = _get_image_path(images_dir, pid, phase)
             volume = _load_nifti_as_array(img_path)
+
+            # Dual-phase: also load pre-contrast volume
+            phase0_volume: Optional[NDArray] = None
+            if dual_phase:
+                try:
+                    phase0_path = _get_image_path(images_dir, pid, 0)
+                    phase0_volume = _load_nifti_as_array(phase0_path)
+                except Exception as e:
+                    logger.warning(
+                        f"Dual-phase: failed to load phase-0 for "
+                        f"{pid}: {e}, skipping patient."
+                    )
+                    continue
 
             # Load mask (optional for MIDDLE mode)
             mask: Optional[NDArray] = None
@@ -346,28 +516,37 @@ def extract_slices_for_cnn(
                 slices_2d, masks_2d, indices = extract_all_tumor_slices(
                     volume, mask,
                 )
-                for s in slices_2d:
-                    all_slices.append(s)
+                for j, s in enumerate(slices_2d):
+                    all_slices.append(_maybe_stack_dual(s, phase0_volume, indices[j]))
                     all_labels.append(label)
                     all_pids.append(pid)
+                    if return_masks:
+                        m2d = masks_2d[j] if masks_2d is not None and j < len(masks_2d) else np.zeros_like(s)
+                        all_masks.append(m2d.astype(np.float32))
 
             elif _slice_mode == SliceMode.MULTI_SLICE:
                 slices_2d, masks_2d, indices = extract_multi_slices(
                     volume, mask, n_slices=n_slices,
                 )
-                for s in slices_2d:
-                    all_slices.append(s)
+                for j, s in enumerate(slices_2d):
+                    all_slices.append(_maybe_stack_dual(s, phase0_volume, indices[j]))
                     all_labels.append(label)
                     all_pids.append(pid)
+                    if return_masks:
+                        m2d = masks_2d[j] if masks_2d is not None and j < len(masks_2d) else np.zeros_like(s)
+                        all_masks.append(m2d.astype(np.float32))
 
             else:
                 # Single-slice modes
                 slice_2d, mask_2d, idx = extract_2d_slice(
                     volume, mask, mode=_slice_mode,
                 )
-                all_slices.append(slice_2d)
+                all_slices.append(_maybe_stack_dual(slice_2d, phase0_volume, idx))
                 all_labels.append(label)
                 all_pids.append(pid)
+                if return_masks:
+                    m2d = mask_2d if mask_2d is not None else np.zeros_like(slice_2d)
+                    all_masks.append(m2d.astype(np.float32))
 
         except Exception as e:
             logger.warning(f"Failed to extract slices for {pid}: {e}")
@@ -386,7 +565,12 @@ def extract_slices_for_cnn(
         f"({n_failed} failed)"
     )
 
-    return all_slices, np.array(all_labels, dtype=np.float32), all_pids
+    return (
+        all_slices,
+        np.array(all_labels, dtype=np.float32),
+        all_pids,
+        all_masks if return_masks else None,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -408,6 +592,9 @@ def train_cnn(
     weight_decay: float = DEFAULT_CNN_WEIGHT_DECAY,
     patience: int = DEFAULT_CNN_PATIENCE,
     seed: int = DEFAULT_SEED,
+    train_masks: Optional[list[NDArray]] = None,
+    val_masks: Optional[list[NDArray]] = None,
+    use_mask_channel: bool = False,
 ) -> tuple[Any, dict[str, float]]:
     """Train a CNN classifier on 2D MRI slices.
 
@@ -437,6 +624,12 @@ def train_cnn(
         Early stopping patience (epochs without AUROC improvement).
     seed : int
         Random seed.
+    train_masks, val_masks : list[NDArray] | None
+        Optional 2D mask arrays (one per slice).  Required when
+        *use_mask_channel* is ``True``.
+    use_mask_channel : bool
+        When ``True``, the model receives a 4-channel input
+        (3 × image + 1 × mask).
 
     Returns
     -------
@@ -469,10 +662,12 @@ def train_cnn(
     train_ds = MRISliceDataset(
         train_slices, train_labels,
         image_size=image_size, augment=True,
+        masks=train_masks if use_mask_channel else None,
     )
     val_ds = MRISliceDataset(
         val_slices, val_labels,
         image_size=image_size, augment=False,
+        masks=val_masks if use_mask_channel else None,
     )
 
     train_loader = DataLoader(
@@ -486,8 +681,11 @@ def train_cnn(
     )
 
     # --- Model ------------------------------------------------------------
+    base_chans = 6 if dual_phase else 3
+    in_chans = base_chans + 1 if use_mask_channel else base_chans
     model = create_cnn_model(
         model_name=model_name, pretrained=True, num_classes=1,
+        in_chans=in_chans,
     )
     model = model.to(device)
 
@@ -658,6 +856,8 @@ def train_cnn(
         "model_name": model_name,
         "num_classes": 1,
         "image_size": image_size,
+        "in_chans": in_chans,
+        "use_mask_channel": use_mask_channel,
         "task": task,
         "best_epoch": best_epoch,
         "best_val_auroc": best_val_auroc,
@@ -687,6 +887,7 @@ def evaluate_cnn(
     labels: NDArray,
     image_size: int = DEFAULT_CNN_IMAGE_SIZE,
     batch_size: int = DEFAULT_CNN_BATCH_SIZE,
+    masks: Optional[list[NDArray]] = None,
 ) -> dict[str, float]:
     """Evaluate a trained CNN on a set of slices.
 
@@ -702,6 +903,8 @@ def evaluate_cnn(
         Expected input resolution.
     batch_size : int
         Inference batch size.
+    masks : list[NDArray] | None
+        Optional 2D mask arrays (for mask-channel models).
 
     Returns
     -------
@@ -716,7 +919,10 @@ def evaluate_cnn(
     model = model.to(device)
     model.eval()
 
-    ds = MRISliceDataset(slices, labels, image_size=image_size, augment=False)
+    ds = MRISliceDataset(
+        slices, labels, image_size=image_size, augment=False,
+        masks=masks,
+    )
     loader = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=0)
 
     criterion = nn.BCEWithLogitsLoss()
@@ -783,6 +989,7 @@ def load_cnn_model(
         model_name=checkpoint["model_name"],
         pretrained=False,
         num_classes=checkpoint.get("num_classes", 1),
+        in_chans=checkpoint.get("in_chans", 3),
     )
     model.load_state_dict(checkpoint["model_state_dict"])
     model = model.to(device)
@@ -822,6 +1029,8 @@ def train_cnn_pipeline(
     evaluate_test_set: bool = False,
     test_patient_ids: Optional[list[str]] = None,
     clinical_df: Optional[Any] = None,
+    use_mask_channel: bool = False,
+    dual_phase: bool = False,
 ) -> tuple[Any, str, dict[str, float]]:
     """Full CNN training pipeline for a single task.
 
@@ -842,9 +1051,11 @@ def train_cnn_pipeline(
     _check_cnn_dependencies()
 
     logger.info(f"\n--- CNN: Extracting 2D slices for task '{task}' ---")
+    if use_mask_channel:
+        logger.info("Mask-channel mode: masks will be added as 4th input channel.")
 
     # 1. Extract slices
-    all_slices, slice_labels, slice_pids = extract_slices_for_cnn(
+    all_slices, slice_labels, slice_pids, all_masks = extract_slices_for_cnn(
         patient_ids=patient_ids,
         labels=labels,
         data_dir=data_dir,
@@ -853,6 +1064,8 @@ def train_cnn_pipeline(
         phase=phase,
         slice_mode=slice_mode,
         n_slices=n_slices,
+        return_masks=use_mask_channel,
+        dual_phase=dual_phase,
     )
 
     # 2. Patient-aware train/val split
@@ -893,6 +1106,13 @@ def train_cnn_pipeline(
         dtype=np.float32,
     )
 
+    # Split masks if mask-channel mode
+    train_masks_list: Optional[list[NDArray]] = None
+    val_masks_list: Optional[list[NDArray]] = None
+    if use_mask_channel and all_masks is not None:
+        train_masks_list = [m for m, p in zip(all_masks, slice_pids) if p in train_pid_set]
+        val_masks_list = [m for m, p in zip(all_masks, slice_pids) if p in val_pid_set]
+
     logger.info(
         f"Patient-aware split: {len(train_pid_set)} train patients "
         f"({len(train_slices)} slices), {len(val_pid_set)} val patients "
@@ -914,9 +1134,13 @@ def train_cnn_pipeline(
         learning_rate=learning_rate,
         patience=patience,
         seed=seed,
+        train_masks=train_masks_list,
+        val_masks=val_masks_list,
+        use_mask_channel=use_mask_channel,
     )
 
-    model_desc = f"CNN({model_name}, img={image_size})"
+    mask_tag = ", mask_ch" if use_mask_channel else ""
+    model_desc = f"CNN({model_name}, img={image_size}{mask_tag})"
 
     # 4. Test-set evaluation
     if evaluate_test_set and test_patient_ids and clinical_df is not None:
@@ -935,7 +1159,7 @@ def train_cnn_pipeline(
             )
 
             if len(test_pids_task) > 0:
-                test_slices, test_lbl, test_spids = extract_slices_for_cnn(
+                test_slices, test_lbl, test_spids, test_masks_ret = extract_slices_for_cnn(
                     patient_ids=test_pids_task,
                     labels=test_labels_task,
                     data_dir=data_dir,
@@ -944,12 +1168,14 @@ def train_cnn_pipeline(
                     phase=phase,
                     slice_mode=slice_mode,
                     n_slices=n_slices,
+                    return_masks=use_mask_channel,
                 )
 
                 # Patient-level aggregation for test: average per-slice probs
                 test_metrics = evaluate_cnn(
                     best_model, test_slices, test_lbl,
                     image_size=image_size,
+                    masks=test_masks_ret,
                 )
                 logger.info(
                     f"CNN TEST SET — {task}: "

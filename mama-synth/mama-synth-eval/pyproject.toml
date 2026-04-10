@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mama-synth-eval"
-version = "0.6.0"
+version = "0.7.0"
 description = "Evaluation methods for pre- to post-contrast translation in breast DCE-MRI (8 equally-weighted metrics, Grand Challenge compatible)"
 readme = "README.md"
 license = {file = "LICENSE"}

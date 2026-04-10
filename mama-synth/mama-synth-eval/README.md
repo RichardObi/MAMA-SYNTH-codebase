@@ -15,6 +15,15 @@ The MAMA-SYNTH challenge evaluates generative models that translate pre-contrast
 
 Rankings use **Borda-style hierarchical rank aggregation** with tie-break priority: ROI → CLF → SEG → FULL.
 
+## What's New in v0.7.0
+
+- **Dual-phase classification** (`--dual-phase`) — optionally use both pre-contrast (phase 0) and post-contrast (phase 1) images for molecular subtype classification. For radiomics, features from both phases are concatenated (doubling the feature dimension). For CNN, channels from both phases are stacked into a 6-channel input. Disabled by default to preserve challenge emphasis on post-contrast synthesis quality; useful as an ablation baseline. Use `--precontrast-path` to specify the pre-contrast image directory during evaluation.
+- **CNN mask channel** (`--cnn-mask-channel`) — add the tumor segmentation mask as a 4th input channel to the CNN classifier, providing spatial guidance about tumor location. The first convolutional layer is expanded from 3→4 channels with zero-initialised mask weights so pretrained ImageNet features are preserved.
+- **Radiomics model selection** (`--radiomics-model`) — filter the radiomics classifier family during training: `random_forest`, `logistic_regression`, `svm`, `xgboost`, or `all` (default). Reduces training time when only a specific model family is needed.
+- **Ensemble inference** (`--ensemble`, `--save-all-models`) — average predicted probabilities across multiple trained classifiers. During training, `--save-all-models` persists every successfully trained model (not just the best). During evaluation, `--ensemble` loads all model files matching `{task}_classifier*.pkl` and `{task}_classifier*.pt` from `--clf-model-dir` and ensembles their predictions.
+- **EnsembleClassifier** — new class in `classification.py` that combines `RadiomicsClassifier` and/or `CNNClassifier` instances, with auto-discovery of model files via `EnsembleClassifier.discover_models()`.
+- **300+ tests** — 34 new tests covering dual-phase feature extraction (radiomics + CNN), mask channel, radiomics model selection, ensemble inference, and CLI integration.
+
 ## What's New in v0.6.0
 
 - **EfficientNet CNN classifier** — `--classifier-type cnn` trains an EfficientNet-B0 deep learning classifier as a higher-capacity alternative to the radiomics-based models (~0.6 AUROC). Includes ImageNet pre-training, cosine LR scheduling, class-weighted loss, early stopping, and gradient clipping.
@@ -143,6 +152,9 @@ python -m eval \
 | `--roi-margin-mm` | `10.0` | Dilation margin (mm) around tumor mask for ROI |
 | `--seg-model-path` | `None` | Pre-trained nnUNet model directory for segmentation |
 | `--clf-model-dir` | `None` | Directory with pre-trained `.pkl` classifier models |
+| `--ensemble` | `false` | Average probabilities across all models in `--clf-model-dir` |
+| `--dual-phase` | `false` | Concatenate pre-contrast features for classification |
+| `--precontrast-path` | `None` | Pre-contrast images directory for `--dual-phase` |
 | `--cache-dir` | `None` | Feature cache directory (speeds up repeated FRD runs) |
 | `--disable-lpips` | `false` | Skip LPIPS (if torch unavailable) |
 | `--disable-frd` | `false` | Skip FRD (if pyradiomics unavailable) |
@@ -385,6 +397,10 @@ mamasia-train \
 | `--cnn-batch-size` | `32` | Batch size (CNN mode only) |
 | `--cnn-lr` | `1e-4` | Initial learning rate (CNN mode only) |
 | `--cnn-patience` | `10` | Early-stopping patience in epochs (CNN mode only) |
+| `--cnn-mask-channel` | `false` | Add tumor mask as 4th CNN input channel |
+| `--radiomics-model` | `all` | Radiomics family filter: `all`, `xgboost`, `random_forest`, `logistic_regression`, `svm` |
+| `--save-all-models` | `false` | Save all trained models (not just best) for ensemble |
+| `--dual-phase` | `false` | Use both phase 0 + phase 1 for classification |
 | `-v, --verbose` | `false` | Verbose logging |
 
 ### Training Modes
@@ -452,6 +468,69 @@ mamasia-train \
 ```
 
 Requires the `[cnn]` extra: `pip install "eval[cnn]"`
+**Model selection by family**: Train only a specific classifier family.
+
+```bash
+# Train only Random Forest classifiers
+mamasia-train \
+    --data-dir /path/to/mama-mia-dataset \
+    --output-dir ./models \
+    --radiomics-model random_forest
+```
+
+**CNN with mask channel**: Add tumor mask as spatial guidance.
+
+```bash
+mamasia-train \
+    --data-dir /path/to/mama-mia-dataset \
+    --output-dir ./models \
+    --classifier-type cnn \
+    --cnn-mask-channel
+```
+
+**Save all models for ensemble**: Persist every trained model.
+
+```bash
+mamasia-train \
+    --data-dir /path/to/mama-mia-dataset \
+    --output-dir ./models \
+    --save-all-models
+```
+
+**Dual-phase classification**: Use both pre-contrast and post-contrast images.
+
+```bash
+mamasia-train \
+    --data-dir /path/to/mama-mia-dataset \
+    --output-dir ./models \
+    --dual-phase
+```
+
+**Ensemble evaluation**: Average predictions across all saved models.
+
+```bash
+python -m eval \
+    --ground-truth-path /path/to/ground-truth \
+    --predictions-path /path/to/predictions \
+    --clf-model-dir /path/to/trained-models \
+    --labels-path /path/to/labels.csv \
+    --ensemble \
+    --output-file metrics.json
+```
+
+**Dual-phase evaluation**: Include pre-contrast features during evaluation.
+
+```bash
+python -m eval \
+    --ground-truth-path /path/to/ground-truth \
+    --predictions-path /path/to/predictions \
+    --clf-model-dir /path/to/trained-models \
+    --labels-path /path/to/labels.csv \
+    --dual-phase \
+    --precontrast-path /path/to/precontrast-images \
+    --output-file metrics.json
+```
+
 
 **Test-set evaluation**: Train on the MAMA-MIA training split and automatically evaluate on the test split.
 
@@ -505,6 +584,8 @@ After training, the output directory contains:
 ```
 trained-models/
 ├── tnbc_classifier.pkl              # TNBC classifier (radiomics mode)
+├── tnbc_classifier_RF_0.pkl         # Additional models (--save-all-models)
+├── tnbc_classifier_LR_1.pkl         # ...
 ├── luminal_classifier.pkl           # Luminal classifier (radiomics mode)
 ├── tnbc_classifier_cnn.pt           # TNBC classifier (CNN mode)
 ├── luminal_classifier_cnn.pt        # Luminal classifier (CNN mode)
@@ -707,7 +788,7 @@ mama-synth-eval
 │   ├── evaluation.py            # Main evaluation pipeline (MamaSynthEval, DatasetNormalizer)
 │   ├── metrics.py               # Image-to-image & segmentation metrics
 │   ├── frd.py                   # Fréchet Radiomics Distance (batch, cached)
-│   ├── classification.py        # Molecular subtype classification (RadiomicsClassifier, CNNClassifier)
+│   ├── classification.py        # Molecular subtype classification (RadiomicsClassifier, CNNClassifier, EnsembleClassifier)
 │   ├── train_classifier.py      # Classifier training on MAMA-MIA dataset
 │   ├── train_cnn_classifier.py  # EfficientNet CNN training pipeline
 │   ├── slice_extraction.py      # 2D slice extraction from 3D NIfTI volumes
@@ -719,7 +800,7 @@ mama-synth-eval
 │   ├── synthesize.py            # Synthesis pipeline (medigan wrapper + CLI)
 │   ├── webapp.py                # Streamlit web interface
 │   └── generate_test_data.py    # Artificial test data generator
-├── tests/                       # 280+ tests (unit + integration + E2E)
+├── tests/                       # 300+ tests (unit + integration + E2E)
 │   ├── conftest.py              # Shared fixtures
 │   ├── test_evaluation.py       # Evaluation & normalizer tests
 │   ├── test_metrics.py          # Metric tests
@@ -731,6 +812,7 @@ mama-synth-eval
 │   ├── test_e2e.py              # End-to-end integration tests
 │   ├── test_train_classifier.py # Classifier training tests
 │   ├── test_train_cnn_classifier.py # CNN classifier training tests
+│   ├── test_v070_features.py    # v0.7.0 feature tests (dual-phase, ensemble, etc.)
 │   ├── test_synthesize.py       # Synthesis pipeline tests
 │   ├── test_slice_extraction.py # 2D slice extraction tests
 │   └── test_training_visualization.py # Training visualisation tests

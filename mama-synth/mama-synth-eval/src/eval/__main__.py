@@ -109,6 +109,37 @@ def main() -> int:
         help="Directory with pre-trained classifier .pkl files (tnbc_classifier.pkl, luminal_classifier.pkl).",
     )
     parser.add_argument(
+        "--ensemble",
+        action="store_true",
+        help=(
+            "Enable ensemble inference for classification. When set, all "
+            "model files matching {task}_classifier*.pkl and "
+            "{task}_classifier*.pt in --clf-model-dir are loaded and their "
+            "predicted probabilities are averaged. This allows combining "
+            "multiple radiomics models and/or CNN models."
+        ),
+    )
+    parser.add_argument(
+        "--dual-phase",
+        action="store_true",
+        help=(
+            "Use both pre-contrast (phase 0) and post-contrast (phase 1) "
+            "images for classification. For radiomics, features from both "
+            "phases are concatenated. Disabled by default to preserve "
+            "challenge emphasis on post-contrast synthesis quality."
+        ),
+    )
+    parser.add_argument(
+        "--precontrast-path",
+        type=Path,
+        default=None,
+        help=(
+            "Directory containing pre-contrast images for --dual-phase "
+            "classification. If not provided, --ground-truth-path is used "
+            "as fallback (assuming GT directory contains pre-contrast images)."
+        ),
+    )
+    parser.add_argument(
         "--cache-dir",
         type=Path,
         default=None,
@@ -159,6 +190,9 @@ def main() -> int:
             seg_model_path=args.seg_model_path,
             clf_model_dir=args.clf_model_dir,
             cache_dir=args.cache_dir,
+            ensemble=args.ensemble,
+            dual_phase=getattr(args, "dual_phase", False),
+            precontrast_path=getattr(args, "precontrast_path", None),
         )
         results = evaluator.evaluate()
 

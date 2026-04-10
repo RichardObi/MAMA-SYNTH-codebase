@@ -157,6 +157,7 @@ def _make_pipeline(clf: Any) -> Pipeline:
 
 def _get_model_configs(
     scale_pos_weight: float = 1.0,
+    model_filter: Optional[str] = None,
 ) -> list[dict[str, Any]]:
     """Return a list of model configurations to try during training.
 
@@ -167,6 +168,10 @@ def _get_model_configs(
         scale_pos_weight: Ratio *n_negative / n_positive* for the current
             task.  Passed directly to XGBoost's ``scale_pos_weight`` and
             used to inform other class-imbalance parameters.
+        model_filter: If not None/\"all\", only include configs whose
+            family matches this value.  Accepted values:
+            ``\"xgboost\"``, ``\"random_forest\"``, ``\"logistic_regression\"``,
+            ``\"svm\"``, ``\"all\"`` (or ``None``).
     """
     configs: list[dict[str, Any]] = []
 
@@ -179,6 +184,7 @@ def _get_model_configs(
         configs.extend([
             {
                 "name": "XGB(n=200, d=3, lr=0.1, bal)",
+                "family": "xgboost",
                 "create_fn": lambda: _make_pipeline(XGBClassifier(
                     n_estimators=200, max_depth=3, learning_rate=0.1,
                     scale_pos_weight=_spw,
@@ -188,6 +194,7 @@ def _get_model_configs(
             },
             {
                 "name": "XGB(n=300, d=4, lr=0.05, bal)",
+                "family": "xgboost",
                 "create_fn": lambda: _make_pipeline(XGBClassifier(
                     n_estimators=300, max_depth=4, learning_rate=0.05,
                     scale_pos_weight=_spw,
@@ -197,6 +204,7 @@ def _get_model_configs(
             },
             {
                 "name": "XGB(n=200, d=5, lr=0.05, sub=0.8, bal)",
+                "family": "xgboost",
                 "create_fn": lambda: _make_pipeline(XGBClassifier(
                     n_estimators=200, max_depth=5, learning_rate=0.05,
                     subsample=0.8, colsample_bytree=0.8,
@@ -207,6 +215,7 @@ def _get_model_configs(
             },
             {
                 "name": "XGB(n=150, d=6, lr=0.1, sub=0.8, bal)",
+                "family": "xgboost",
                 "create_fn": lambda: _make_pipeline(XGBClassifier(
                     n_estimators=150, max_depth=6, learning_rate=0.1,
                     subsample=0.8, colsample_bytree=0.8,
@@ -225,6 +234,7 @@ def _get_model_configs(
     configs.extend([
         {
             "name": "RF(n=200, d=15, bal)",
+            "family": "random_forest",
             "create_fn": lambda: _make_pipeline(RandomForestClassifier(
                 n_estimators=200, max_depth=15,
                 class_weight="balanced",
@@ -233,6 +243,7 @@ def _get_model_configs(
         },
         {
             "name": "RF(n=300, d=None, bal)",
+            "family": "random_forest",
             "create_fn": lambda: _make_pipeline(RandomForestClassifier(
                 n_estimators=300, max_depth=None,
                 class_weight="balanced",
@@ -247,6 +258,7 @@ def _get_model_configs(
     for C in (0.01, 0.1, 1.0, 10.0):
         configs.append({
             "name": f"LogReg(C={C}, bal)",
+            "family": "logistic_regression",
             "create_fn": (
                 lambda _C=C: _make_pipeline(LogisticRegression(
                     C=_C, class_weight="balanced", max_iter=2000,
@@ -261,6 +273,7 @@ def _get_model_configs(
     for C in (0.1, 1.0, 10.0):
         configs.append({
             "name": f"SVM-RBF(C={C}, bal)",
+            "family": "svm",
             "create_fn": (
                 lambda _C=C: _make_pipeline(SVC(
                     C=_C, kernel="rbf", probability=True,
@@ -268,6 +281,16 @@ def _get_model_configs(
                 ))
             ),
         })
+
+    # --- Apply family filter ----------------------------------------------
+    if model_filter and model_filter != "all":
+        configs = [c for c in configs if c.get("family") == model_filter]
+        if not configs:
+            raise ValueError(
+                f"No model configs match --radiomics-model '{model_filter}'. "
+                f"Valid choices: all, xgboost, random_forest, "
+                f"logistic_regression, svm."
+            )
 
     return configs
 
@@ -510,6 +533,7 @@ def extract_features_for_patients(
     n_workers: int = 1,
     slice_mode: Optional[str] = None,
     n_slices: int = DEFAULT_N_SLICES,
+    dual_phase: bool = False,
 ) -> tuple[NDArray[np.floating], list[str], list[int]]:
     """Extract radiomic features for a list of patients.
 
@@ -540,6 +564,9 @@ def extract_features_for_patients(
         n_workers: Number of parallel workers (currently sequential).
         slice_mode: 2D slice extraction strategy or None for full 3D.
         n_slices: Number of slices for ``"multi_slice"`` mode.
+        dual_phase: When True, also extract features from phase 0
+            (pre-contrast) and concatenate them with phase 1 features,
+            doubling the feature dimension. Disabled by default.
 
     Returns:
         Tuple of:
@@ -593,9 +620,10 @@ def extract_features_for_patients(
     n_failed = 0
 
     # Cache suffix differentiates 3D vs 2D cached features
+    _dp_tag = "_dualphase" if dual_phase else ""
     cache_suffix = (
-        f"_phase{phase}.npy" if _slice_mode is None
-        else f"_phase{phase}_{_slice_mode.value}.npy"
+        f"_phase{phase}{_dp_tag}.npy" if _slice_mode is None
+        else f"_phase{phase}_{_slice_mode.value}{_dp_tag}.npy"
     )
 
     for i, pid in iterator:
@@ -772,6 +800,52 @@ def extract_features_for_patients(
                 n_failed += 1
                 continue
 
+        # --- Dual-phase: extract & concatenate phase-0 features ---
+        if dual_phase:
+            phase0_path = _get_image_path(images_dir, pid, 0)
+            try:
+                phase0_array = _load_nifti_as_array(phase0_path)
+            except Exception as e:
+                logger.warning(
+                    f"Dual-phase: failed to load phase-0 for {pid}: {e}, "
+                    "skipping."
+                )
+                n_failed += 1
+                continue
+            try:
+                if _slice_mode is not None and phase0_array.ndim == 3:
+                    if _slice_mode in (
+                        SliceMode.MAX_TUMOR, SliceMode.CENTER_TUMOR,
+                        SliceMode.MIDDLE,
+                    ):
+                        p0_2d, p0_msk, _ = extract_2d_slice(
+                            phase0_array, mask=mask_array,
+                            mode=_slice_mode, normalize=True,
+                        )
+                        feat_p0 = extract_radiomic_features(
+                            p0_2d, mask=p0_msk,
+                            feature_classes=FRD_FEATURE_CLASSES,
+                            bin_width=FRD_DEFAULT_BIN_WIDTH,
+                        )
+                    else:
+                        feat_p0 = extract_radiomic_features(
+                            phase0_array, mask=mask_array,
+                            feature_classes=FRD_FEATURE_CLASSES,
+                            bin_width=FRD_DEFAULT_BIN_WIDTH,
+                        )
+                else:
+                    feat_p0 = extract_radiomic_features(
+                        phase0_array, mask=mask_array,
+                        feature_classes=FRD_FEATURE_CLASSES,
+                        bin_width=FRD_DEFAULT_BIN_WIDTH,
+                    )
+                feat = np.concatenate([feat, feat_p0])
+            except Exception as e:
+                logger.warning(
+                    f"Dual-phase feature extraction failed for {pid}: {e}, "
+                    "using single-phase features."
+                )
+
         # Validate feature vector
         if feat.size == 0 or np.all(feat == 0):
             logger.warning(f"Empty features for {pid}, skipping.")
@@ -913,7 +987,9 @@ def train_with_model_selection(
     X_val: NDArray[np.floating],
     y_val: NDArray[np.integer],
     task: str,
-) -> tuple[Any, str, dict[str, float]]:
+    model_filter: Optional[str] = None,
+    return_all: bool = False,
+) -> tuple[Any, str, dict[str, float], Optional[list[tuple[Any, str, dict[str, float]]]]]:
     """Train multiple model configurations and select the best.
 
     Tries all configurations from _get_model_configs() and selects the
@@ -925,14 +1001,19 @@ def train_with_model_selection(
         X_val: Validation features.
         y_val: Validation labels.
         task: Task name for logging.
+        model_filter: Optional family name to restrict model configs.
+        return_all: If True, additionally return all successfully trained
+            models as a list of ``(model, name, metrics)`` tuples.
 
     Returns:
-        Tuple of (best_model, best_config_name, best_val_metrics).
+        Tuple of ``(best_model, best_config_name, best_val_metrics,
+        all_models_or_None)``.  *all_models_or_None* is ``None`` when
+        *return_all* is ``False``.
     """
     n_pos = max(int(y_train.sum()), 1)
     n_neg = int((1 - y_train).sum())
     spw = n_neg / n_pos
-    configs = _get_model_configs(scale_pos_weight=spw)
+    configs = _get_model_configs(scale_pos_weight=spw, model_filter=model_filter)
     logger.info(
         f"\n{'='*60}\n"
         f"Training '{task}' classifier — trying {len(configs)} configurations\n"
@@ -952,6 +1033,7 @@ def train_with_model_selection(
     best_val_auroc = -1.0
     best_val_metrics: dict[str, float] = {}
     results_log: list[dict[str, Any]] = []
+    all_trained: list[tuple[Any, str, dict[str, float]]] = []
 
     for config in configs:
         try:
@@ -969,6 +1051,9 @@ def train_with_model_selection(
             "val_auroc": val_m["auroc"],
             "val_bal_acc": val_m["balanced_accuracy"],
         })
+
+        if return_all:
+            all_trained.append((model, config["name"], val_m))
 
         val_auroc = val_m["auroc"]
         if not np.isnan(val_auroc) and val_auroc > best_val_auroc:
@@ -990,7 +1075,7 @@ def train_with_model_selection(
     )
     logger.info(f"{'─'*60}\n")
 
-    return best_model, best_name, best_val_metrics
+    return best_model, best_name, best_val_metrics, (all_trained if return_all else None)
 
 
 # ---------------------------------------------------------------------------
@@ -1003,7 +1088,9 @@ def train_with_cross_validation(
     task: str,
     n_folds: int = 5,
     seed: int = DEFAULT_SEED,
-) -> tuple[Any, str, dict[str, float]]:
+    model_filter: Optional[str] = None,
+    return_all: bool = False,
+) -> tuple[Any, str, dict[str, float], Optional[list[tuple[Any, str, dict[str, float]]]]]:
     """Train with k-fold cross-validation for model selection.
 
     Uses stratified k-fold CV to evaluate model configs, then retrains
@@ -1015,14 +1102,18 @@ def train_with_cross_validation(
         task: Task name for logging.
         n_folds: Number of CV folds.
         seed: Random seed.
+        model_filter: Optional family name to restrict model configs.
+        return_all: If True, retrain *all* configs on the full data and
+            return them in addition to the best model.
 
     Returns:
-        Tuple of (best_model, best_config_name, avg_cv_metrics).
+        Tuple of ``(best_model, best_config_name, avg_cv_metrics,
+        all_models_or_None)``.
     """
     n_pos = max(int(y.sum()), 1)
     n_neg = int((1 - y).sum())
     spw = n_neg / n_pos
-    configs = _get_model_configs(scale_pos_weight=spw)
+    configs = _get_model_configs(scale_pos_weight=spw, model_filter=model_filter)
     skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=seed)
 
     logger.info(
@@ -1083,7 +1174,20 @@ def train_with_cross_validation(
         f"Bal.Acc={full_metrics['balanced_accuracy']:.4f}"
     )
 
-    return final_model, best_config["name"], {"cv_auroc": best_avg_auroc}
+    # Optionally retrain all successful configs on full data
+    all_trained: Optional[list[tuple[Any, str, dict[str, float]]]] = None
+    if return_all:
+        all_trained = []
+        for cfg in configs:
+            try:
+                m = cfg["create_fn"]()
+                m.fit(X, y)
+                m_metrics = evaluate_model(m, X, y)
+                all_trained.append((m, cfg["name"], m_metrics))
+            except Exception as e:
+                logger.warning(f"  Retrain {cfg['name']} failed: {e}")
+
+    return final_model, best_config["name"], {"cv_auroc": best_avg_auroc}, all_trained
 
 
 # ---------------------------------------------------------------------------
@@ -1094,6 +1198,7 @@ def save_model(
     model: Any,
     task: str,
     output_dir: Path,
+    suffix: str = "",
 ) -> Path:
     """Save a trained model in the format expected by the evaluation pipeline.
 
@@ -1105,12 +1210,14 @@ def save_model(
         model: Trained sklearn-compatible classifier.
         task: Task name ('tnbc' or 'luminal').
         output_dir: Directory to save the model.
+        suffix: Optional suffix appended before ``.pkl``
+            (e.g. ``"_xgb_1"`` → ``tnbc_classifier_xgb_1.pkl``).
 
     Returns:
         Path to the saved model file.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
-    model_path = output_dir / f"{task}_classifier.pkl"
+    model_path = output_dir / f"{task}_classifier{suffix}.pkl"
 
     with open(model_path, "wb") as f:
         pickle.dump(model, f)
@@ -1353,6 +1460,19 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         ),
     )
 
+    # Radiomics model family filter
+    parser.add_argument(
+        "--radiomics-model",
+        type=str,
+        choices=["all", "xgboost", "random_forest", "logistic_regression", "svm"],
+        default="all",
+        help=(
+            "Which radiomics classifier family to train. 'all' (default) "
+            "tries all available families and picks the best by AUROC. "
+            "Only effective with --classifier-type radiomics."
+        ),
+    )
+
     # CNN-specific arguments
     parser.add_argument(
         "--cnn-model",
@@ -1389,6 +1509,45 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         type=int,
         default=10,
         help="CNN early stopping patience (epochs). Default: 10.",
+    )
+    parser.add_argument(
+        "--cnn-mask-channel",
+        action="store_true",
+        help=(
+            "Add segmentation mask as a 4th input channel to the CNN, "
+            "giving the model spatial guidance about tumour location. "
+            "The first conv layer is expanded from 3→4 channels with "
+            "zero-initialised mask weights so pretrained features are "
+            "preserved. Only effective with --classifier-type cnn."
+        ),
+    )
+
+    # Ensemble / multi-model saving
+    parser.add_argument(
+        "--save-all-models",
+        action="store_true",
+        help=(
+            "Save ALL successfully trained models (not just the best). "
+            "Each model is saved with a distinct filename suffix so that "
+            "ensemble inference (--ensemble during evaluation) can load "
+            "them all. Files are named {task}_classifier_{family}_{n}.pkl. "
+            "Only effective with --classifier-type radiomics."
+        ),
+    )
+
+    # Dual-phase classification
+    parser.add_argument(
+        "--dual-phase",
+        action="store_true",
+        help=(
+            "Use both phase 0 (pre-contrast) and phase 1 (post-contrast) "
+            "for classification. For radiomics, features from both phases "
+            "are concatenated (doubling the feature dimension). For CNN, "
+            "channels from both phases are stacked (6-channel input). "
+            "Disabled by default because pre-contrast images are real "
+            "(not synthesized) and including them dilutes evaluation of "
+            "synthesis quality. Useful as an ablation baseline."
+        ),
     )
 
     # Visualisation
@@ -1441,6 +1600,8 @@ def main(argv: Optional[list[str]] = None) -> None:
     logger.info(f"Data directory:   {args.data_dir}")
     logger.info(f"Output directory: {args.output_dir}")
     logger.info(f"Classifier type:  {args.classifier_type}")
+    if args.classifier_type == "radiomics" and args.radiomics_model != "all":
+        logger.info(f"Radiomics model:  {args.radiomics_model}")
     logger.info(f"Tasks:            {args.tasks}")
     logger.info(f"MRI phase:        {args.phase}")
     logger.info(f"Val ratio:        {args.val_ratio}")
@@ -1452,12 +1613,16 @@ def main(argv: Optional[list[str]] = None) -> None:
             logger.info(f"Num slices:       {args.n_slices}")
     else:
         logger.info("Slice mode:       3D (full volume)")
+    if getattr(args, "dual_phase", False):
+        logger.info("Dual-phase:       ENABLED (phase 0 + phase 1)")
     if args.classifier_type == "cnn":
         logger.info(f"CNN model:        {args.cnn_model}")
         logger.info(f"CNN image size:   {args.cnn_image_size}")
         logger.info(f"CNN epochs:       {args.cnn_epochs}")
         logger.info(f"CNN batch size:   {args.cnn_batch_size}")
         logger.info(f"CNN LR:           {args.cnn_lr}")
+        if args.cnn_mask_channel:
+            logger.info("CNN mask channel: ENABLED (4-channel input)")
         # Auto-default slice mode to all_tumor for CNN
         if args.slice_mode is None:
             args.slice_mode = SliceMode.ALL_TUMOR.value
@@ -1527,6 +1692,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         "cv_folds": args.cv_folds,
         "seed": args.seed,
         "slice_mode": args.slice_mode,
+        "dual_phase": getattr(args, "dual_phase", False),
         "total_patients": len(clinical_df),
         "tasks": {},
     }
@@ -1596,6 +1762,8 @@ def main(argv: Optional[list[str]] = None) -> None:
                 ),
                 test_patient_ids=test_patient_ids_global or None,
                 clinical_df=clinical_df,
+                use_mask_channel=args.cnn_mask_channel,
+                dual_phase=getattr(args, "dual_phase", False),
             )
 
             task_elapsed = time.time() - task_start
@@ -1626,6 +1794,7 @@ def main(argv: Optional[list[str]] = None) -> None:
             n_workers=args.n_workers,
             slice_mode=args.slice_mode,
             n_slices=args.n_slices,
+            dual_phase=getattr(args, "dual_phase", False),
         )
 
         # Filter labels to match valid patients
@@ -1639,15 +1808,18 @@ def main(argv: Optional[list[str]] = None) -> None:
             continue
 
         # 2c. Train classifier
+        save_all = getattr(args, "save_all_models", False)
         if args.cv_folds > 0:
             # Cross-validation mode
             logger.info(f"\n--- Step 4: Training with {args.cv_folds}-fold CV ---")
-            best_model, best_name, best_metrics = train_with_cross_validation(
+            best_model, best_name, best_metrics, all_models = train_with_cross_validation(
                 X=feature_matrix,
                 y=valid_labels,
                 task=task,
                 n_folds=args.cv_folds,
                 seed=args.seed,
+                model_filter=args.radiomics_model,
+                return_all=save_all,
             )
         else:
             # Train/val split mode
@@ -1660,17 +1832,36 @@ def main(argv: Optional[list[str]] = None) -> None:
                 stratify=valid_labels,
             )
 
-            best_model, best_name, best_metrics = train_with_model_selection(
+            best_model, best_name, best_metrics, all_models = train_with_model_selection(
                 X_train=X_train,
                 y_train=y_train,
                 X_val=X_val,
                 y_val=y_val,
                 task=task,
+                model_filter=args.radiomics_model,
+                return_all=save_all,
             )
 
         # 2d. Save model
         logger.info("\n--- Step 5: Saving model ---")
         model_path = save_model(best_model, task, args.output_dir)
+
+        # Save all models when --save-all-models is active
+        if save_all and all_models:
+            logger.info(
+                f"Saving all {len(all_models)} models for ensemble support..."
+            )
+            for idx, (m, m_name, m_metrics) in enumerate(all_models, start=1):
+                # Sanitise config name for filename
+                safe_name = (
+                    m_name.lower()
+                    .replace(" ", "_")
+                    .replace("(", "")
+                    .replace(")", "")
+                    .replace(",", "")
+                    .replace("=", "")
+                )[:40]
+                save_model(m, task, args.output_dir, suffix=f"_{safe_name}")
 
         # 2e. Generate validation visualisations
         if not args.no_viz:
@@ -1741,6 +1932,7 @@ def main(argv: Optional[list[str]] = None) -> None:
                             n_workers=args.n_workers,
                             slice_mode=args.slice_mode,
                             n_slices=args.n_slices,
+                            dual_phase=getattr(args, "dual_phase", False),
                         )
                     )
 

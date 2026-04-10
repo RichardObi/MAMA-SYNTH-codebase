@@ -49,6 +49,12 @@ from eval.slice_extraction import (
     extract_2d_slice,
     extract_multi_slices,
 )
+from eval.classification import (
+    CNNClassifier,
+    EnsembleClassifier,
+    RadiomicsClassifier,
+    evaluate_classification,
+)
 from eval.training_visualization import TrainingVisualizer
 
 __all__ = [
@@ -74,6 +80,11 @@ __all__ = [
     # Segmentation metrics
     "compute_dice",
     "compute_hd95",
+    # Classification
+    "RadiomicsClassifier",
+    "CNNClassifier",
+    "EnsembleClassifier",
+    "evaluate_classification",
     # Classifier training
     "train_classifier",
     # 2D slice extraction
@@ -84,4 +95,4 @@ __all__ = [
     "TrainingVisualizer",
 ]
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"

@@ -345,7 +345,7 @@ class TestTrainWithModelSelection:
         ])
         y_val = np.array([0] * (n_val // 2) + [1] * (n_val // 2), dtype=np.int64)
 
-        best_model, best_name, best_metrics = train_with_model_selection(
+        best_model, best_name, best_metrics, _ = train_with_model_selection(
             X_train, y_train, X_val, y_val, task="tnbc"
         )
 
@@ -370,7 +370,7 @@ class TestTrainWithCrossValidation:
         ])
         y = np.array([0] * (n_samples // 2) + [1] * (n_samples // 2), dtype=np.int64)
 
-        model, name, metrics = train_with_cross_validation(
+        model, name, metrics, _ = train_with_cross_validation(
             X, y, task="luminal", n_folds=3, seed=42
         )
 
@@ -741,7 +741,7 @@ class TestEndToEnd:
         )
 
         # Train
-        best_model, best_name, best_metrics = train_with_model_selection(
+        best_model, best_name, best_metrics, _ = train_with_model_selection(
             X_train, y_train, X_val, y_val, task="tnbc"
         )
 

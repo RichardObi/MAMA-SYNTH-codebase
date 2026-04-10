@@ -211,6 +211,9 @@ class MamaSynthEval:
         seg_model_path: Optional[Path] = None,
         clf_model_dir: Optional[Path] = None,
         cache_dir: Optional[Path] = None,
+        ensemble: bool = False,
+        dual_phase: bool = False,
+        precontrast_path: Optional[Path] = None,
     ) -> None:
         self.ground_truth_path = Path(ground_truth_path)
         self.predictions_path = Path(predictions_path)
@@ -225,6 +228,11 @@ class MamaSynthEval:
         self.seg_model_path = Path(seg_model_path) if seg_model_path else None
         self.clf_model_dir = Path(clf_model_dir) if clf_model_dir else None
         self.cache_dir = Path(cache_dir) if cache_dir else None
+        self.ensemble = ensemble
+        self.dual_phase = dual_phase
+        self.precontrast_path = (
+            Path(precontrast_path) if precontrast_path else None
+        )
         # Will be fitted during evaluate()
         self._normalizer = DatasetNormalizer()
 
@@ -549,6 +557,12 @@ class MamaSynthEval:
     ) -> dict[str, Any]:
         """Evaluate molecular subtype classification on synthetic images.
 
+        When ``self.ensemble`` is ``True``, all models found in
+        ``clf_model_dir`` for each task are used and their predicted
+        probabilities are averaged (ensemble inference).  Otherwise the
+        single-model behaviour is preserved: CNN has priority, then
+        radiomics.
+
         Returns dict with 'aggregates' and 'detail' sub-keys.
         """
         if self.labels_path is None or not self.labels_path.exists():
@@ -556,6 +570,8 @@ class MamaSynthEval:
 
         try:
             from eval.classification import (
+                CNNClassifier,
+                EnsembleClassifier,
                 RadiomicsClassifier,
                 evaluate_classification,
             )
@@ -569,7 +585,7 @@ class MamaSynthEval:
         if not labels:
             return {}
 
-        # Extract features from synthetic images
+        # Extract radiomic features from synthetic images
         features_list = []
         tnbc_true = []
         luminal_true = []
@@ -582,6 +598,27 @@ class MamaSynthEval:
 
             pred_image = self._load_image(pred_path).astype(np.float64)
             feats = extract_radiomic_features(pred_image)
+
+            # Dual-phase: also extract features from pre-contrast and concatenate
+            if self.dual_phase and self.precontrast_path:
+                precon_feats = None
+                for ext in (".nii.gz", ".nii", ".mha"):
+                    pc_path = self.precontrast_path / f"{stem}{ext}"
+                    if pc_path.exists():
+                        try:
+                            pc_image = self._load_image(pc_path).astype(
+                                np.float64
+                            )
+                            precon_feats = extract_radiomic_features(pc_image)
+                        except Exception as e:
+                            logger.warning(
+                                f"Dual-phase: failed to load pre-contrast "
+                                f"for {stem}: {e}"
+                            )
+                        break
+                if precon_feats is not None:
+                    feats = np.concatenate([feats, precon_feats])
+
             features_list.append(feats)
             tnbc_true.append(labels[stem].get("tnbc", 0))
             luminal_true.append(labels[stem].get("luminal", 0))
@@ -598,12 +635,69 @@ class MamaSynthEval:
         agg: dict[str, Any] = {}
         detail: dict[str, Any] = {"n_cases": len(features_list)}
 
-        # Try loading pre-trained organizer models
         for task, y_true, metric_key in [
             ("luminal", y_luminal, METRIC_AUROC_LUMINAL),
             ("tnbc", y_tnbc, METRIC_AUROC_TNBC),
         ]:
-            # Check for CNN model first, then radiomics .pkl
+            # ----------------------------------------------------------
+            # Ensemble mode: discover all models and average probabilities
+            # ----------------------------------------------------------
+            if self.ensemble and self.clf_model_dir and self.clf_model_dir.exists():
+                ensemble = EnsembleClassifier.discover_models(
+                    task=task, model_dir=self.clf_model_dir,
+                )
+                if ensemble.n_models == 0:
+                    detail[f"note_{task}"] = (
+                        f"No pre-trained {task} models found in "
+                        f"{self.clf_model_dir} for ensemble."
+                    )
+                    continue
+
+                logger.info(
+                    f"Ensemble inference for '{task}': "
+                    f"{ensemble.description()}"
+                )
+
+                # Prepare CNN inputs only if the ensemble contains CNN models
+                cnn_images: Optional[list[NDArray]] = None
+                cnn_masks: Optional[list[Optional[NDArray]]] = None
+                if ensemble.has_cnn:
+                    cnn_images = []
+                    cnn_masks = []
+                    for _, pred_path in pairs:
+                        stem = self._get_stem(pred_path)
+                        if stem not in labels:
+                            continue
+                        img = self._load_image(pred_path).astype(np.float64)
+                        cnn_images.append(img)
+                        mask_arr: Optional[NDArray] = None
+                        if self.masks_path and self.masks_path.exists():
+                            for ext in (".nii.gz", ".nii", ".mha"):
+                                mp = self.masks_path / f"{stem}{ext}"
+                                if mp.exists():
+                                    mask_arr = sitk.GetArrayFromImage(
+                                        sitk.ReadImage(str(mp), sitk.sitkUInt8)
+                                    ).astype(bool)
+                                    break
+                        cnn_masks.append(mask_arr)
+
+                y_score = ensemble.predict_proba(
+                    features=feature_matrix if ensemble.has_radiomics else None,
+                    images=cnn_images,
+                    masks=cnn_masks,
+                )
+                clf_result = evaluate_classification(y_true, y_score)
+                agg[metric_key] = clf_result["auroc"]
+                detail[f"auroc_{task}"] = clf_result["auroc"]
+                detail[f"balanced_accuracy_{task}"] = (
+                    clf_result["balanced_accuracy"]
+                )
+                detail[f"classifier_type_{task}"] = ensemble.description()
+                continue
+
+            # ----------------------------------------------------------
+            # Single-model mode (original behaviour)
+            # ----------------------------------------------------------
             cnn_model_path = None
             pkl_model_path = None
             if self.clf_model_dir and self.clf_model_dir.exists():
@@ -621,14 +715,12 @@ class MamaSynthEval:
             if cnn_model_path:
                 # CNN classifier — works on raw images, not features
                 try:
-                    from eval.classification import CNNClassifier
-
                     cnn_clf = CNNClassifier(
                         task=task, model_path=cnn_model_path,
                     )
                     # Collect raw images and optional masks
-                    cnn_images: list[NDArray] = []
-                    cnn_masks: list[Optional[NDArray]] = []
+                    cnn_imgs: list[NDArray] = []
+                    cnn_msks: list[Optional[NDArray]] = []
                     cnn_y: list[int] = []
 
                     for _, pred_path in pairs:
@@ -636,25 +728,25 @@ class MamaSynthEval:
                         if stem not in labels:
                             continue
                         img = self._load_image(pred_path).astype(np.float64)
-                        cnn_images.append(img)
+                        cnn_imgs.append(img)
                         # Try to load mask for better slice selection
-                        mask_arr: Optional[NDArray] = None
+                        mask_arr_single: Optional[NDArray] = None
                         if self.masks_path and self.masks_path.exists():
                             for ext in (".nii.gz", ".nii", ".mha"):
                                 mp = self.masks_path / f"{stem}{ext}"
                                 if mp.exists():
-                                    mask_arr = sitk.GetArrayFromImage(
+                                    mask_arr_single = sitk.GetArrayFromImage(
                                         sitk.ReadImage(str(mp), sitk.sitkUInt8)
                                     ).astype(bool)
                                     break
-                        cnn_masks.append(mask_arr)
+                        cnn_msks.append(mask_arr_single)
                         cnn_y.append(
                             labels[stem].get(task, 0)
                         )
 
-                    if len(cnn_images) >= 2:
+                    if len(cnn_imgs) >= 2:
                         y_score = cnn_clf.predict_proba_from_images(
-                            cnn_images, cnn_masks,
+                            cnn_imgs, cnn_msks,
                         )
                         _y_true_cnn = np.array(cnn_y, dtype=np.int64)
                         clf_result = evaluate_classification(
