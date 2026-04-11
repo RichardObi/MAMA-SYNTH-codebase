@@ -541,7 +541,10 @@ def extract_slices_for_cnn(
             if mask_arr is not None:
                 np.save(str(pdir / f"mask_{idx}.npy"), mask_arr)
         except Exception as e:
-            logger.debug(f"Failed to cache slice {idx} for {pid}: {e}")
+            logger.warning(
+                f"Failed to write cache slice {idx} for {pid}: {e}  "
+                f"Caching disabled for this slice — will re-extract on next run."
+            )
 
     def _mark_patient_done(pid: str) -> None:
         """Write a marker file indicating all slices have been cached."""
@@ -550,15 +553,46 @@ def extract_slices_for_cnn(
             return
         try:
             (pdir / "_done").touch()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(
+                f"Could not write cache completion marker for {pid}: {e}  "
+                f"This patient will be re-extracted on the next run."
+            )
 
     if cache_dir is not None:
         cache_dir = Path(cache_dir)
         cache_dir.mkdir(parents=True, exist_ok=True)
+
+        # Pre-scan: count how many patients already have a complete cache
+        # so the user can see upfront whether extraction will happen.
+        n_already_cached = sum(
+            1 for pid in patient_ids
+            if (d := _patient_cache_dir(pid)) is not None
+            and (d / "_done").exists()
+        )
+        n_need_extract = len(patient_ids) - n_already_cached
+        if n_already_cached == len(patient_ids):
+            logger.info(
+                f"CNN slice cache: {cache_dir}  (tag='{_cache_tag}')  "
+                f"— ALL {len(patient_ids)} patients already cached, "
+                f"loading from disk (no NIfTI I/O)."
+            )
+        elif n_already_cached > 0:
+            logger.info(
+                f"CNN slice cache: {cache_dir}  (tag='{_cache_tag}')  "
+                f"— {n_already_cached}/{len(patient_ids)} patients cached; "
+                f"will extract {n_need_extract} missing patients from NIfTI."
+            )
+        else:
+            logger.info(
+                f"CNN slice cache: {cache_dir}  (tag='{_cache_tag}')  "
+                f"— cache empty, extracting all {len(patient_ids)} patients "
+                f"from NIfTI and writing to cache."
+            )
+    else:
         logger.info(
-            f"CNN slice cache: {cache_dir}  "
-            f"(tag='{_cache_tag}')"
+            "CNN slice cache: DISABLED (no --cache-dir supplied).  "
+            "Pass --cache-dir to avoid re-extracting slices on every run."
         )
 
     # Progress bar
@@ -602,6 +636,10 @@ def extract_slices_for_cnn(
             # --- Try cache first ------------------------------------------
             cached = _load_from_cache(pid)
             if cached is not None:
+                logger.debug(
+                    f"Cache hit: {pid} → {len(cached['slices'])} slices "
+                    f"loaded from disk."
+                )
                 for j, s in enumerate(cached["slices"]):
                     all_slices.append(s)
                     all_labels.append(label)
@@ -614,6 +652,7 @@ def extract_slices_for_cnn(
                 continue
 
             # --- Extract from NIfTI (cache miss) --------------------------
+            logger.debug(f"Cache miss: {pid} — loading NIfTI and extracting slices.")
             img_path = _get_image_path(images_dir, pid, phase)
             volume = _load_nifti_as_array(img_path)
 
