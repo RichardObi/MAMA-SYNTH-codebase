@@ -690,13 +690,14 @@ After training, the output directory contains versioned run sub-directories (unl
 
 ```
 trained-models/
+├── feature_cache/                   # Shared across ALL runs — features are
+│   └── ...                          # reused and never duplicated per run
 ├── latest -> run_002_20250102_093000_cnn_contrast/     # symlink
 ├── run_001_20250101_120000_radiomics_tnbc_luminal/
 │   ├── tnbc_classifier.pkl              # TNBC classifier (radiomics mode)
 │   ├── tnbc_classifier_RF_0.pkl         # Additional models (--save-all-models)
 │   ├── luminal_classifier.pkl           # Luminal classifier (radiomics mode)
 │   ├── training_report.json             # Training metadata, metrics, and config
-│   ├── feature_cache/                   # Cached feature vectors (per patient)
 │   └── visualizations/
 │       ├── tnbc/
 │       │   ├── confusion_matrix_tnbc.png

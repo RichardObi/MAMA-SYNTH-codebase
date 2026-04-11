@@ -1748,8 +1748,11 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         help=(
             "Directory for caching extracted features per patient. "
             "For radiomics this stores per-patient feature arrays; for "
-            "CNN this stores extracted 2-D slices (.npz). "
-            "Speeds up re-runs. Default: <output-dir>/feature_cache"
+            "CNN this stores extracted 2-D slices. "
+            "The cache is shared across all versioned run directories — "
+            "it is placed at <output-dir>/feature_cache (next to the "
+            "run_NNN_… folders, not inside them) so features are reused "
+            "across runs without duplicating them on disk."
         ),
     )
     parser.add_argument(
@@ -2016,6 +2019,11 @@ def main(argv: Optional[list[str]] = None) -> None:
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
+    # Capture the base output dir *before* it is overwritten by
+    # _build_run_dir — the feature/slice cache lives here so it is
+    # shared across all runs rather than duplicated inside each run dir.
+    base_output_dir = args.output_dir
+
     # Build structured run directory unless --flat-output is active.
     if not args.flat_output:
         args.output_dir = _build_run_dir(
@@ -2073,9 +2081,11 @@ def main(argv: Optional[list[str]] = None) -> None:
     if n_cases_limit is not None:
         logger.info(f"Case limit:       {n_cases_limit} {'(--quick-test)' if args.quick_test else ''}")
 
-    # Set default cache dir
+    # Set default cache dir — anchored to the *base* output dir so it is
+    # shared across versioned run directories instead of being duplicated
+    # inside each run folder.
     if args.cache_dir is None:
-        args.cache_dir = args.output_dir / "feature_cache"
+        args.cache_dir = base_output_dir / "feature_cache"
 
     # Clear cache if requested
     if args.clear_cache and args.cache_dir.exists():
