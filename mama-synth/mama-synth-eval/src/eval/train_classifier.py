@@ -59,7 +59,6 @@ import argparse
 import json
 import logging
 import pickle
-import sys
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -125,6 +124,9 @@ DEFAULT_N_SLICES = 5
 # The clinical Excel may use 'dataset_split', 'split', or 'dataset'.
 # We try each in order.
 SPLIT_COLUMN_CANDIDATES = ["dataset_split", "split", "dataset"]
+
+# Default run-directory prefix inside --output-dir
+RUN_DIR_PREFIX = "run"
 
 # Auto-detected filenames for the CSV-based train/test split shipped with
 # the MAMA-MIA dataset.  The file has two ragged columns: ``train_split``
@@ -304,6 +306,90 @@ def _get_model_configs(
 
 
 # ---------------------------------------------------------------------------
+# Structured output directory
+# ---------------------------------------------------------------------------
+
+
+def _build_run_dir(
+    output_dir: Path,
+    classifier_type: str,
+    tasks: list[str],
+    run_name: Optional[str] = None,
+) -> Path:
+    """Create a versioned run directory under *output_dir*.
+
+    The directory name is::
+
+        run_NNN_YYYYMMDD_HHMMSS_{classifier_type}_{tasks}
+
+    where *NNN* is an auto-incremented 3-digit run counter.  An optional
+    *run_name* replaces the auto-generated descriptor suffix.
+
+    A ``latest`` symbolic link is updated to point at the new directory.
+
+    Parameters
+    ----------
+    output_dir : Path
+        Base output directory (e.g. ``./trained_models``).
+    classifier_type : str
+        ``"radiomics"`` or ``"cnn"``.
+    tasks : list[str]
+        Active classification tasks.
+    run_name : str | None
+        Optional custom suffix for the run directory.
+
+    Returns
+    -------
+    Path to the newly-created run directory.
+    """
+    from datetime import datetime
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Determine next run number by scanning existing directories.
+    existing_nums: list[int] = []
+    for child in output_dir.iterdir():
+        if child.is_dir() and child.name.startswith(f"{RUN_DIR_PREFIX}_"):
+            parts = child.name.split("_")
+            if len(parts) >= 2:
+                try:
+                    existing_nums.append(int(parts[1]))
+                except ValueError:
+                    pass
+    next_num = max(existing_nums, default=0) + 1
+
+    # Build directory name.
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    if run_name:
+        # Sanitise user-supplied name.
+        safe_name = (
+            run_name.strip()
+            .replace(" ", "_")
+            .replace("/", "_")
+            .replace("\\", "_")
+        )[:60]
+        dir_name = f"{RUN_DIR_PREFIX}_{next_num:03d}_{ts}_{safe_name}"
+    else:
+        tasks_tag = "_".join(sorted(tasks))
+        dir_name = f"{RUN_DIR_PREFIX}_{next_num:03d}_{ts}_{classifier_type}_{tasks_tag}"
+
+    run_dir = output_dir / dir_name
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    # Update 'latest' symlink.
+    latest_link = output_dir / "latest"
+    try:
+        if latest_link.is_symlink() or latest_link.exists():
+            latest_link.unlink()
+        latest_link.symlink_to(run_dir.name)
+    except OSError:
+        # May fail on some file-systems (e.g. FAT32); non-fatal.
+        logger.debug(f"Could not create 'latest' symlink: {latest_link}")
+
+    return run_dir
+
+
+# ---------------------------------------------------------------------------
 # Clinical data loading
 # ---------------------------------------------------------------------------
 
@@ -348,19 +434,37 @@ def create_labels(
 
     Filters patients with valid tumor_subtype and creates binary labels.
 
+    For the ``contrast`` task, every patient is included regardless of
+    tumor_subtype (no filtering needed — the label is the MRI phase, not
+    clinical metadata).  The returned list contains each patient **once**;
+    actual sample doubling (phase 0 + phase 1) is performed downstream.
+
     Args:
         clinical_df: Clinical data DataFrame with 'patient_id' and
             'tumor_subtype' columns.
-        task: Classification task ('tnbc' or 'luminal').
+        task: Classification task ('tnbc', 'luminal', or 'contrast').
 
     Returns:
         Tuple of (patient_ids, labels) where labels is a binary array.
     """
     import pandas as pd
 
-    valid_tasks = {"tnbc", "luminal"}
+    valid_tasks = {"tnbc", "luminal", "contrast"}
     if task not in valid_tasks:
         raise ValueError(f"task must be one of {valid_tasks}, got '{task}'")
+
+    if task == "contrast":
+        # Contrast task: every patient with a ``patient_id`` is valid.
+        # Labels are placeholder 0s — the real 0/1 labels are created by
+        # ``create_contrast_dataset()`` which doubles the dataset (one
+        # sample per phase per patient).
+        patient_ids = clinical_df["patient_id"].dropna().unique().tolist()
+        labels = np.zeros(len(patient_ids), dtype=np.int64)
+        logger.info(
+            f"Task 'contrast': {len(patient_ids)} patients available "
+            f"(each contributes phase-0 and phase-1 samples)."
+        )
+        return patient_ids, labels
 
     # Filter rows with valid tumor_subtype
     df = clinical_df[clinical_df["tumor_subtype"].notna()].copy()
@@ -392,6 +496,86 @@ def create_labels(
     )
 
     return patient_ids, labels
+
+
+def create_contrast_dataset(
+    patient_ids: list[str],
+    data_dir: Path,
+    images_dir: Optional[Path] = None,
+    segmentations_dir: Optional[Path] = None,
+    cache_dir: Optional[Path] = None,
+    n_workers: int = 1,
+    slice_mode: Optional[str] = None,
+    n_slices: int = DEFAULT_N_SLICES,
+) -> tuple[NDArray[np.floating], NDArray[np.integer], list[str], list[int]]:
+    """Build a feature matrix for the pre-/post-contrast classification task.
+
+    Each patient contributes **two** feature vectors: one extracted from
+    phase 0 (pre-contrast, label=0) and one from phase 1 (post-contrast,
+    label=1).  This effectively doubles the dataset size compared to a
+    single-phase subtype task.
+
+    Parameters
+    ----------
+    patient_ids : list[str]
+        Patient identifiers (each will appear twice in the output).
+    data_dir, images_dir, segmentations_dir : Path
+        Standard MAMA-MIA path arguments.
+    cache_dir : Path | None
+        Feature cache directory.
+    n_workers, slice_mode, n_slices : int | str | None
+        Feature extraction parameters (passed through).
+
+    Returns
+    -------
+    feature_matrix : NDArray
+        Shape ``(2*N_valid, n_features)``.
+    labels : NDArray
+        Binary array — ``0`` for pre-contrast, ``1`` for post-contrast.
+    valid_pids : list[str]
+        Patient ID for each row (may repeat).
+    valid_original_indices : list[int]
+        Index into *patient_ids* for each valid row.
+    """
+    all_feats: list[NDArray[np.floating]] = []
+    all_labels: list[int] = []
+    all_pids: list[str] = []
+    all_indices: list[int] = []
+
+    for phase_val, label_val in [(0, 0), (1, 1)]:
+        logger.info(
+            f"Contrast task: extracting features from phase {phase_val} "
+            f"(label={label_val}) for {len(patient_ids)} patients."
+        )
+        feat_matrix, valid_pids, valid_idx = extract_features_for_patients(
+            patient_ids=patient_ids,
+            data_dir=data_dir,
+            images_dir=images_dir,
+            segmentations_dir=segmentations_dir,
+            phase=phase_val,
+            cache_dir=cache_dir,
+            n_workers=n_workers,
+            slice_mode=slice_mode,
+            n_slices=n_slices,
+            dual_phase=False,  # never dual-phase for contrast task itself
+        )
+        n_samples = feat_matrix.shape[0]
+        all_feats.append(feat_matrix)
+        all_labels.extend([label_val] * n_samples)
+        all_pids.extend(valid_pids)
+        all_indices.extend(valid_idx)
+
+    feature_matrix = np.vstack(all_feats)
+    labels = np.array(all_labels, dtype=np.int64)
+
+    n_pre = int((labels == 0).sum())
+    n_post = int((labels == 1).sum())
+    logger.info(
+        f"Contrast dataset: {len(labels)} samples "
+        f"(pre-contrast={n_pre}, post-contrast={n_post})"
+    )
+
+    return feature_matrix, labels, all_pids, all_indices
 
 
 def load_split_csv(
@@ -1459,7 +1643,31 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         "--output-dir",
         type=Path,
         required=True,
-        help="Directory to save trained model files (.pkl).",
+        help=(
+            "Base directory for saving trained models. By default, each "
+            "training run creates a versioned sub-directory "
+            "(e.g. run_001_20260411_143022_cnn_tnbc). "
+            "Use --flat-output to write directly into this directory."
+        ),
+    )
+    parser.add_argument(
+        "--run-name",
+        type=str,
+        default=None,
+        help=(
+            "Custom name for this training run. When set, the run "
+            "directory is named run_NNN_TIMESTAMP_{run-name}. "
+            "Useful for labelling experiments."
+        ),
+    )
+    parser.add_argument(
+        "--flat-output",
+        action="store_true",
+        help=(
+            "Write all outputs directly into --output-dir without "
+            "creating a versioned run sub-directory. Preserves the "
+            "pre-v0.9.0 behaviour."
+        ),
     )
 
     # Optional data arguments
@@ -1494,9 +1702,14 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--tasks",
         nargs="+",
-        choices=["tnbc", "luminal"],
+        choices=["tnbc", "luminal", "contrast"],
         default=["tnbc", "luminal"],
-        help="Classification tasks to train. Default: tnbc luminal",
+        help=(
+            "Classification tasks to train. 'tnbc' and 'luminal' are "
+            "molecular subtype tasks based on clinical labels. 'contrast' "
+            "trains a pre-contrast vs post-contrast phase classifier "
+            "(binary: phase 0 → 0, phase 1 → 1). Default: tnbc luminal"
+        ),
     )
     parser.add_argument(
         "--phase",
@@ -1803,6 +2016,15 @@ def main(argv: Optional[list[str]] = None) -> None:
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
+    # Build structured run directory unless --flat-output is active.
+    if not args.flat_output:
+        args.output_dir = _build_run_dir(
+            output_dir=args.output_dir,
+            classifier_type=args.classifier_type,
+            tasks=args.tasks,
+            run_name=getattr(args, "run_name", None),
+        )
+
     # Resolve --quick-test → --n-cases
     n_cases_limit: Optional[int] = args.n_cases
     if args.quick_test and n_cases_limit is None:
@@ -1839,7 +2061,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         logger.info(f"CNN batch size:   {args.cnn_batch_size}")
         logger.info(f"CNN LR:           {args.cnn_lr}")
         if args.cnn_mask_channel:
-            logger.info("CNN mask channel: ENABLED (4-channel input)")
+            logger.info("CNN mask channel: ENABLED (+1 channel for mask)")
         # Auto-default slice mode to all_tumor for CNN
         if args.slice_mode is None:
             args.slice_mode = SliceMode.ALL_TUMOR.value
@@ -1858,9 +2080,17 @@ def main(argv: Optional[list[str]] = None) -> None:
     # Clear cache if requested
     if args.clear_cache and args.cache_dir.exists():
         import shutil
-        n_removed = sum(1 for _ in args.cache_dir.glob("*.npy"))
+        n_npy = sum(1 for _ in args.cache_dir.glob("*.npy"))
+        n_npz = sum(1 for _ in args.cache_dir.glob("*.npz"))
+        n_dirs = sum(
+            1 for d in args.cache_dir.iterdir()
+            if d.is_dir() and not d.name.startswith(".")
+        )
         shutil.rmtree(args.cache_dir)
-        logger.info(f"Cleared feature cache ({n_removed} files): {args.cache_dir}")
+        logger.info(
+            f"Cleared feature cache ({n_npy} .npy, {n_npz} .npz, "
+            f"{n_dirs} dirs): {args.cache_dir}"
+        )
 
     # Create visualisation output directory
     viz_dir = args.output_dir / "visualizations"
@@ -1962,6 +2192,12 @@ def main(argv: Optional[list[str]] = None) -> None:
         if args.classifier_type == "cnn":
             from eval.train_cnn_classifier import train_cnn_pipeline
 
+            # For contrast task, override dual_phase and phase so the CNN
+            # pipeline extracts slices from both phases with appropriate
+            # labels.  See ``train_cnn_pipeline(contrast_mode=True)`` in
+            # train_cnn_classifier.py.
+            _cnn_contrast = task == "contrast"
+
             cnn_model, cnn_name, cnn_metrics = train_cnn_pipeline(
                 task=task,
                 patient_ids=patient_ids,
@@ -1992,10 +2228,11 @@ def main(argv: Optional[list[str]] = None) -> None:
                 dual_phase=getattr(args, "dual_phase", False),
                 device=getattr(args, "device", None),
                 cache_dir=getattr(args, "cache_dir", None),
+                contrast_mode=_cnn_contrast,
             )
 
             task_elapsed = time.time() - task_start
-            report["tasks"][task] = {
+            cnn_report: dict[str, Any] = {
                 "classifier_type": "cnn",
                 "best_model": cnn_name,
                 "val_metrics": cnn_metrics,
@@ -2006,27 +2243,53 @@ def main(argv: Optional[list[str]] = None) -> None:
                 ),
                 "elapsed_seconds": round(task_elapsed, 1),
             }
+            # Propagate CNN test-set metrics into the report so the
+            # final summary picks them up.
+            if "test_auroc" in cnn_metrics:
+                cnn_report["test_metrics"] = {
+                    "auroc": cnn_metrics["test_auroc"],
+                    "balanced_accuracy": cnn_metrics[
+                        "test_balanced_accuracy"
+                    ],
+                    "loss": cnn_metrics.get("test_loss", float("nan")),
+                }
+            report["tasks"][task] = cnn_report
             logger.info(f"Task '{task}' (CNN) completed in {task_elapsed:.1f}s")
             continue
         # ---- End CNN branch ----------------------------------------------
 
         # 2b. Extract features (radiomics path)
         logger.info("\n--- Step 3: Extracting radiomic features ---")
-        feature_matrix, valid_pids, valid_indices = extract_features_for_patients(
-            patient_ids=patient_ids,
-            data_dir=args.data_dir,
-            images_dir=args.images_dir,
-            segmentations_dir=args.segmentations_dir,
-            phase=args.phase,
-            cache_dir=args.cache_dir,
-            n_workers=args.n_workers,
-            slice_mode=args.slice_mode,
-            n_slices=args.n_slices,
-            dual_phase=getattr(args, "dual_phase", False),
-        )
 
-        # Filter labels to match valid patients
-        valid_labels = labels[valid_indices]
+        if task == "contrast":
+            # Contrast task: extract from both phases and combine.
+            feature_matrix, valid_labels, valid_pids, valid_indices = (
+                create_contrast_dataset(
+                    patient_ids=patient_ids,
+                    data_dir=args.data_dir,
+                    images_dir=args.images_dir,
+                    segmentations_dir=args.segmentations_dir,
+                    cache_dir=args.cache_dir,
+                    n_workers=args.n_workers,
+                    slice_mode=args.slice_mode,
+                    n_slices=args.n_slices,
+                )
+            )
+        else:
+            feature_matrix, valid_pids, valid_indices = extract_features_for_patients(
+                patient_ids=patient_ids,
+                data_dir=args.data_dir,
+                images_dir=args.images_dir,
+                segmentations_dir=args.segmentations_dir,
+                phase=args.phase,
+                cache_dir=args.cache_dir,
+                n_workers=args.n_workers,
+                slice_mode=args.slice_mode,
+                n_slices=args.n_slices,
+                dual_phase=getattr(args, "dual_phase", False),
+            )
+            # Filter labels to match valid patients
+            valid_labels = labels[valid_indices]
 
         if len(valid_labels) < 10:
             logger.error(
@@ -2135,86 +2398,105 @@ def main(argv: Optional[list[str]] = None) -> None:
                 f"({len(test_patient_ids_global)} patients) ---"
             )
             try:
-                # Create labels for test patients
-                test_pids_task, test_labels_task = create_labels(
-                    clinical_df[
-                        clinical_df["patient_id"].isin(test_patient_ids_global)
-                    ].copy(),
-                    task,
-                )
-
-                if len(test_pids_task) == 0:
-                    logger.warning(
-                        f"No test patients with valid labels for task '{task}'."
-                    )
-                else:
-                    # Extract test features
-                    test_features, test_valid_pids, test_valid_idx = (
-                        extract_features_for_patients(
-                            patient_ids=test_pids_task,
+                if task == "contrast":
+                    # Contrast: build test features from both phases.
+                    test_features, test_labels_valid, _, _ = (
+                        create_contrast_dataset(
+                            patient_ids=test_patient_ids_global,
                             data_dir=args.data_dir,
                             images_dir=args.images_dir,
                             segmentations_dir=args.segmentations_dir,
-                            phase=args.phase,
                             cache_dir=args.cache_dir,
                             n_workers=args.n_workers,
                             slice_mode=args.slice_mode,
                             n_slices=args.n_slices,
-                            dual_phase=getattr(args, "dual_phase", False),
                         )
                     )
+                else:
+                    # Subtype tasks: create labels for test patients
+                    test_pids_task, test_labels_task = create_labels(
+                        clinical_df[
+                            clinical_df["patient_id"].isin(
+                                test_patient_ids_global
+                            )
+                        ].copy(),
+                        task,
+                    )
 
-                    test_labels_valid = test_labels_task[test_valid_idx]
-
-                    if len(test_labels_valid) < 2:
+                    if len(test_pids_task) == 0:
                         logger.warning(
-                            f"Fewer than 2 valid test patients for '{task}'."
+                            f"No test patients with valid labels for '{task}'."
                         )
+                        # Leave empty so the len < 2 check below skips.
+                        test_features = np.empty((0, 0))
+                        test_labels_valid = np.array([], dtype=np.int64)
                     else:
-                        # Predict on test set
-                        test_metrics = evaluate_model(
-                            best_model, test_features, test_labels_valid
+                        # Extract test features
+                        test_features, test_valid_pids, test_valid_idx = (
+                            extract_features_for_patients(
+                                patient_ids=test_pids_task,
+                                data_dir=args.data_dir,
+                                images_dir=args.images_dir,
+                                segmentations_dir=args.segmentations_dir,
+                                phase=args.phase,
+                                cache_dir=args.cache_dir,
+                                n_workers=args.n_workers,
+                                slice_mode=args.slice_mode,
+                                n_slices=args.n_slices,
+                                dual_phase=getattr(args, "dual_phase", False),
+                            )
                         )
-                        logger.info(
-                            f"TEST SET — {task}: "
-                            f"AUROC={test_metrics['auroc']:.4f}, "
-                            f"Bal.Acc={test_metrics['balanced_accuracy']:.4f}"
-                        )
+                        test_labels_valid = test_labels_task[test_valid_idx]
 
-                        # Generate test-set visualisations
-                        if not args.no_viz:
-                            try:
-                                test_viz = TrainingVisualizer(
-                                    output_dir=viz_dir / f"{task}_test"
-                                )
-                                test_proba = best_model.predict_proba(
-                                    test_features
-                                )
-                                test_score = (
-                                    test_proba[:, 1]
-                                    if test_proba.ndim == 2
-                                    else test_proba
-                                )
-                                test_pred = (
-                                    (test_score >= 0.5).astype(np.int64)
-                                )
+                if len(test_labels_valid) < 2:
+                    logger.warning(
+                        f"Fewer than 2 valid test patients for '{task}'."
+                    )
+                else:
+                    # Predict on test set
+                    test_metrics = evaluate_model(
+                        best_model, test_features, test_labels_valid
+                    )
+                    logger.info(
+                        f"TEST SET — {task}: "
+                        f"AUROC={test_metrics['auroc']:.4f}, "
+                        f"Bal.Acc={test_metrics['balanced_accuracy']:.4f}"
+                    )
 
-                                test_viz_paths = test_viz.generate_all(
-                                    y_true=test_labels_valid,
-                                    y_pred=test_pred,
-                                    y_score=test_score,
-                                    model=best_model,
-                                    task=task,
-                                    dataset_label="MAMA-MIA Test",
-                                )
-                                logger.info(
-                                    f"Generated {len(test_viz_paths)} test-set "
-                                    f"visualisations for '{task}'"
-                                )
-                            except Exception as e:
-                                logger.warning(
-                                    f"Test-set visualisation failed: {e}"
-                                )
+                    # Generate test-set visualisations
+                    if not args.no_viz:
+                        try:
+                            test_viz = TrainingVisualizer(
+                                output_dir=viz_dir / f"{task}_test"
+                            )
+                            test_proba = best_model.predict_proba(
+                                test_features
+                            )
+                            test_score = (
+                                test_proba[:, 1]
+                                if test_proba.ndim == 2
+                                else test_proba
+                            )
+                            test_pred = (
+                                (test_score >= 0.5).astype(np.int64)
+                            )
+
+                            test_viz_paths = test_viz.generate_all(
+                                y_true=test_labels_valid,
+                                y_pred=test_pred,
+                                y_score=test_score,
+                                model=best_model,
+                                task=task,
+                                dataset_label="MAMA-MIA Test",
+                            )
+                            logger.info(
+                                f"Generated {len(test_viz_paths)} test-set "
+                                f"visualisations for '{task}'"
+                            )
+                        except Exception as e:
+                            logger.warning(
+                                f"Test-set visualisation failed: {e}"
+                            )
 
             except Exception as e:
                 logger.warning(f"Test-set evaluation failed for '{task}': {e}")

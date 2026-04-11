@@ -15,10 +15,51 @@ The MAMA-SYNTH challenge evaluates generative models that translate pre-contrast
 
 Rankings use **Borda-style hierarchical rank aggregation** with tie-break priority: ROI → CLF → SEG → FULL.
 
+## What's New in v0.9.0
+
+- **Structured output folders** (`--run-name`, `--flat-output`) — training runs are now organised into versioned sub-directories under the output path:
+  ```
+  trained_models/
+  ├── run_001_20250101_120000_radiomics_tnbc_luminal/
+  ├── run_002_20250102_093000_cnn_contrast/
+  └── latest -> run_002_...
+  ```
+  Each run directory is auto-numbered and timestamped. A `latest` symlink always points to the most recent run. Use `--run-name my_experiment` to add a custom label, or `--flat-output` to disable versioned directories and write files directly to `--output-dir` (legacy behaviour).
+
+- **Contrast classification** (`--tasks contrast`) — new binary classification task that distinguishes pre-contrast (phase 0) from post-contrast (phase 1) images. Works with both radiomics (`--classifier-type radiomics`) and CNN (`--classifier-type cnn`) backends. For radiomics, features are extracted independently from each phase and combined. For CNN, slices from both phases are extracted with appropriate labels and patient-aware splitting prevents leakage.
+  ```bash
+  mamasia-train \
+      --data-dir /path/to/mama-mia-dataset \
+      --output-dir ./trained_models \
+      --tasks contrast \
+      --classifier-type cnn
+  ```
+
+- **Incremental slice caching** — CNN slice extraction now saves each slice individually as a `.npy` file inside a per-patient directory, so even if the process is killed mid-extraction the already-saved slices survive on disk. A `_done` marker file indicates the patient was fully extracted. Incomplete extractions are automatically re-started on the next run. Legacy `.npz` caches are still supported for backwards compatibility.
+  ```
+  cache_dir/
+  ├── ISPY1_1001_ph1_all_tumor_n5_dp0_msk0/
+  │   ├── slice_0.npy
+  │   ├── slice_1.npy
+  │   ├── mask_0.npy
+  │   ├── mask_1.npy
+  │   └── _done
+  └── ISPY1_1001_ph1_all_tumor_n5_dp0_msk0.npz   # legacy (still readable)
+  ```
+
+- **Bug fixes**:
+  - Fixed version mismatch between `pyproject.toml` and README (now consistently v0.9.0).
+  - Fixed `--clear-cache` only removing `.npy` files — now also removes `.npz` files and per-slice cache directories.
+  - Removed unused `import hashlib` from `train_cnn_classifier.py`.
+  - Removed unused `import sys` from `train_classifier.py`.
+  - Removed unused `batch_size_extract` parameter from `extract_slices_for_cnn()`.
+  - Fixed hardcoded "4-channel" in mask channel log message — now reflects actual channel count.
+  - Fixed inaccurate docstrings for channel counts in `MRISliceDataset` and `train_cnn` (now document both single-phase and dual-phase cases).
+
 ## What's New in v0.8.0
 
 - **CSV-based train/test split** — the MAMA-MIA dataset ships a `train_test_splits.csv` file with `train_split` and `test_split` columns listing patient IDs. This is now auto-detected in `--data-dir` and used as the primary split mechanism. Use `--split-csv /path/to/file.csv` to point to a custom location. Falls back to column-based detection when no CSV is found.
-- **CNN slice caching** (`--cache-dir`) — extracted 2-D slices are written to disk on the first run and re-loaded on subsequent runs, avoiding repeated NIfTI I/O. Each patient's slices are stored in a `.npz` file keyed by extraction parameters (phase, slice mode, dual-phase, mask channel), so different configurations use separate caches.
+- **CNN slice caching** (`--cache-dir`) — extracted 2-D slices are written to disk on the first run and re-loaded on subsequent runs, avoiding repeated NIfTI I/O. Each patient's slices are stored as individual `.npy` files inside a per-patient directory (upgraded from single `.npz` files in v0.9.0), keyed by extraction parameters (phase, slice mode, dual-phase, mask channel), so different configurations use separate caches.
 - **GPU / device selection** (`--device`) — new CLI flag for CNN training and evaluation: `auto` (default, selects CUDA → MPS → CPU), `cpu`, `cuda`, or `mps`. Previously the device was always auto-detected with no way to override.
 - **MAMA-MIA test split by dataset** (`--test-split-values`) — use arbitrary column values as the test set when no CSV is available. With `--split-column dataset --test-split-values DUKE`, all DUKE patients become the test set.
 - **Bug fixes**:
@@ -386,7 +427,7 @@ mamasia-train \
 | `--clinical-data` | `None` | Path to Excel file (auto-detected in `--data-dir` if omitted) |
 | `--images-dir` | `None` | Images directory (default: `<data-dir>/images`) |
 | `--segmentations-dir` / `--masks-path` | `None` | Path to segmentation masks folder (default: `<data-dir>/segmentations`). Use this when masks are not in the default location. |
-| `--tasks` | `tnbc,luminal` | Comma-separated list of tasks to train |
+| `--tasks` | `tnbc,luminal` | Comma-separated list of tasks: `tnbc`, `luminal`, `contrast` |
 | `--phase` | `1` | DCE-MRI phase to use (0=pre-contrast, 1=first post-contrast) |
 | `--val-ratio` | `0.2` | Fraction of data for validation (holdout mode) |
 | `--cv-folds` | `0` | Number of cross-validation folds (0 = holdout mode) |
@@ -410,13 +451,13 @@ mamasia-train \
 | `--cnn-batch-size` | `32` | Batch size (CNN mode only) |
 | `--cnn-lr` | `1e-4` | Initial learning rate (CNN mode only) |
 | `--cnn-patience` | `10` | Early-stopping patience in epochs (CNN mode only) |
-| `--cnn-mask-channel` | `false` | Add tumor mask as 4th CNN input channel |
+| `--cnn-mask-channel` | `false` | Add tumor mask as extra CNN input channel |
 | `--radiomics-model` | `all` | Radiomics family filter: `all`, `xgboost`, `random_forest`, `logistic_regression`, `svm` |
 | `--save-all-models` | `false` | Save all trained models (not just best) for ensemble |
 | `--dual-phase` | `false` | Use both phase 0 + phase 1 for classification |
 | `--device` | `auto` | Device for CNN training: `auto`, `cpu`, `cuda`, `mps` |
-| `--cache-dir` | `None` | Directory for caching extracted CNN slices (`.npz` per patient) |
-| `--test-split-values` | `None` | Custom test-set values for `--split-column` (e.g. `DUKE ISPY1`) |
+| `--run-name` | `None` | Custom label appended to the versioned run directory name |
+| `--flat-output` | `false` | Disable versioned run directories; write directly to `--output-dir` |
 | `-v, --verbose` | `false` | Verbose logging |
 
 ### Training Modes
@@ -520,6 +561,24 @@ mamasia-train \
     --data-dir /path/to/mama-mia-dataset \
     --output-dir ./models \
     --dual-phase
+```
+
+**Contrast classification**: Train a binary classifier to distinguish pre-contrast from post-contrast images (useful as the main MAMA-SYNTH challenge task).
+
+```bash
+# Radiomics-based contrast classifier
+mamasia-train \
+    --data-dir /path/to/mama-mia-dataset \
+    --output-dir ./trained_models \
+    --tasks contrast
+
+# CNN-based contrast classifier
+mamasia-train \
+    --data-dir /path/to/mama-mia-dataset \
+    --output-dir ./trained_models \
+    --tasks contrast \
+    --classifier-type cnn \
+    --cache-dir ./slice_cache
 ```
 
 **Ensemble evaluation**: Average predictions across all saved models.
@@ -627,34 +686,35 @@ viz.generate_all(
 
 ### Training Output
 
-After training, the output directory contains:
+After training, the output directory contains versioned run sub-directories (unless `--flat-output` is used):
 
 ```
 trained-models/
-├── tnbc_classifier.pkl              # TNBC classifier (radiomics mode)
-├── tnbc_classifier_RF_0.pkl         # Additional models (--save-all-models)
-├── tnbc_classifier_LR_1.pkl         # ...
-├── luminal_classifier.pkl           # Luminal classifier (radiomics mode)
-├── tnbc_classifier_cnn.pt           # TNBC classifier (CNN mode)
-├── luminal_classifier_cnn.pt        # Luminal classifier (CNN mode)
-├── training_report.json             # Training metadata, metrics, and config
-├── feature_cache/                   # Cached feature vectors (per patient)
-└── visualizations/
-    ├── tnbc/                        # Validation-set visualisations
-    │   ├── confusion_matrix_tnbc.png
-    │   ├── confusion_matrix_tnbc.json
-    │   ├── roc_curve_tnbc.png
-    │   ├── pr_curve_tnbc.png
-    │   ├── feature_importance_tnbc.png
-    │   ├── classification_report_tnbc.txt
-    │   ├── classification_report_tnbc.json
-    │   └── dashboard_tnbc.png       # Combined 2×2 dashboard
-    ├── tnbc_test/                   # Test-set visualisations (if --evaluate-test-set)
-    │   └── ...
-    ├── luminal/
-    │   └── ...
-    └── luminal_test/
-        └── ...
+├── latest -> run_002_20250102_093000_cnn_contrast/     # symlink
+├── run_001_20250101_120000_radiomics_tnbc_luminal/
+│   ├── tnbc_classifier.pkl              # TNBC classifier (radiomics mode)
+│   ├── tnbc_classifier_RF_0.pkl         # Additional models (--save-all-models)
+│   ├── luminal_classifier.pkl           # Luminal classifier (radiomics mode)
+│   ├── training_report.json             # Training metadata, metrics, and config
+│   ├── feature_cache/                   # Cached feature vectors (per patient)
+│   └── visualizations/
+│       ├── tnbc/
+│       │   ├── confusion_matrix_tnbc.png
+│       │   ├── roc_curve_tnbc.png
+│       │   ├── pr_curve_tnbc.png
+│       │   ├── feature_importance_tnbc.png
+│       │   ├── classification_report_tnbc.{txt,json}
+│       │   └── dashboard_tnbc.png
+│       ├── tnbc_test/                   # Test-set visualisations (--evaluate-test-set)
+│       │   └── ...
+│       └── luminal/
+│           └── ...
+└── run_002_20250102_093000_cnn_contrast/
+    ├── contrast_classifier_cnn.pt       # Contrast classifier (CNN mode)
+    ├── training_report.json
+    └── visualizations/
+        └── contrast/
+            └── ...
 ```
 
 The `.pkl` files are directly usable with the evaluation pipeline:
@@ -861,6 +921,7 @@ mama-synth-eval
 │   ├── test_train_classifier.py # Classifier training tests
 │   ├── test_train_cnn_classifier.py # CNN classifier training tests
 │   ├── test_v070_features.py    # v0.7.0 feature tests (dual-phase, ensemble, etc.)
+│   ├── test_v090_features.py    # v0.9.0 feature tests (run dirs, contrast, caching)
 │   ├── test_synthesize.py       # Synthesis pipeline tests
 │   ├── test_slice_extraction.py # 2D slice extraction tests
 │   └── test_training_visualization.py # Training visualisation tests
