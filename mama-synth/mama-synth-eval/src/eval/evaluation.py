@@ -237,6 +237,9 @@ class MamaSynthEval:
         )
         # Will be fitted during evaluate()
         self._normalizer = DatasetNormalizer()
+        # Per-evaluation image cache to avoid redundant NIfTI loads.
+        # Enabled only during evaluate() and cleared afterwards.
+        self._image_cache: Optional[dict[str, NDArray]] = None
 
     # ------------------------------------------------------------------
     # Main entry point
@@ -295,9 +298,12 @@ class MamaSynthEval:
                 "worst-score imputation will apply."
             )
 
+        # Enable per-evaluation image cache so NIfTI files are decoded once.
+        self._image_cache = {}
+
         # --- Fit dataset-level normaliser on all GT images ---
         gt_images_raw = [
-            self._load_image(p) for p in tqdm(
+            self._load_image_cached(p) for p in tqdm(
                 [p[0] for p in pairs], desc="Loading GT images", leave=False
             )
         ]
@@ -360,6 +366,10 @@ class MamaSynthEval:
             results["missing_predictions"] = missing_stems
 
         self._save_results(results)
+
+        # Release per-evaluation image cache to free memory.
+        self._image_cache = None
+
         return results
 
     # ------------------------------------------------------------------
@@ -386,7 +396,7 @@ class MamaSynthEval:
             leave=False,
         ):
             gt = self._normalizer.transform(gt_raw)
-            pred = self._normalizer.transform(self._load_image(pred_path))
+            pred = self._normalizer.transform(self._load_image_cached(pred_path))
 
             mse_values.append(float(np.mean((pred - gt) ** 2)))
             real_images.append(gt)
@@ -441,8 +451,8 @@ class MamaSynthEval:
                 logger.warning(f"No mask for {stem}, skipping ROI evaluation.")
                 continue
 
-            gt = self._normalizer.transform(self._load_image(gt_path))
-            pred = self._normalizer.transform(self._load_image(pred_path))
+            gt = self._normalizer.transform(self._load_image_cached(gt_path))
+            pred = self._normalizer.transform(self._load_image_cached(pred_path))
             mask = masks[stem]
 
             real_roi, synth_roi, _ = extract_roi_pair(
@@ -525,7 +535,7 @@ class MamaSynthEval:
             if stem not in masks:
                 continue
 
-            pred_image = self._load_image(pred_path).astype(np.float64)
+            pred_image = self._load_image_cached(pred_path).astype(np.float64)
             gt_mask = masks[stem]
 
             # Apply segmentation model to synthetic image
@@ -598,7 +608,7 @@ class MamaSynthEval:
             if stem not in labels:
                 continue
 
-            pred_image = self._load_image(pred_path).astype(np.float64)
+            pred_image = self._load_image_cached(pred_path).astype(np.float64)
             feats = extract_radiomic_features(pred_image)
 
             # Dual-phase: also extract features from pre-contrast and concatenate
@@ -608,7 +618,7 @@ class MamaSynthEval:
                     pc_path = self.precontrast_path / f"{stem}{ext}"
                     if pc_path.exists():
                         try:
-                            pc_image = self._load_image(pc_path).astype(
+                            pc_image = self._load_image_cached(pc_path).astype(
                                 np.float64
                             )
                             precon_feats = extract_radiomic_features(pc_image)
@@ -673,7 +683,7 @@ class MamaSynthEval:
                         stem = self._get_stem(pred_path)
                         if stem not in labels:
                             continue
-                        img = self._load_image(pred_path).astype(np.float64)
+                        img = self._load_image_cached(pred_path).astype(np.float64)
                         cnn_images.append(img)
                         mask_arr: Optional[NDArray] = None
                         if self.masks_path and self.masks_path.exists():
@@ -732,7 +742,7 @@ class MamaSynthEval:
                         stem = self._get_stem(pred_path)
                         if stem not in labels:
                             continue
-                        img = self._load_image(pred_path).astype(np.float64)
+                        img = self._load_image_cached(pred_path).astype(np.float64)
                         cnn_imgs.append(img)
                         # Try to load mask for better slice selection
                         mask_arr_single: Optional[NDArray] = None
@@ -895,7 +905,7 @@ class MamaSynthEval:
                 continue
 
             # Load the synthetic image
-            pred_image = self._load_image(pred_path).astype(np.float64)
+            pred_image = self._load_image_cached(pred_path).astype(np.float64)
 
             # Create mirrored mask
             mirrored = create_mirrored_mask(pred_image, mask_arr)
@@ -1067,8 +1077,8 @@ class MamaSynthEval:
         fitted (the standard challenge workflow).  Falls back to raw
         intensities for backward compatibility.
         """
-        gt_image = self._load_image(gt_path).astype(np.float64)
-        pred_image = self._load_image(pred_path).astype(np.float64)
+        gt_image = self._load_image_cached(gt_path).astype(np.float64)
+        pred_image = self._load_image_cached(pred_path).astype(np.float64)
 
         if gt_image.shape != pred_image.shape:
             raise ValueError(
@@ -1108,6 +1118,26 @@ class MamaSynthEval:
         image = sitk.ReadImage(str(path))
         return sitk.GetArrayFromImage(image)
 
+    def _load_image_cached(self, path: Path) -> NDArray[np.floating]:
+        """Load an image, reusing the per-evaluation cache when active.
+
+        During ``evaluate()``, a cache dict is active so that the same
+        NIfTI file is decompressed only once even when multiple
+        evaluation tasks need it.  A *copy* is returned each time so
+        that in-place mutations (e.g. ``normalize_intensity``) do not
+        corrupt the cached original.
+        """
+        key = str(path)
+        if self._image_cache is not None:
+            arr = self._image_cache.get(key)
+            if arr is not None:
+                return arr.copy()
+        arr = self._load_image(path)
+        if self._image_cache is not None:
+            self._image_cache[key] = arr
+            return arr.copy()
+        return arr
+
     def _load_masks(
         self, gt_paths: list[Path]
     ) -> dict[str, NDArray[np.bool_]]:
@@ -1122,7 +1152,7 @@ class MamaSynthEval:
         for gt_path in gt_paths:
             stem = self._get_stem(gt_path)
             if stem in mask_mapping:
-                mask_data = self._load_image(mask_mapping[stem])
+                mask_data = self._load_image_cached(mask_mapping[stem])
                 masks[stem] = mask_data > 0
             else:
                 logger.warning(f"No mask found for {stem}")

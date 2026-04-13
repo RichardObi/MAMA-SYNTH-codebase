@@ -51,6 +51,8 @@ __all__ = ["TrainingVisualizer"]
 _TASK_LABELS = {
     "tnbc": "TNBC vs non-TNBC",
     "luminal": "Luminal vs non-Luminal",
+    "contrast": "Pre- vs Post-Contrast",
+    "tumor_roi": "Tumor ROI vs Contralateral ROI",
 }
 
 
@@ -129,6 +131,10 @@ class TrainingVisualizer:
                 class_names = ["non-TNBC", "TNBC"]
             elif task == "luminal":
                 class_names = ["non-Luminal", "Luminal"]
+            elif task == "contrast":
+                class_names = ["Pre-Contrast", "Post-Contrast"]
+            elif task == "tumor_roi":
+                class_names = ["Contralateral ROI", "Tumor ROI"]
             else:
                 class_names = ["Negative", "Positive"]
 
@@ -436,6 +442,10 @@ class TrainingVisualizer:
                 class_names = ["non-TNBC", "TNBC"]
             elif task == "luminal":
                 class_names = ["non-Luminal", "Luminal"]
+            elif task == "contrast":
+                class_names = ["Pre-Contrast", "Post-Contrast"]
+            elif task == "tumor_roi":
+                class_names = ["Contralateral ROI", "Tumor ROI"]
             else:
                 class_names = ["Negative", "Positive"]
 
@@ -550,6 +560,10 @@ class TrainingVisualizer:
                 class_names = ["non-TNBC", "TNBC"]
             elif task == "luminal":
                 class_names = ["non-Luminal", "Luminal"]
+            elif task == "contrast":
+                class_names = ["Pre-Contrast", "Post-Contrast"]
+            elif task == "tumor_roi":
+                class_names = ["Contralateral ROI", "Tumor ROI"]
             else:
                 class_names = ["Negative", "Positive"]
 

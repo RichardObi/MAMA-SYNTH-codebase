@@ -128,12 +128,12 @@ class RadiomicsClassifier:
         """Initialize the classifier.
 
         Args:
-            task: One of 'tnbc' or 'luminal'.
+            task: One of 'tnbc', 'luminal', 'contrast', or 'tumor_roi'.
             model: Pre-trained scikit-learn model with predict_proba method.
                    If None, a default XGBoost model is created.
             model_path: Path to a pickled model file. Takes precedence over model.
         """
-        valid_tasks = {"tnbc", "luminal"}
+        valid_tasks = {"tnbc", "luminal", "contrast", "tumor_roi"}
         if task not in valid_tasks:
             raise ValueError(f"task must be one of {valid_tasks}, got '{task}'")
         self.task = task
@@ -167,7 +167,7 @@ class RadiomicsClassifier:
                 eval_metric="logloss",
                 random_state=42,
             )
-        except ImportError:
+        except Exception:
             from sklearn.ensemble import RandomForestClassifier
 
             logger.info("XGBoost not available, falling back to RandomForest.")
@@ -267,7 +267,7 @@ class CNNClassifier:
         task: str = "tnbc",
         model_path: Optional[Union[str, Path]] = None,
     ) -> None:
-        valid_tasks = {"tnbc", "luminal"}
+        valid_tasks = {"tnbc", "luminal", "contrast", "tumor_roi"}
         if task not in valid_tasks:
             raise ValueError(f"task must be one of {valid_tasks}, got '{task}'")
         self.task = task
@@ -426,7 +426,7 @@ class EnsembleClassifier:
     """
 
     def __init__(self, task: str) -> None:
-        valid_tasks = {"tnbc", "luminal"}
+        valid_tasks = {"tnbc", "luminal", "contrast", "tumor_roi"}
         if task not in valid_tasks:
             raise ValueError(f"task must be one of {valid_tasks}, got '{task}'")
         self.task = task

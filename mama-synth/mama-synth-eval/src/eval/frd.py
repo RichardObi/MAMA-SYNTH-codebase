@@ -64,6 +64,50 @@ def _extract_single(
     )
 
 
+# ---------------------------------------------------------------------------
+# Cached pyradiomics extractor
+# ---------------------------------------------------------------------------
+# Creating a RadiomicsFeatureExtractor is expensive: it imports many
+# sub-modules, builds filter kernels, etc.  We cache configured instances
+# keyed by (feature_classes, bin_width, was_2d) so repeated calls with the
+# same configuration reuse the same object.  The cache lives in the module
+# and is therefore per-process (safe for ProcessPoolExecutor workers which
+# each get their own copy via forking/spawning).
+
+_EXTRACTOR_CACHE: dict[tuple, object] = {}
+
+
+def _get_cached_extractor(
+    feature_classes: tuple[str, ...],
+    bin_width: int,
+    was_2d: bool,
+) -> object:
+    """Return a cached RadiomicsFeatureExtractor, creating one if needed."""
+    key = (feature_classes, bin_width, was_2d)
+    extractor = _EXTRACTOR_CACHE.get(key)
+    if extractor is not None:
+        return extractor
+
+    from radiomics import featureextractor
+
+    settings = {
+        "binWidth": bin_width,
+        "resampledPixelSpacing": None,  # No resampling
+        "interpolator": "sitkBSpline",
+        "minimumROIDimensions": 1,
+        "minimumROISize": 1,
+        "force2D": was_2d,
+        "force2Ddimension": 0 if was_2d else None,
+    }
+    ext = featureextractor.RadiomicsFeatureExtractor(**settings)
+    ext.disableAllFeatures()
+    for fc in feature_classes:
+        ext.enableFeatureClassByName(fc)
+
+    _EXTRACTOR_CACHE[key] = ext
+    return ext
+
+
 def extract_radiomic_features(
     image: NDArray[np.floating],
     mask: Optional[NDArray[np.bool_]] = None,
@@ -102,8 +146,10 @@ def extract_radiomic_features(
     if feature_classes is None:
         feature_classes = FRD_FEATURE_CLASSES
 
-    # Suppress verbose pyradiomics logging
-    radiomics.setVerbosity(60)
+    # Suppress verbose pyradiomics logging (once per process)
+    if not getattr(extract_radiomic_features, "_verbosity_set", False):
+        radiomics.setVerbosity(60)
+        extract_radiomic_features._verbosity_set = True
 
     # Ensure image is at least 3D for SimpleITK (add slice dimension if 2D)
     was_2d = image.ndim == 2
@@ -127,23 +173,12 @@ def extract_radiomic_features(
     sitk_image = sitk.GetImageFromArray(image.astype(np.float64))
     sitk_mask = sitk.GetImageFromArray(mask_arr)
 
-    # Configure pyradiomics extractor
-    settings = {
-        "binWidth": bin_width,
-        "resampledPixelSpacing": None,  # No resampling
-        "interpolator": "sitkBSpline",
-        "minimumROIDimensions": 1,
-        "minimumROISize": 1,
-        "force2D": was_2d,
-        "force2Ddimension": 0 if was_2d else None,
-    }
-
-    extractor = featureextractor.RadiomicsFeatureExtractor(**settings)
-
-    # Disable all features, then enable only requested classes
-    extractor.disableAllFeatures()
-    for fc in feature_classes:
-        extractor.enableFeatureClassByName(fc)
+    # Get or create a cached extractor for this configuration
+    extractor = _get_cached_extractor(
+        feature_classes=tuple(feature_classes),
+        bin_width=bin_width,
+        was_2d=was_2d,
+    )
 
     try:
         result = extractor.execute(sitk_image, sitk_mask)

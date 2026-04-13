@@ -58,6 +58,7 @@ Reference: MAMA-SYNTH Challenge, Classification assessment.
 import argparse
 import json
 import logging
+import os
 import pickle
 import time
 from pathlib import Path
@@ -1745,32 +1746,56 @@ def train_with_model_selection(
     results_log: list[dict[str, Any]] = []
     all_trained: list[tuple[Any, str, dict[str, float]]] = []
 
-    for config in configs:
-        try:
-            model, train_m, val_m = train_single_model(
-                config, X_train, y_train, X_val, y_val
-            )
-        except Exception as e:
-            logger.warning(f"  Failed: {config['name']}: {e}")
-            continue
+    # Train configs concurrently using threads.  sklearn/BLAS releases the
+    # GIL so multiple fits can run in parallel.  ThreadPoolExecutor avoids
+    # pickling issues with lambda create_fn closures.
+    from concurrent.futures import ThreadPoolExecutor, as_completed
 
-        results_log.append({
-            "name": config["name"],
-            "train_auroc": train_m["auroc"],
-            "train_bal_acc": train_m["balanced_accuracy"],
-            "val_auroc": val_m["auroc"],
-            "val_bal_acc": val_m["balanced_accuracy"],
-        })
+    n_threads = min(len(configs), max(1, (os.cpu_count() or 1)))
 
-        if return_all:
-            all_trained.append((model, config["name"], val_m))
+    def _fit_config(
+        cfg: dict[str, Any],
+    ) -> tuple[dict[str, Any], Any, dict[str, float], dict[str, float]]:
+        model = cfg["create_fn"]()
+        start = time.time()
+        model.fit(X_train, y_train)
+        elapsed = time.time() - start
+        train_m = evaluate_model(model, X_train, y_train)
+        val_m = evaluate_model(model, X_val, y_val)
+        logger.info(
+            f"  {cfg['name']} ({elapsed:.1f}s): "
+            f"train AUROC={train_m['auroc']:.4f}, "
+            f"val AUROC={val_m['auroc']:.4f}"
+        )
+        return cfg, model, train_m, val_m
 
-        val_auroc = val_m["auroc"]
-        if not np.isnan(val_auroc) and val_auroc > best_val_auroc:
-            best_val_auroc = val_auroc
-            best_model = model
-            best_name = config["name"]
-            best_val_metrics = val_m
+    with ThreadPoolExecutor(max_workers=n_threads) as pool:
+        futures = {pool.submit(_fit_config, cfg): cfg for cfg in configs}
+        for fut in as_completed(futures):
+            cfg = futures[fut]
+            try:
+                _, model, train_m, val_m = fut.result()
+            except Exception as e:
+                logger.warning(f"  Failed: {cfg['name']}: {e}")
+                continue
+
+            results_log.append({
+                "name": cfg["name"],
+                "train_auroc": train_m["auroc"],
+                "train_bal_acc": train_m["balanced_accuracy"],
+                "val_auroc": val_m["auroc"],
+                "val_bal_acc": val_m["balanced_accuracy"],
+            })
+
+            if return_all:
+                all_trained.append((model, cfg["name"], val_m))
+
+            val_auroc = val_m["auroc"]
+            if not np.isnan(val_auroc) and val_auroc > best_val_auroc:
+                best_val_auroc = val_auroc
+                best_model = model
+                best_name = cfg["name"]
+                best_val_metrics = val_m
 
     if best_model is None:
         raise RuntimeError(
@@ -1835,12 +1860,33 @@ def train_with_cross_validation(
 
     best_config = None
     best_avg_auroc = -1.0
+    # Minimum number of folds before early-stopping can trigger.
+    _MIN_FOLDS_BEFORE_STOP = 2
 
     for config in configs:
-        fold_aurocs = []
-        fold_bal_accs = []
+        fold_aurocs: list[float] = []
+        fold_bal_accs: list[float] = []
+        _stopped_early = False
 
         for fold, (train_idx, val_idx) in enumerate(skf.split(X, y)):
+            # --- Early stopping: if running mean is far below current best,
+            # skip remaining folds to save time. ---
+            if (
+                fold >= _MIN_FOLDS_BEFORE_STOP
+                and best_avg_auroc > 0
+                and fold_aurocs
+            ):
+                running_mean = float(np.nanmean(fold_aurocs))
+                # Stop if running mean is more than 0.10 below best so far
+                if running_mean < best_avg_auroc - 0.10:
+                    logger.debug(
+                        f"  {config['name']}: early-stopped after fold {fold} "
+                        f"(running AUROC={running_mean:.4f} vs "
+                        f"best={best_avg_auroc:.4f})"
+                    )
+                    _stopped_early = True
+                    break
+
             X_tr, X_va = X[train_idx], X[val_idx]
             y_tr, y_va = y[train_idx], y[val_idx]
 
@@ -1858,10 +1904,11 @@ def train_with_cross_validation(
         if fold_aurocs:
             avg_auroc = float(np.nanmean(fold_aurocs))
             avg_bal_acc = float(np.nanmean(fold_bal_accs))
+            suffix = " [early-stopped]" if _stopped_early else ""
             logger.info(
                 f"  {config['name']}: "
                 f"CV AUROC={avg_auroc:.4f}±{np.nanstd(fold_aurocs):.4f}, "
-                f"Bal.Acc={avg_bal_acc:.4f}"
+                f"Bal.Acc={avg_bal_acc:.4f}{suffix}"
             )
 
             if avg_auroc > best_avg_auroc:
