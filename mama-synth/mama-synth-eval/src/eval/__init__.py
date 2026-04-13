@@ -25,6 +25,7 @@ from eval.evaluation import (
     DatasetNormalizer,
     METRIC_AUROC_LUMINAL,
     METRIC_AUROC_TNBC,
+    METRIC_AUROC_TUMOR_ROI,
     METRIC_DICE,
     METRIC_FRD_ROI,
     METRIC_HD95,
@@ -68,6 +69,7 @@ __all__ = [
     "METRIC_FRD_ROI",
     "METRIC_AUROC_LUMINAL",
     "METRIC_AUROC_TNBC",
+    "METRIC_AUROC_TUMOR_ROI",
     "METRIC_DICE",
     "METRIC_HD95",
     # Image-to-image metrics

@@ -28,8 +28,8 @@ breast DCE-MRI images across four tasks with **8 equally-weighted metrics**
       2.2  FRD   (distributional comparison of tumor-area realism)
 
   Task 3 — Classification:
-      3.1  AUROC luminal     (standard medical AUC metric)
-      3.2  AUROC triple-neg. (same metric, second subtype)
+      3.1  AUROC contrast    (pre- vs post-contrast phase classification)
+      3.2  AUROC tumor ROI   (tumor ROI vs contralateral mirrored ROI)
 
   Task 4 — Segmentation:
       4.1  Dice  (classic standardised segmentation metric)
@@ -47,6 +47,7 @@ The output ``metrics.json`` uses a Grand-Challenge-compatible structure::
           "frd_roi": ...,
           "auroc_luminal": ...,
           "auroc_tnbc": ...,
+          "auroc_tumor_roi": ...,
           "dice": {"mean": ..., "std": ...},
           "hausdorff95": {"mean": ..., "std": ...}
       },
@@ -89,6 +90,7 @@ METRIC_SSIM_ROI = "ssim_roi"
 METRIC_FRD_ROI = "frd_roi"
 METRIC_AUROC_LUMINAL = "auroc_luminal"
 METRIC_AUROC_TNBC = "auroc_tnbc"
+METRIC_AUROC_TUMOR_ROI = "auroc_tumor_roi"
 METRIC_DICE = "dice"
 METRIC_HD95 = "hausdorff95"
 
@@ -796,7 +798,155 @@ class MamaSynthEval:
                     "Provide model via --clf-model-dir."
                 )
 
+        # --------------------------------------------------------------
+        # Tumor ROI classification (separate feature extraction)
+        # --------------------------------------------------------------
+        # Unlike tnbc/luminal, tumor_roi requires mask-based feature
+        # extraction: for each case we extract features from the tumor
+        # ROI (label=1) and from a contralateral mirrored ROI (label=0),
+        # then run the trained classifier.
+        # --------------------------------------------------------------
+        self._evaluate_tumor_roi(pairs, labels, agg, detail)
+
         return {"aggregates": agg, "detail": detail}
+
+    def _evaluate_tumor_roi(
+        self,
+        pairs: list[tuple[Path, Path]],
+        labels: dict[str, dict[str, int]],
+        agg: dict[str, Any],
+        detail: dict[str, Any],
+    ) -> None:
+        """Evaluate tumor-ROI vs contralateral-mirrored-ROI classification.
+
+        For each synthetic prediction that has a corresponding mask:
+          1. Extract radiomic features from the tumor ROI (label=1).
+          2. Mirror the mask across the body midline and extract
+             radiomic features from the mirrored region (label=0).
+          3. Run the pre-trained ``tumor_roi`` classifier on both
+             feature vectors and collect predicted probabilities.
+
+        Populates *agg* and *detail* in-place.
+        """
+        task = "tumor_roi"
+        metric_key = METRIC_AUROC_TUMOR_ROI
+
+        # Check for a pre-trained tumor_roi model
+        pkl_model_path = None
+        if self.clf_model_dir and self.clf_model_dir.exists():
+            pkl_candidate = self.clf_model_dir / f"{task}_classifier.pkl"
+            if pkl_candidate.exists():
+                pkl_model_path = pkl_candidate
+
+        if pkl_model_path is None:
+            detail[f"note_{task}"] = (
+                f"No pre-trained {task} classifier found. "
+                "Provide model via --clf-model-dir."
+            )
+            return
+
+        if self.masks_path is None or not self.masks_path.exists():
+            detail[f"note_{task}"] = (
+                "Tumor ROI evaluation requires masks (--masks-path)."
+            )
+            return
+
+        try:
+            from eval.classification import (
+                RadiomicsClassifier,
+                evaluate_classification,
+            )
+            from eval.frd import extract_radiomic_features
+            from eval.mirror_utils import create_mirrored_mask
+        except ImportError:
+            logger.warning(
+                "Tumor ROI evaluation dependencies unavailable, skipping."
+            )
+            return
+
+        clf = RadiomicsClassifier(task=task, model_path=pkl_model_path)
+
+        tumor_feats: list[NDArray] = []
+        mirror_feats: list[NDArray] = []
+        valid_stems: list[str] = []
+
+        for _, pred_path in tqdm(
+            pairs, desc="Tumor ROI features", leave=False
+        ):
+            stem = self._get_stem(pred_path)
+
+            # Load mask
+            mask_arr: Optional[NDArray[np.bool_]] = None
+            if self.masks_path:
+                for ext in (".nii.gz", ".nii", ".mha"):
+                    mask_file = self.masks_path / f"{stem}{ext}"
+                    if mask_file.exists():
+                        try:
+                            mask_arr = sitk.GetArrayFromImage(
+                                sitk.ReadImage(str(mask_file), sitk.sitkUInt8)
+                            ).astype(bool)
+                        except Exception as e:
+                            logger.warning(
+                                f"Failed to load mask for {stem}: {e}"
+                            )
+                        break
+
+            if mask_arr is None or not np.any(mask_arr):
+                continue
+
+            # Load the synthetic image
+            pred_image = self._load_image(pred_path).astype(np.float64)
+
+            # Create mirrored mask
+            mirrored = create_mirrored_mask(pred_image, mask_arr)
+            if mirrored is None:
+                continue
+
+            # Extract features from tumor ROI and mirrored ROI
+            try:
+                t_feats = extract_radiomic_features(
+                    pred_image, mask=mask_arr
+                )
+                m_feats = extract_radiomic_features(
+                    pred_image, mask=mirrored
+                )
+                if t_feats.size == 0 or m_feats.size == 0:
+                    continue
+                tumor_feats.append(t_feats)
+                mirror_feats.append(m_feats)
+                valid_stems.append(stem)
+            except Exception as e:
+                logger.warning(
+                    f"Tumor ROI feature extraction failed for {stem}: {e}"
+                )
+                continue
+
+        if len(tumor_feats) < 2:
+            detail[f"note_{task}"] = (
+                f"Too few valid cases ({len(tumor_feats)}) for tumor ROI "
+                "evaluation.  Check masks and image data."
+            )
+            return
+
+        # Build combined feature matrix: tumor=1, mirror=0
+        all_feats = np.vstack(
+            [np.stack(tumor_feats), np.stack(mirror_feats)]
+        )
+        all_feats = np.nan_to_num(
+            all_feats, nan=0.0, posinf=0.0, neginf=0.0
+        )
+        y_true = np.concatenate([
+            np.ones(len(tumor_feats), dtype=np.int64),
+            np.zeros(len(mirror_feats), dtype=np.int64),
+        ])
+
+        y_score = clf.predict_proba(all_feats)
+        clf_result = evaluate_classification(y_true, y_score)
+        agg[metric_key] = clf_result["auroc"]
+        detail[f"auroc_{task}"] = clf_result["auroc"]
+        detail[f"balanced_accuracy_{task}"] = clf_result["balanced_accuracy"]
+        detail[f"n_cases_{task}"] = len(valid_stems)
+        detail[f"classifier_type_{task}"] = "radiomics"
 
     # ------------------------------------------------------------------
     # Per-case metrics (backward compatibility + GC results list)

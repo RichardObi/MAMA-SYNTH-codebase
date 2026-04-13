@@ -439,17 +439,23 @@ def create_labels(
     clinical metadata).  The returned list contains each patient **once**;
     actual sample doubling (phase 0 + phase 1) is performed downstream.
 
+    For the ``tumor_roi`` task, every patient is included (like contrast).
+    Labels are placeholder 0s — the real 0/1 labels (tumor ROI vs
+    contralateral mirrored ROI) are created by
+    ``create_tumor_roi_dataset()`` downstream.
+
     Args:
         clinical_df: Clinical data DataFrame with 'patient_id' and
             'tumor_subtype' columns.
-        task: Classification task ('tnbc', 'luminal', or 'contrast').
+        task: Classification task ('tnbc', 'luminal', 'contrast', or
+            'tumor_roi').
 
     Returns:
         Tuple of (patient_ids, labels) where labels is a binary array.
     """
     import pandas as pd
 
-    valid_tasks = {"tnbc", "luminal", "contrast"}
+    valid_tasks = {"tnbc", "luminal", "contrast", "tumor_roi"}
     if task not in valid_tasks:
         raise ValueError(f"task must be one of {valid_tasks}, got '{task}'")
 
@@ -463,6 +469,18 @@ def create_labels(
         logger.info(
             f"Task 'contrast': {len(patient_ids)} patients available "
             f"(each contributes phase-0 and phase-1 samples)."
+        )
+        return patient_ids, labels
+
+    if task == "tumor_roi":
+        # Tumor ROI task: every patient participates.  Labels are
+        # placeholder 0s — real labels (1=tumor, 0=mirror) are created
+        # by ``create_tumor_roi_dataset()``.
+        patient_ids = clinical_df["patient_id"].dropna().unique().tolist()
+        labels = np.zeros(len(patient_ids), dtype=np.int64)
+        logger.info(
+            f"Task 'tumor_roi': {len(patient_ids)} patients available "
+            f"(each contributes tumor-ROI and mirrored-ROI samples)."
         )
         return patient_ids, labels
 
@@ -573,6 +591,342 @@ def create_contrast_dataset(
     logger.info(
         f"Contrast dataset: {len(labels)} samples "
         f"(pre-contrast={n_pre}, post-contrast={n_post})"
+    )
+
+    return feature_matrix, labels, all_pids, all_indices
+
+
+def create_tumor_roi_dataset(
+    patient_ids: list[str],
+    data_dir: Path,
+    images_dir: Optional[Path] = None,
+    segmentations_dir: Optional[Path] = None,
+    phase: int = 1,
+    cache_dir: Optional[Path] = None,
+    n_workers: int = 1,
+    slice_mode: Optional[str] = None,
+    n_slices: int = 5,
+    search_fraction: float = 0.4,
+    min_tissue_fraction: float = 0.3,
+) -> tuple[NDArray[np.floating], NDArray[np.integer], list[str], list[int]]:
+    """Build a feature matrix for the tumor-ROI vs mirrored-ROI task.
+
+    For each patient, this function:
+      1. Loads the post-contrast image and tumor segmentation mask.
+      2. Extracts radiomic features from the **tumor ROI** (label=1).
+      3. Creates a contralateral mirrored mask (reflected about the
+         body midline) and extracts radiomic features from that
+         **mirrored ROI** (label=0).
+
+    Patients whose mirrored mask fails tissue validation are skipped
+    (they contribute neither a positive nor a negative sample).
+
+    Parameters
+    ----------
+    patient_ids : list[str]
+        Patient identifiers.
+    data_dir : Path
+        Root directory of the MAMA-MIA dataset.
+    images_dir, segmentations_dir : Path | None
+        Override paths.
+    phase : int
+        MRI phase to use (default: 1 = first post-contrast).
+    cache_dir : Path | None
+        Feature cache directory.  Tumor-ROI and mirrored-ROI features
+        are cached separately with ``_tumor`` and ``_mirror`` suffixes.
+    n_workers : int
+        Currently unused (sequential extraction).
+    slice_mode : str | None
+        2D slice extraction strategy.  Only ``"all_tumor"`` is fully
+        supported; when set, each tumour slice becomes an independent
+        sample.  ``None`` → full 3D volume.
+    n_slices : int
+        Number of slices for multi-slice mode (passed through).
+    search_fraction : float
+        Passed to :func:`eval.mirror_utils.detect_midline`.
+    min_tissue_fraction : float
+        Passed to :func:`eval.mirror_utils.validate_mirrored_region`.
+
+    Returns
+    -------
+    feature_matrix : NDArray
+        Shape ``(2*N_valid, n_features)`` (tumor + mirror per patient).
+    labels : NDArray
+        Binary array — ``1`` for tumor ROI, ``0`` for mirrored ROI.
+    valid_pids : list[str]
+        Patient ID for each row (each valid patient appears twice or
+        more in ``all_tumor`` mode).
+    valid_original_indices : list[int]
+        Index into *patient_ids* for each valid row.
+    """
+    from eval.frd import (
+        FRD_DEFAULT_BIN_WIDTH,
+        FRD_FEATURE_CLASSES,
+        extract_radiomic_features,
+    )
+    from eval.mirror_utils import create_mirrored_mask
+
+    if images_dir is None:
+        images_dir = data_dir / IMAGES_SUBDIR
+    if segmentations_dir is None:
+        segmentations_dir = data_dir / SEGMENTATIONS_SUBDIR
+
+    if cache_dir is not None:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+
+    # Resolve slice mode
+    _use_all_tumor = (
+        slice_mode is not None and SliceMode(slice_mode) == SliceMode.ALL_TUMOR
+    )
+
+    # Cache suffix
+    _sm_tag = f"_{slice_mode}" if slice_mode else ""
+    cache_suffix_tumor = f"_phase{phase}{_sm_tag}_tumor.npy"
+    cache_suffix_mirror = f"_phase{phase}{_sm_tag}_mirror.npy"
+
+    try:
+        from tqdm import tqdm
+        iterator = tqdm(
+            enumerate(patient_ids),
+            total=len(patient_ids),
+            desc="Tumor ROI dataset",
+            unit="patient",
+        )
+    except ImportError:
+        iterator = enumerate(patient_ids)
+
+    all_feats: list[NDArray[np.floating]] = []
+    all_labels: list[int] = []
+    all_pids: list[str] = []
+    all_indices: list[int] = []
+    n_valid = 0
+    n_skipped = 0
+
+    for i, pid in iterator:
+        # --- Try loading from cache first ---
+        if cache_dir is not None:
+            tumor_cache = cache_dir / f"{pid}{cache_suffix_tumor}"
+            mirror_cache = cache_dir / f"{pid}{cache_suffix_mirror}"
+            if tumor_cache.exists() and mirror_cache.exists():
+                try:
+                    t_feat = np.load(tumor_cache, allow_pickle=False)
+                    m_feat = np.load(mirror_cache, allow_pickle=False)
+
+                    # Handle 2D cached arrays (all_tumor mode)
+                    if t_feat.ndim == 2 and m_feat.ndim == 2:
+                        for row in t_feat:
+                            all_feats.append(row)
+                            all_labels.append(1)
+                            all_pids.append(pid)
+                            all_indices.append(i)
+                        for row in m_feat:
+                            all_feats.append(row)
+                            all_labels.append(0)
+                            all_pids.append(pid)
+                            all_indices.append(i)
+                    else:
+                        all_feats.append(t_feat)
+                        all_labels.append(1)
+                        all_pids.append(pid)
+                        all_indices.append(i)
+                        all_feats.append(m_feat)
+                        all_labels.append(0)
+                        all_pids.append(pid)
+                        all_indices.append(i)
+                    n_valid += 1
+                    continue
+                except Exception:
+                    pass  # Re-extract if cache is corrupted
+
+        # --- Load image and mask ---
+        image_path = _get_image_path(images_dir, pid, phase)
+        seg_path = _get_segmentation_path(segmentations_dir, pid)
+
+        try:
+            image_array = _load_nifti_as_array(image_path)
+        except Exception as e:
+            logger.warning(f"Failed to load image for {pid}: {e}, skipping.")
+            n_skipped += 1
+            continue
+
+        try:
+            mask_array = _load_mask_as_array(seg_path)
+        except Exception as e:
+            logger.warning(
+                f"No segmentation mask for {pid}: {e}, skipping."
+            )
+            n_skipped += 1
+            continue
+
+        if not np.any(mask_array):
+            logger.warning(f"Empty mask for {pid}, skipping.")
+            n_skipped += 1
+            continue
+
+        # --- Create mirrored mask ---
+        mirrored_mask = create_mirrored_mask(
+            image_array, mask_array,
+            search_fraction=search_fraction,
+            min_tissue_fraction=min_tissue_fraction,
+        )
+        if mirrored_mask is None:
+            logger.info(
+                f"Mirrored mask validation failed for {pid}, skipping."
+            )
+            n_skipped += 1
+            continue
+
+        # --- Extract features ---
+        try:
+            if _use_all_tumor and image_array.ndim == 3:
+                # All-tumour slices: extract per-slice features
+                tumor_slices_img, tumor_slices_msk, tumor_idxs = (
+                    extract_all_tumor_slices(
+                        image_array, mask=mask_array, normalize=True,
+                    )
+                )
+                # Extract mirror slices at the same z-indices
+                mirror_slices_img = []
+                mirror_slices_msk = []
+                for z_idx in tumor_idxs:
+                    img_slice = image_array[z_idx]
+                    # Normalise the same way as extract_all_tumor_slices
+                    mu = img_slice.mean()
+                    std = img_slice.std()
+                    if std > 0:
+                        img_slice = (img_slice - mu) / std
+                    mirror_slices_img.append(img_slice)
+                    mirror_slices_msk.append(mirrored_mask[z_idx])
+
+                t_feats: list[NDArray[np.floating]] = []
+                m_feats: list[NDArray[np.floating]] = []
+
+                for s_img, s_msk in zip(tumor_slices_img, tumor_slices_msk):
+                    sf = extract_radiomic_features(
+                        s_img, mask=s_msk,
+                        feature_classes=FRD_FEATURE_CLASSES,
+                        bin_width=FRD_DEFAULT_BIN_WIDTH,
+                    )
+                    if sf.size > 0 and not np.all(sf == 0):
+                        t_feats.append(sf)
+
+                for s_img, s_msk in zip(mirror_slices_img, mirror_slices_msk):
+                    if not np.any(s_msk):
+                        continue
+                    sf = extract_radiomic_features(
+                        s_img, mask=s_msk,
+                        feature_classes=FRD_FEATURE_CLASSES,
+                        bin_width=FRD_DEFAULT_BIN_WIDTH,
+                    )
+                    if sf.size > 0 and not np.all(sf == 0):
+                        m_feats.append(sf)
+
+                if not t_feats or not m_feats:
+                    logger.warning(
+                        f"Empty features for {pid} (tumor or mirror), "
+                        "skipping."
+                    )
+                    n_skipped += 1
+                    continue
+
+                for f in t_feats:
+                    all_feats.append(f)
+                    all_labels.append(1)
+                    all_pids.append(pid)
+                    all_indices.append(i)
+                for f in m_feats:
+                    all_feats.append(f)
+                    all_labels.append(0)
+                    all_pids.append(pid)
+                    all_indices.append(i)
+
+                # Cache
+                if cache_dir is not None:
+                    try:
+                        np.save(
+                            cache_dir / f"{pid}{cache_suffix_tumor}",
+                            np.stack(t_feats, axis=0),
+                        )
+                        np.save(
+                            cache_dir / f"{pid}{cache_suffix_mirror}",
+                            np.stack(m_feats, axis=0),
+                        )
+                    except Exception as e:
+                        logger.debug(f"Failed to cache for {pid}: {e}")
+
+            else:
+                # Full 3D or single-slice extraction
+                t_feat = extract_radiomic_features(
+                    image_array, mask=mask_array,
+                    feature_classes=FRD_FEATURE_CLASSES,
+                    bin_width=FRD_DEFAULT_BIN_WIDTH,
+                )
+                m_feat = extract_radiomic_features(
+                    image_array, mask=mirrored_mask,
+                    feature_classes=FRD_FEATURE_CLASSES,
+                    bin_width=FRD_DEFAULT_BIN_WIDTH,
+                )
+
+                if t_feat.size == 0 or np.all(t_feat == 0):
+                    logger.warning(f"Empty tumor features for {pid}.")
+                    n_skipped += 1
+                    continue
+                if m_feat.size == 0 or np.all(m_feat == 0):
+                    logger.warning(f"Empty mirror features for {pid}.")
+                    n_skipped += 1
+                    continue
+
+                all_feats.append(t_feat)
+                all_labels.append(1)
+                all_pids.append(pid)
+                all_indices.append(i)
+                all_feats.append(m_feat)
+                all_labels.append(0)
+                all_pids.append(pid)
+                all_indices.append(i)
+
+                # Cache
+                if cache_dir is not None:
+                    try:
+                        np.save(
+                            cache_dir / f"{pid}{cache_suffix_tumor}",
+                            t_feat,
+                        )
+                        np.save(
+                            cache_dir / f"{pid}{cache_suffix_mirror}",
+                            m_feat,
+                        )
+                    except Exception as e:
+                        logger.debug(f"Failed to cache for {pid}: {e}")
+
+            n_valid += 1
+
+        except Exception as e:
+            logger.warning(
+                f"Feature extraction failed for {pid}: {e}, skipping."
+            )
+            n_skipped += 1
+            continue
+
+    logger.info(
+        f"Tumor ROI dataset: {n_valid} patients valid, "
+        f"{n_skipped} skipped, {len(all_feats)} total samples "
+        f"(tumor={sum(1 for l in all_labels if l == 1)}, "
+        f"mirror={sum(1 for l in all_labels if l == 0)})"
+    )
+
+    if len(all_feats) == 0:
+        raise RuntimeError(
+            "No features could be extracted for tumor_roi task. "
+            "Check image/mask paths and data."
+        )
+
+    feature_matrix = np.vstack([f[np.newaxis, :] if f.ndim == 1 else f for f in all_feats])
+    labels = np.array(all_labels, dtype=np.int64)
+
+    # Clean NaN/Inf
+    feature_matrix = np.nan_to_num(
+        feature_matrix, nan=0.0, posinf=0.0, neginf=0.0
     )
 
     return feature_matrix, labels, all_pids, all_indices
@@ -1702,13 +2056,15 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--tasks",
         nargs="+",
-        choices=["tnbc", "luminal", "contrast"],
+        choices=["tnbc", "luminal", "contrast", "tumor_roi"],
         default=["tnbc", "luminal"],
         help=(
             "Classification tasks to train. 'tnbc' and 'luminal' are "
             "molecular subtype tasks based on clinical labels. 'contrast' "
             "trains a pre-contrast vs post-contrast phase classifier "
-            "(binary: phase 0 → 0, phase 1 → 1). Default: tnbc luminal"
+            "(binary: phase 0 → 0, phase 1 → 1). 'tumor_roi' trains a "
+            "tumor ROI vs contralateral mirrored ROI classifier using "
+            "radiomics features. Default: tnbc luminal"
         ),
     )
     parser.add_argument(
@@ -1929,6 +2285,19 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         type=int,
         default=10,
         help="CNN early stopping patience (epochs). Default: 10.",
+    )
+    parser.add_argument(
+        "--cnn-num-workers",
+        type=int,
+        default=None,
+        help=(
+            "Number of DataLoader worker processes for parallel data "
+            "loading during CNN training. Workers prefetch batches from "
+            "the on-disk slice cache while the GPU trains on the current "
+            "batch, eliminating the I/O bottleneck. Default: min(CPUs, 4) "
+            "on Linux, 0 on macOS. Set to 0 to disable multi-process "
+            "loading."
+        ),
     )
     parser.add_argument(
         "--cnn-mask-channel",
@@ -2199,8 +2568,17 @@ def main(argv: Optional[list[str]] = None) -> None:
             labels = labels[:n_cases_limit]
 
         # ---- CNN branch --------------------------------------------------
-        if args.classifier_type == "cnn":
-            from eval.train_cnn_classifier import train_cnn_pipeline
+        if args.classifier_type == "cnn" and task != "tumor_roi":
+            from eval.train_cnn_classifier import (
+                DEFAULT_CNN_NUM_WORKERS,
+                train_cnn_pipeline,
+            )
+
+            _cnn_nw = (
+                getattr(args, "cnn_num_workers", None)
+                if getattr(args, "cnn_num_workers", None) is not None
+                else DEFAULT_CNN_NUM_WORKERS
+            )
 
             # For contrast task, override dual_phase and phase so the CNN
             # pipeline extracts slices from both phases with appropriate
@@ -2239,6 +2617,7 @@ def main(argv: Optional[list[str]] = None) -> None:
                 device=getattr(args, "device", None),
                 cache_dir=getattr(args, "cache_dir", None),
                 contrast_mode=_cnn_contrast,
+                num_workers=_cnn_nw,
             )
 
             task_elapsed = time.time() - task_start
@@ -2269,6 +2648,12 @@ def main(argv: Optional[list[str]] = None) -> None:
         # ---- End CNN branch ----------------------------------------------
 
         # 2b. Extract features (radiomics path)
+        if args.classifier_type == "cnn" and task == "tumor_roi":
+            logger.warning(
+                "Task 'tumor_roi' does not support CNN training "
+                "(radiomics-only to avoid position confound). "
+                "Falling back to radiomics pipeline."
+            )
         logger.info("\n--- Step 3: Extracting radiomic features ---")
 
         if task == "contrast":
@@ -2279,6 +2664,21 @@ def main(argv: Optional[list[str]] = None) -> None:
                     data_dir=args.data_dir,
                     images_dir=args.images_dir,
                     segmentations_dir=args.segmentations_dir,
+                    cache_dir=args.cache_dir,
+                    n_workers=args.n_workers,
+                    slice_mode=args.slice_mode,
+                    n_slices=args.n_slices,
+                )
+            )
+        elif task == "tumor_roi":
+            # Tumor ROI task: extract tumor + mirrored ROI features.
+            feature_matrix, valid_labels, valid_pids, valid_indices = (
+                create_tumor_roi_dataset(
+                    patient_ids=patient_ids,
+                    data_dir=args.data_dir,
+                    images_dir=args.images_dir,
+                    segmentations_dir=args.segmentations_dir,
+                    phase=args.phase,
                     cache_dir=args.cache_dir,
                     n_workers=args.n_workers,
                     slice_mode=args.slice_mode,
@@ -2416,6 +2816,21 @@ def main(argv: Optional[list[str]] = None) -> None:
                             data_dir=args.data_dir,
                             images_dir=args.images_dir,
                             segmentations_dir=args.segmentations_dir,
+                            cache_dir=args.cache_dir,
+                            n_workers=args.n_workers,
+                            slice_mode=args.slice_mode,
+                            n_slices=args.n_slices,
+                        )
+                    )
+                elif task == "tumor_roi":
+                    # Tumor ROI: build test features from tumor + mirror.
+                    test_features, test_labels_valid, _, _ = (
+                        create_tumor_roi_dataset(
+                            patient_ids=test_patient_ids_global,
+                            data_dir=args.data_dir,
+                            images_dir=args.images_dir,
+                            segmentations_dir=args.segmentations_dir,
+                            phase=args.phase,
                             cache_dir=args.cache_dir,
                             n_workers=args.n_workers,
                             slice_mode=args.slice_mode,

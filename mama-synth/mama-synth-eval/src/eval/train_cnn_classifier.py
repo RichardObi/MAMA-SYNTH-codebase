@@ -69,6 +69,26 @@ DEFAULT_CNN_PATIENCE = 10
 DEFAULT_CNN_MODEL_NAME = "efficientnet_b0"
 CNN_MODEL_SUFFIX = "_classifier_cnn.pt"
 
+
+def _default_num_workers() -> int:
+    """Return a sensible default for DataLoader num_workers.
+
+    Uses up to 4 CPU cores (the sweet-spot for typical I/O-bound
+    lazy-loaded datasets).  Returns 0 on macOS (where
+    ``fork`` is unsafe and ``spawn`` has high overhead for
+    small datasets).
+    """
+    import os
+    import sys
+
+    if sys.platform == "darwin":
+        return 0
+    n_cpus = os.cpu_count() or 1
+    return min(n_cpus, 4)
+
+
+DEFAULT_CNN_NUM_WORKERS = _default_num_workers()
+
 # Re-use constants from the main training module
 DEFAULT_PHASE = 1
 DEFAULT_N_SLICES = 5
@@ -138,7 +158,10 @@ class _LazyNpyList:
             p = self._paths[idx]
             if p is None:
                 return None
-            return np.load(str(p), allow_pickle=False)
+            try:
+                return np.load(str(p), allow_pickle=False)
+            except:
+                return np.load(str(p), allow_pickle=True)
         if isinstance(idx, slice):
             return _LazyNpyList(self._paths[idx])
         raise TypeError(
@@ -807,18 +830,20 @@ def extract_slices_for_cnn(
 
         # Try new-style per-slice cache
         if pdir is not None and pdir.exists() and (pdir / "_done").exists():
-            j = 0
-            while True:
-                sf = pdir / f"slice_{j}.npy"
-                if not sf.exists():
-                    break
+            # Use sorted glob to discover all slice files in one
+            # directory listing instead of stat-checking one by one.
+            slice_files = sorted(
+                pdir.glob("slice_*.npy"),
+                key=lambda p: int(p.stem.split("_")[1]),
+            )
+            for sf in slice_files:
                 slice_paths.append(sf)
+                j = int(sf.stem.split("_")[1])
                 mf = pdir / f"mask_{j}.npy"
                 mask_paths.append(mf if mf.exists() else None)
                 all_labels.append(label)
                 all_pids.append(pid)
-                j += 1
-            if j > 0:
+            if slice_files:
                 n_patients_loaded += 1
             continue
 
@@ -907,6 +932,7 @@ def train_cnn(
     use_mask_channel: bool = False,
     dual_phase: bool = False,
     device: Optional[str] = None,
+    num_workers: int = DEFAULT_CNN_NUM_WORKERS,
 ) -> tuple[Any, dict[str, float]]:
     """Train a CNN classifier on 2D MRI slices.
 
@@ -949,6 +975,11 @@ def train_cnn(
         Target device (``"auto"``, ``"cpu"``, ``"cuda"``, ``"mps"``).
         When ``None`` or ``"auto"``, the best available device is
         auto-detected.
+    num_workers : int
+        Number of DataLoader worker processes for parallel data loading.
+        Workers prefetch batches from the lazy ``.npy`` cache while the
+        GPU trains on the current batch, eliminating the I/O bottleneck.
+        Default: up to 4 on Linux, 0 on macOS.
 
     Returns
     -------
@@ -991,14 +1022,26 @@ def train_cnn(
         masks=val_masks if use_mask_channel else None,
     )
 
+    _pin = device.type == "cuda"
+    _pw = num_workers > 0  # persistent_workers avoids respawn overhead
+    _pf: Optional[int] = 2 if num_workers > 0 else None
+
+    if num_workers > 0:
+        logger.info(
+            f"DataLoader: {num_workers} workers, persistent_workers=True, "
+            f"prefetch_factor=2  — data loading overlaps GPU execution."
+        )
+
     train_loader = DataLoader(
         train_ds, batch_size=batch_size, shuffle=True,
-        num_workers=0, pin_memory=(device.type == "cuda"),
+        num_workers=num_workers, pin_memory=_pin,
         drop_last=len(train_ds) > batch_size,
+        persistent_workers=_pw, prefetch_factor=_pf,
     )
     val_loader = DataLoader(
         val_ds, batch_size=batch_size, shuffle=False,
-        num_workers=0, pin_memory=(device.type == "cuda"),
+        num_workers=num_workers, pin_memory=_pin,
+        persistent_workers=_pw, prefetch_factor=_pf,
     )
 
     # --- Model ------------------------------------------------------------
@@ -1210,6 +1253,7 @@ def evaluate_cnn(
     batch_size: int = DEFAULT_CNN_BATCH_SIZE,
     masks: Optional[list[NDArray]] = None,
     device: Optional[str] = None,
+    num_workers: int = DEFAULT_CNN_NUM_WORKERS,
 ) -> dict[str, float]:
     """Evaluate a trained CNN on a set of slices.
 
@@ -1255,7 +1299,13 @@ def evaluate_cnn(
         slices, labels, image_size=image_size, augment=False,
         masks=masks,
     )
-    loader = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=0)
+    loader = DataLoader(
+        ds, batch_size=batch_size, shuffle=False,
+        num_workers=num_workers,
+        pin_memory=(device.type == "cuda"),
+        persistent_workers=num_workers > 0,
+        prefetch_factor=2 if num_workers > 0 else None,
+    )
 
     criterion = nn.BCEWithLogitsLoss()
     all_probs: list[float] = []
@@ -1366,6 +1416,7 @@ def train_cnn_pipeline(
     device: Optional[str] = None,
     cache_dir: Optional[Path] = None,
     contrast_mode: bool = False,
+    num_workers: int = DEFAULT_CNN_NUM_WORKERS,
 ) -> tuple[Any, str, dict[str, float]]:
     """Full CNN training pipeline for a single task.
 
@@ -1522,6 +1573,7 @@ def train_cnn_pipeline(
         use_mask_channel=use_mask_channel,
         dual_phase=dual_phase,
         device=device,
+        num_workers=num_workers,
     )
 
     mask_tag = ", mask_ch" if use_mask_channel else ""
@@ -1592,6 +1644,7 @@ def train_cnn_pipeline(
                     image_size=image_size,
                     masks=test_masks_ret,
                     device=device,
+                    num_workers=num_workers,
                 )
                 logger.info(
                     f"CNN TEST SET — {task}: "
