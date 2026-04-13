@@ -94,7 +94,7 @@ class TestZscoreNormalizeSlice:
         img = np.array([[100.0, 200.0], [300.0, 400.0]])
         normed = zscore_normalize_slice(img)
         # Should have roughly zero mean
-        assert abs(np.mean(normed)) < 1e-10
+        assert abs(np.mean(normed)) < 1e-6
 
     def test_with_mask(self):
         img = np.array([[100.0, 200.0], [300.0, 400.0]])
@@ -267,7 +267,7 @@ class TestExtract2dSlice:
             volume_3d, mask_3d, mode=SliceMode.MAX_TUMOR, normalize=False
         )
         # Raw values, not clipped
-        assert img.dtype == np.float64
+        assert img.dtype == np.float32
 
     def test_wrong_dimensions(self):
         vol_2d = np.random.randn(32, 32)

@@ -385,9 +385,8 @@ def extract_slices_for_cnn(
     radiomic feature vectors.
 
     When *cache_dir* is provided, extracted slices are saved per-patient
-    as ``.npz`` files and reused on subsequent runs, avoiding repeated
-    NIfTI loading and slice extraction.  Patients are processed in
-    batches of *batch_size_extract* to limit peak CPU/memory usage.
+    as individual ``.npy`` files and reused on subsequent runs, avoiding
+    repeated NIfTI loading and slice extraction.
 
     Parameters
     ----------
@@ -560,16 +559,26 @@ def extract_slices_for_cnn(
             )
 
     if cache_dir is not None:
-        cache_dir = Path(cache_dir)
+        cache_dir = Path(cache_dir).resolve()  # absolute for determinism
         cache_dir.mkdir(parents=True, exist_ok=True)
 
         # Pre-scan: count how many patients already have a complete cache
         # so the user can see upfront whether extraction will happen.
-        n_already_cached = sum(
-            1 for pid in patient_ids
-            if (d := _patient_cache_dir(pid)) is not None
-            and (d / "_done").exists()
-        )
+        n_already_cached = 0
+        n_incomplete = 0
+        for pid in patient_ids:
+            d = _patient_cache_dir(pid)
+            if d is not None and d.exists():
+                if (d / "_done").exists():
+                    n_already_cached += 1
+                else:
+                    n_incomplete += 1
+            elif cache_dir is not None:
+                # Also check legacy .npz
+                _npz_chk = cache_dir / f"{pid}_{_cache_tag}.npz"
+                if _npz_chk.exists():
+                    n_already_cached += 1
+
         n_need_extract = len(patient_ids) - n_already_cached
         if n_already_cached == len(patient_ids):
             logger.info(
@@ -580,14 +589,32 @@ def extract_slices_for_cnn(
         elif n_already_cached > 0:
             logger.info(
                 f"CNN slice cache: {cache_dir}  (tag='{_cache_tag}')  "
-                f"— {n_already_cached}/{len(patient_ids)} patients cached; "
+                f"— {n_already_cached}/{len(patient_ids)} patients cached"
+                f"{f', {n_incomplete} incomplete (will re-extract)' if n_incomplete else ''}; "
                 f"will extract {n_need_extract} missing patients from NIfTI."
             )
         else:
+            # Help the user diagnose a stale/wrong cache path.
+            n_dirs_on_disk = sum(
+                1 for e in cache_dir.iterdir()
+                if e.is_dir() and not e.name.startswith(".")
+            ) if cache_dir.exists() else 0
+            extra = ""
+            if n_dirs_on_disk > 0:
+                extra = (
+                    f" (found {n_dirs_on_disk} directories in cache_dir, "
+                    f"but none matched the current tag or patient list)"
+                )
+            elif n_incomplete > 0:
+                extra = (
+                    f" ({n_incomplete} patients have partial/incomplete "
+                    f"cache — they will be re-extracted)"
+                )
             logger.info(
                 f"CNN slice cache: {cache_dir}  (tag='{_cache_tag}')  "
-                f"— cache empty, extracting all {len(patient_ids)} patients "
-                f"from NIfTI and writing to cache."
+                f"— no cached patients found for current run{extra}, "
+                f"extracting all {len(patient_ids)} patients from NIfTI "
+                f"and writing to cache."
             )
     else:
         logger.info(
@@ -752,10 +779,26 @@ def extract_slices_for_cnn(
                 _save_slice_to_cache(pid, 0, stacked, m2d_single)
                 _mark_patient_done(pid)
 
+            # --- Free large arrays to prevent OOM --------------------
+            # Breast MRI volumes can be 500+ MB each; dual-phase doubles
+            # that.  Explicit deletion + periodic gc.collect() keeps
+            # resident memory manageable during long extraction runs.
+            del volume
+            if phase0_volume is not None:
+                del phase0_volume
+            if mask is not None:
+                del mask
+
         except Exception as e:
             logger.warning(f"Failed to extract slices for {pid}: {e}")
             n_failed += 1
             continue
+
+        # Trigger garbage collection every 25 patients to reclaim memory
+        # sooner.  This is cheap (~5 ms) relative to the NIfTI I/O.
+        if (i + 1) % 25 == 0:
+            import gc
+            gc.collect()
 
     if len(all_slices) == 0:
         raise RuntimeError(

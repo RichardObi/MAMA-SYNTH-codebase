@@ -137,9 +137,9 @@ def zscore_normalize_slice(
         clip_range: Min/max clipping bounds after z-scoring.
 
     Returns:
-        Normalised 2D array (float64).
+        Normalised 2D array (float32).
     """
-    image_slice = image_slice.astype(np.float64)
+    image_slice = image_slice.astype(np.float32)
 
     if mask_slice is not None and np.any(mask_slice):
         roi_values = image_slice[mask_slice]
@@ -311,7 +311,7 @@ def extract_2d_slice(
     # Extract the slice
     slicer = [slice(None)] * 3
     slicer[axis] = slice_idx
-    image_slice = volume[tuple(slicer)].astype(np.float64)
+    image_slice = volume[tuple(slicer)].astype(np.float32)
 
     mask_slice: Optional[NDArray[np.bool_]] = None
     if mask is not None:
@@ -386,7 +386,7 @@ def extract_multi_slices(
     for idx in indices:
         slicer = [slice(None)] * 3
         slicer[axis] = idx
-        img = volume[tuple(slicer)].astype(np.float64)
+        img = volume[tuple(slicer)].astype(np.float32)
         msk: Optional[NDArray[np.bool_]] = None
         if mask is not None:
             msk = mask[tuple(slicer)].astype(bool)
@@ -450,7 +450,7 @@ def extract_all_tumor_slices(
     for idx in indices:
         slicer = [slice(None)] * 3
         slicer[axis] = idx
-        img = volume[tuple(slicer)].astype(np.float64)
+        img = volume[tuple(slicer)].astype(np.float32)
         msk = mask[tuple(slicer)].astype(bool)
 
         if normalize:

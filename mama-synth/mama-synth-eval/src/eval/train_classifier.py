@@ -848,7 +848,7 @@ def _load_nifti_as_array(filepath: Path) -> NDArray[np.floating]:
         raise FileNotFoundError(f"NIfTI file not found: {filepath}")
 
     sitk_image = sitk.ReadImage(str(filepath), sitk.sitkFloat32)
-    return sitk.GetArrayFromImage(sitk_image).astype(np.float64)
+    return sitk.GetArrayFromImage(sitk_image)  # already float32
 
 
 def _load_mask_as_array(filepath: Path) -> NDArray[np.bool_]:
