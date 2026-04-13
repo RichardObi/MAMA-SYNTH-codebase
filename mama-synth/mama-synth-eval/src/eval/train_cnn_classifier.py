@@ -104,6 +104,67 @@ def _check_cnn_dependencies() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Lazy-loading list backed by .npy cache files
+# ---------------------------------------------------------------------------
+
+
+class _LazyNpyList:
+    """Drop-in ``list[NDArray]`` replacement that loads from ``.npy`` on demand.
+
+    This avoids holding the entire slice dataset in memory at once.
+    Each ``__getitem__`` call reads a single ``.npy`` file from disk
+    (which is very fast for small arrays) and returns it as a numpy
+    array.  Only the *current batch* of slices lives in memory at any
+    time — critical for large datasets with thousands of patients.
+
+    Supports ``len``, integer indexing, iteration, concatenation
+    (``+``), and index-based sub-selection (``subset``).
+    """
+
+    def __init__(self, paths: "list[Path | None]") -> None:
+        self._paths: list[Path | None] = list(paths)
+
+    # -- Sequence protocol --------------------------------------------------
+
+    def __len__(self) -> int:
+        return len(self._paths)
+
+    def __getitem__(self, idx):
+        if isinstance(idx, int):
+            if idx < 0:
+                idx += len(self._paths)
+            if idx < 0 or idx >= len(self._paths):
+                raise IndexError(idx)
+            p = self._paths[idx]
+            if p is None:
+                return None
+            return np.load(str(p), allow_pickle=False)
+        if isinstance(idx, slice):
+            return _LazyNpyList(self._paths[idx])
+        raise TypeError(
+            f"indices must be integers or slices, not {type(idx).__name__}"
+        )
+
+    def __iter__(self):
+        for p in self._paths:
+            if p is None:
+                yield None
+            else:
+                yield np.load(str(p), allow_pickle=False)
+
+    # -- Convenience --------------------------------------------------------
+
+    def __add__(self, other: "_LazyNpyList") -> "_LazyNpyList":
+        if isinstance(other, _LazyNpyList):
+            return _LazyNpyList(self._paths + other._paths)
+        return NotImplemented
+
+    def subset(self, indices: "list[int]") -> "_LazyNpyList":
+        """Return a new lazy list with only the given positional indices."""
+        return _LazyNpyList([self._paths[i] for i in indices])
+
+
+# ---------------------------------------------------------------------------
 # Dataset
 # ---------------------------------------------------------------------------
 
@@ -377,16 +438,23 @@ def extract_slices_for_cnn(
     return_masks: bool = False,
     dual_phase: bool = False,
     cache_dir: Optional[Path] = None,
-) -> tuple[list[NDArray], NDArray, list[str], Optional[list[NDArray]]]:
-    """Extract raw 2D slices for CNN training.
+) -> tuple["_LazyNpyList | list[NDArray]", NDArray, list[str], "Optional[_LazyNpyList | list[NDArray]]"]:
+    """Extract raw 2D slices for CNN training (lazy-loaded from cache).
 
     Similar to :func:`extract_features_for_patients` in
     ``train_classifier.py`` but returns raw pixel arrays instead of
     radiomic feature vectors.
 
-    When *cache_dir* is provided, extracted slices are saved per-patient
-    as individual ``.npy`` files and reused on subsequent runs, avoiding
-    repeated NIfTI loading and slice extraction.
+    **Architecture**: Slices are extracted to a per-patient on-disk cache
+    (individual ``.npy`` files).  The returned ``slices`` and ``masks``
+    objects are :class:`_LazyNpyList` instances that load each ``.npy``
+    on demand via ``__getitem__`` — only the current training batch
+    resides in memory at any time.  This makes extraction and training
+    feasible for large datasets (1 000+ patients, dual-phase) without
+    running out of memory.
+
+    If ``cache_dir`` is ``None``, a temporary directory is used (does
+    not persist across runs).
 
     Parameters
     ----------
@@ -415,19 +483,21 @@ def extract_slices_for_cnn(
         Directory for per-patient slice caches.  Each patient's slices
         are stored as individual ``.npy`` files inside a patient
         sub-directory.  A ``_done`` marker indicates the extraction
-        was fully completed.  If ``None``, caching is disabled.
+        was fully completed.  If ``None``, a temporary directory is
+        created (will NOT persist across runs).
 
     Returns
     -------
-    slices : list[NDArray]
-        Raw 2D numpy arrays (one per extracted slice).
+    slices : _LazyNpyList
+        Lazy-loaded 2D numpy arrays (one per extracted slice).
+        Supports ``len``, ``__getitem__``, iteration, and ``subset``.
     slice_labels : NDArray
         Corresponding binary labels (may be longer than *patient_ids*
         when ``all_tumor`` mode produces multiple slices per patient).
     slice_pids : list[str]
         Patient ID for each slice.
-    slice_masks : list[NDArray] | None
-        Corresponding 2D mask arrays (only when *return_masks* is
+    slice_masks : _LazyNpyList | None
+        Lazy-loaded 2D mask arrays (only when *return_masks* is
         ``True``; otherwise ``None``).
     """
     from eval.slice_extraction import (
@@ -464,65 +534,6 @@ def extract_slices_for_cnn(
         if cache_dir is None:
             return None
         return cache_dir / f"{pid}_{_cache_tag}"
-
-    def _load_from_cache(pid: str) -> Optional[dict]:
-        """Try to load cached slices for a patient.
-
-        Uses per-slice ``.npy`` files inside a patient directory so that
-        partial extractions (e.g. process killed mid-patient) still
-        survive on disk and are usable.  A ``_done`` marker file
-        indicates the patient was fully extracted.
-        """
-        pdir = _patient_cache_dir(pid)
-        if pdir is None or not pdir.exists():
-            # Fall back to legacy single-file `.npz` cache.
-            _npz = cache_dir / f"{pid}_{_cache_tag}.npz" if cache_dir else None
-            if _npz is not None and _npz.exists():
-                try:
-                    data = np.load(str(_npz), allow_pickle=True)
-                    return {
-                        "slices": list(data["slices"]),
-                        "masks": list(data["masks"]) if "masks" in data else None,
-                        "n_slices": int(data["n_slices"]),
-                    }
-                except Exception:
-                    pass
-            return None
-
-        # New per-slice cache: enumerate slice_{i}.npy files.
-        done_marker = pdir / "_done"
-        if not done_marker.exists():
-            # Patient extraction was interrupted — ignore partial cache
-            # so we re-extract cleanly.
-            return None
-
-        slices: list[NDArray] = []
-        masks: list[NDArray] = []
-        i = 0
-        while True:
-            sf = pdir / f"slice_{i}.npy"
-            if not sf.exists():
-                break
-            try:
-                slices.append(np.load(str(sf), allow_pickle=False))
-            except Exception:
-                break
-            mf = pdir / f"mask_{i}.npy"
-            if mf.exists():
-                try:
-                    masks.append(np.load(str(mf), allow_pickle=False))
-                except Exception:
-                    masks.append(np.zeros_like(slices[-1]))
-            i += 1
-
-        if len(slices) == 0:
-            return None
-
-        return {
-            "slices": slices,
-            "masks": masks if masks else None,
-            "n_slices": len(slices),
-        }
 
     def _save_slice_to_cache(
         pid: str,
@@ -561,85 +572,86 @@ def extract_slices_for_cnn(
     if cache_dir is not None:
         cache_dir = Path(cache_dir).resolve()  # absolute for determinism
         cache_dir.mkdir(parents=True, exist_ok=True)
-
-        # Pre-scan: count how many patients already have a complete cache
-        # so the user can see upfront whether extraction will happen.
-        n_already_cached = 0
-        n_incomplete = 0
-        for pid in patient_ids:
-            d = _patient_cache_dir(pid)
-            if d is not None and d.exists():
-                if (d / "_done").exists():
-                    n_already_cached += 1
-                else:
-                    n_incomplete += 1
-            elif cache_dir is not None:
-                # Also check legacy .npz
-                _npz_chk = cache_dir / f"{pid}_{_cache_tag}.npz"
-                if _npz_chk.exists():
-                    n_already_cached += 1
-
-        n_need_extract = len(patient_ids) - n_already_cached
-        if n_already_cached == len(patient_ids):
-            logger.info(
-                f"CNN slice cache: {cache_dir}  (tag='{_cache_tag}')  "
-                f"— ALL {len(patient_ids)} patients already cached, "
-                f"loading from disk (no NIfTI I/O)."
-            )
-        elif n_already_cached > 0:
-            logger.info(
-                f"CNN slice cache: {cache_dir}  (tag='{_cache_tag}')  "
-                f"— {n_already_cached}/{len(patient_ids)} patients cached"
-                f"{f', {n_incomplete} incomplete (will re-extract)' if n_incomplete else ''}; "
-                f"will extract {n_need_extract} missing patients from NIfTI."
-            )
-        else:
-            # Help the user diagnose a stale/wrong cache path.
-            n_dirs_on_disk = sum(
-                1 for e in cache_dir.iterdir()
-                if e.is_dir() and not e.name.startswith(".")
-            ) if cache_dir.exists() else 0
-            extra = ""
-            if n_dirs_on_disk > 0:
-                extra = (
-                    f" (found {n_dirs_on_disk} directories in cache_dir, "
-                    f"but none matched the current tag or patient list)"
-                )
-            elif n_incomplete > 0:
-                extra = (
-                    f" ({n_incomplete} patients have partial/incomplete "
-                    f"cache — they will be re-extracted)"
-                )
-            logger.info(
-                f"CNN slice cache: {cache_dir}  (tag='{_cache_tag}')  "
-                f"— no cached patients found for current run{extra}, "
-                f"extracting all {len(patient_ids)} patients from NIfTI "
-                f"and writing to cache."
-            )
     else:
+        # Caching is REQUIRED for the lazy-loading architecture.
+        # If the caller didn't supply one, use a temp dir under the
+        # system temp directory — still avoids keeping all slices in RAM.
+        import tempfile
+        cache_dir = Path(
+            tempfile.mkdtemp(prefix="mama_cnn_cache_")
+        ).resolve()
         logger.info(
-            "CNN slice cache: DISABLED (no --cache-dir supplied).  "
-            "Pass --cache-dir to avoid re-extracting slices on every run."
+            f"No cache_dir supplied — using temporary directory: "
+            f"{cache_dir}  (will NOT persist across runs)."
         )
 
-    # Progress bar
-    try:
-        from tqdm import tqdm
-        iterator = tqdm(
-            enumerate(patient_ids),
-            total=len(patient_ids),
-            desc="Extracting slices (CNN)",
-            unit="patient",
+    # ------------------------------------------------------------------
+    # Pre-scan: classify every patient as cached / incomplete / missing
+    # ------------------------------------------------------------------
+    cached_pids: list[str] = []
+    missing_pids: list[str] = []
+    n_incomplete = 0
+    pid_to_label: dict[str, float] = {}
+
+    for idx, pid in enumerate(patient_ids):
+        pid_to_label[pid] = float(labels[idx])
+        d = _patient_cache_dir(pid)
+        if d is not None and d.exists() and (d / "_done").exists():
+            cached_pids.append(pid)
+        else:
+            # Check legacy .npz
+            _npz_chk = cache_dir / f"{pid}_{_cache_tag}.npz"
+            if _npz_chk.exists():
+                cached_pids.append(pid)
+            else:
+                if d is not None and d.exists():
+                    n_incomplete += 1
+                missing_pids.append(pid)
+
+    n_already_cached = len(cached_pids)
+    n_need_extract = len(missing_pids)
+
+    if n_already_cached == len(patient_ids):
+        logger.info(
+            f"CNN slice cache: {cache_dir}  (tag='{_cache_tag}')  "
+            f"— ALL {len(patient_ids)} patients already cached, "
+            f"loading from disk (no NIfTI I/O)."
         )
-    except ImportError:
-        iterator = enumerate(patient_ids)
+    elif n_already_cached > 0:
+        logger.info(
+            f"CNN slice cache: {cache_dir}  (tag='{_cache_tag}')  "
+            f"— {n_already_cached}/{len(patient_ids)} patients cached"
+            f"{f', {n_incomplete} incomplete (will re-extract)' if n_incomplete else ''}; "
+            f"will extract {n_need_extract} missing patients from NIfTI."
+        )
+    else:
+        # Help the user diagnose a stale/wrong cache path.
+        n_dirs_on_disk = sum(
+            1 for e in cache_dir.iterdir()
+            if e.is_dir() and not e.name.startswith(".")
+        ) if cache_dir.exists() else 0
+        extra = ""
+        if n_dirs_on_disk > 0:
+            extra = (
+                f" (found {n_dirs_on_disk} directories in cache_dir, "
+                f"but none matched the current tag or patient list)"
+            )
+        elif n_incomplete > 0:
+            extra = (
+                f" ({n_incomplete} patients have partial/incomplete "
+                f"cache — they will be re-extracted)"
+            )
+        logger.info(
+            f"CNN slice cache: {cache_dir}  (tag='{_cache_tag}')  "
+            f"— no cached patients found for current run{extra}, "
+            f"extracting all {len(patient_ids)} patients from NIfTI "
+            f"and writing to cache."
+        )
 
-    all_slices: list[NDArray] = []
-    all_labels: list[float] = []
-    all_pids: list[str] = []
-    all_masks: list[NDArray] = []  # only populated when return_masks=True
-    n_failed = 0
-
+    # ------------------------------------------------------------------
+    # Phase 1: Extract ONLY the missing patients into the cache.
+    #           Nothing is kept in memory — only written to disk.
+    # ------------------------------------------------------------------
     def _maybe_stack_dual(
         s: NDArray, vol0: "Optional[NDArray]", si: int,
     ) -> NDArray:
@@ -654,169 +666,220 @@ def extract_slices_for_cnn(
             p0 = np.zeros_like(s, dtype=np.float32)
         return np.stack([s, p0], axis=0)  # (2, H, W)
 
-    n_cache_hits = 0
+    n_failed = 0
 
-    for i, pid in iterator:
+    if n_need_extract > 0:
+        import gc
+
         try:
-            label = float(labels[i])
+            from tqdm import tqdm
+            extract_iter = tqdm(
+                missing_pids,
+                total=n_need_extract,
+                desc="Extracting slices (CNN)",
+                unit="patient",
+            )
+        except ImportError:
+            extract_iter = missing_pids
 
-            # --- Try cache first ------------------------------------------
-            cached = _load_from_cache(pid)
-            if cached is not None:
-                logger.debug(
-                    f"Cache hit: {pid} → {len(cached['slices'])} slices "
-                    f"loaded from disk."
-                )
-                for j, s in enumerate(cached["slices"]):
-                    all_slices.append(s)
-                    all_labels.append(label)
-                    all_pids.append(pid)
-                    if return_masks and cached["masks"] is not None:
-                        all_masks.append(cached["masks"][j])
-                    elif return_masks:
-                        all_masks.append(np.zeros_like(s[-1] if s.ndim == 3 else s, dtype=np.float32))
-                n_cache_hits += 1
-                continue
+        for ei, pid in enumerate(extract_iter):
+            try:
+                img_path = _get_image_path(images_dir, pid, phase)
+                volume = _load_nifti_as_array(img_path)
 
-            # --- Extract from NIfTI (cache miss) --------------------------
-            logger.debug(f"Cache miss: {pid} — loading NIfTI and extracting slices.")
-            img_path = _get_image_path(images_dir, pid, phase)
-            volume = _load_nifti_as_array(img_path)
-
-            # Dual-phase: also load pre-contrast volume
-            phase0_volume: Optional[NDArray] = None
-            if dual_phase:
-                try:
-                    phase0_path = _get_image_path(images_dir, pid, 0)
-                    phase0_volume = _load_nifti_as_array(phase0_path)
-                except Exception as e:
-                    logger.warning(
-                        f"Dual-phase: failed to load phase-0 for "
-                        f"{pid}: {e}, skipping patient."
-                    )
-                    continue
-
-            # Load mask (optional for MIDDLE mode)
-            mask: Optional[NDArray] = None
-            if _slice_mode != SliceMode.MIDDLE:
-                seg_path = _get_segmentation_path(segmentations_dir, pid)
-                try:
-                    mask = _load_mask_as_array(seg_path)
-                except FileNotFoundError:
-                    if _slice_mode in (
-                        SliceMode.MAX_TUMOR,
-                        SliceMode.CENTER_TUMOR,
-                        SliceMode.ALL_TUMOR,
-                    ):
+                # Dual-phase: also load pre-contrast volume
+                phase0_volume: Optional[NDArray] = None
+                if dual_phase:
+                    try:
+                        phase0_path = _get_image_path(images_dir, pid, 0)
+                        phase0_volume = _load_nifti_as_array(phase0_path)
+                    except Exception as e:
                         logger.warning(
-                            f"Mask not found for {pid}, skipping (required "
-                            f"for {_slice_mode.value} mode)."
+                            f"Dual-phase: failed to load phase-0 for "
+                            f"{pid}: {e}, skipping patient."
                         )
                         n_failed += 1
                         continue
-                    # MULTI_SLICE can fall back to evenly spaced
-                    mask = None
 
-            if _slice_mode == SliceMode.ALL_TUMOR:
-                slices_2d, masks_2d, indices = extract_all_tumor_slices(
-                    volume, mask,
-                )
-                patient_slices: list[NDArray] = []
-                patient_masks: list[NDArray] = []
-                for j, s in enumerate(slices_2d):
-                    stacked = _maybe_stack_dual(s, phase0_volume, indices[j])
-                    patient_slices.append(stacked)
-                    all_slices.append(stacked)
-                    all_labels.append(label)
-                    all_pids.append(pid)
-                    m2d_val: Optional[NDArray] = None
+                # Load mask (optional for MIDDLE mode)
+                mask: Optional[NDArray] = None
+                if _slice_mode != SliceMode.MIDDLE:
+                    seg_path = _get_segmentation_path(segmentations_dir, pid)
+                    try:
+                        mask = _load_mask_as_array(seg_path)
+                    except FileNotFoundError:
+                        if _slice_mode in (
+                            SliceMode.MAX_TUMOR,
+                            SliceMode.CENTER_TUMOR,
+                            SliceMode.ALL_TUMOR,
+                        ):
+                            logger.warning(
+                                f"Mask not found for {pid}, skipping "
+                                f"(required for {_slice_mode.value} mode)."
+                            )
+                            n_failed += 1
+                            continue
+                        mask = None
+
+                if _slice_mode == SliceMode.ALL_TUMOR:
+                    slices_2d, masks_2d, indices = extract_all_tumor_slices(
+                        volume, mask,
+                    )
+                    for j, s in enumerate(slices_2d):
+                        stacked = _maybe_stack_dual(s, phase0_volume, indices[j])
+                        m2d_val: Optional[NDArray] = None
+                        if return_masks:
+                            m2d = (
+                                masks_2d[j]
+                                if masks_2d is not None and j < len(masks_2d)
+                                else np.zeros_like(s)
+                            )
+                            m2d_val = m2d.astype(np.float32)
+                        _save_slice_to_cache(pid, j, stacked, m2d_val)
+                    _mark_patient_done(pid)
+
+                elif _slice_mode == SliceMode.MULTI_SLICE:
+                    slices_2d, masks_2d, indices = extract_multi_slices(
+                        volume, mask, n_slices=n_slices,
+                    )
+                    for j, s in enumerate(slices_2d):
+                        stacked = _maybe_stack_dual(s, phase0_volume, indices[j])
+                        m2d_val = None
+                        if return_masks:
+                            m2d = (
+                                masks_2d[j]
+                                if masks_2d is not None and j < len(masks_2d)
+                                else np.zeros_like(s)
+                            )
+                            m2d_val = m2d.astype(np.float32)
+                        _save_slice_to_cache(pid, j, stacked, m2d_val)
+                    _mark_patient_done(pid)
+
+                else:
+                    # Single-slice modes
+                    slice_2d, mask_2d, idx = extract_2d_slice(
+                        volume, mask, mode=_slice_mode,
+                    )
+                    stacked = _maybe_stack_dual(slice_2d, phase0_volume, idx)
+                    m2d_single: Optional[NDArray] = None
                     if return_masks:
-                        m2d = masks_2d[j] if masks_2d is not None and j < len(masks_2d) else np.zeros_like(s)
-                        m2d = m2d.astype(np.float32)
-                        patient_masks.append(m2d)
-                        all_masks.append(m2d)
-                        m2d_val = m2d
-                    _save_slice_to_cache(pid, j, stacked, m2d_val)
-                _mark_patient_done(pid)
+                        m2d = (
+                            mask_2d
+                            if mask_2d is not None
+                            else np.zeros_like(slice_2d)
+                        )
+                        m2d_single = m2d.astype(np.float32)
+                    _save_slice_to_cache(pid, 0, stacked, m2d_single)
+                    _mark_patient_done(pid)
 
-            elif _slice_mode == SliceMode.MULTI_SLICE:
-                slices_2d, masks_2d, indices = extract_multi_slices(
-                    volume, mask, n_slices=n_slices,
-                )
-                patient_slices = []
-                patient_masks = []
-                for j, s in enumerate(slices_2d):
-                    stacked = _maybe_stack_dual(s, phase0_volume, indices[j])
-                    patient_slices.append(stacked)
-                    all_slices.append(stacked)
-                    all_labels.append(label)
-                    all_pids.append(pid)
-                    m2d_val = None
-                    if return_masks:
-                        m2d = masks_2d[j] if masks_2d is not None and j < len(masks_2d) else np.zeros_like(s)
-                        m2d = m2d.astype(np.float32)
-                        patient_masks.append(m2d)
-                        all_masks.append(m2d)
-                        m2d_val = m2d
-                    _save_slice_to_cache(pid, j, stacked, m2d_val)
-                _mark_patient_done(pid)
+                # --- Free large arrays immediately -----------------------
+                del volume
+                if phase0_volume is not None:
+                    del phase0_volume
+                if mask is not None:
+                    del mask
 
-            else:
-                # Single-slice modes
-                slice_2d, mask_2d, idx = extract_2d_slice(
-                    volume, mask, mode=_slice_mode,
-                )
-                stacked = _maybe_stack_dual(slice_2d, phase0_volume, idx)
-                all_slices.append(stacked)
+            except Exception as e:
+                logger.warning(f"Failed to extract slices for {pid}: {e}")
+                n_failed += 1
+                continue
+
+            # Periodic GC every 10 patients (cheap ~5 ms vs NIfTI I/O).
+            if (ei + 1) % 10 == 0:
+                gc.collect()
+
+        # Final GC after extraction phase
+        gc.collect()
+
+    # ------------------------------------------------------------------
+    # Phase 2: Build the lazy index from the cache directory.
+    #           Only paths are stored — zero pixel data in memory.
+    # ------------------------------------------------------------------
+    slice_paths: list[Path] = []
+    mask_paths: list[Optional[Path]] = []
+    all_labels: list[float] = []
+    all_pids: list[str] = []
+
+    n_patients_loaded = 0
+    for pid in patient_ids:
+        pdir = _patient_cache_dir(pid)
+        label = pid_to_label[pid]
+
+        # Try new-style per-slice cache
+        if pdir is not None and pdir.exists() and (pdir / "_done").exists():
+            j = 0
+            while True:
+                sf = pdir / f"slice_{j}.npy"
+                if not sf.exists():
+                    break
+                slice_paths.append(sf)
+                mf = pdir / f"mask_{j}.npy"
+                mask_paths.append(mf if mf.exists() else None)
                 all_labels.append(label)
                 all_pids.append(pid)
-                m2d_single: Optional[NDArray] = None
-                if return_masks:
-                    m2d = mask_2d if mask_2d is not None else np.zeros_like(slice_2d)
-                    m2d = m2d.astype(np.float32)
-                    all_masks.append(m2d)
-                    m2d_single = m2d
-                _save_slice_to_cache(pid, 0, stacked, m2d_single)
-                _mark_patient_done(pid)
-
-            # --- Free large arrays to prevent OOM --------------------
-            # Breast MRI volumes can be 500+ MB each; dual-phase doubles
-            # that.  Explicit deletion + periodic gc.collect() keeps
-            # resident memory manageable during long extraction runs.
-            del volume
-            if phase0_volume is not None:
-                del phase0_volume
-            if mask is not None:
-                del mask
-
-        except Exception as e:
-            logger.warning(f"Failed to extract slices for {pid}: {e}")
-            n_failed += 1
+                j += 1
+            if j > 0:
+                n_patients_loaded += 1
             continue
 
-        # Trigger garbage collection every 25 patients to reclaim memory
-        # sooner.  This is cheap (~5 ms) relative to the NIfTI I/O.
-        if (i + 1) % 25 == 0:
-            import gc
-            gc.collect()
+        # Try legacy .npz
+        _npz = cache_dir / f"{pid}_{_cache_tag}.npz"
+        if _npz.exists():
+            try:
+                data = np.load(str(_npz), allow_pickle=True)
+                n_sl = int(data["n_slices"])
+                # Convert legacy npz → per-slice npy for future lazy use
+                pdir_new = _patient_cache_dir(pid)
+                if pdir_new is not None:
+                    pdir_new.mkdir(parents=True, exist_ok=True)
+                    for j in range(n_sl):
+                        sf = pdir_new / f"slice_{j}.npy"
+                        np.save(str(sf), data["slices"][j])
+                        slice_paths.append(sf)
+                        mf_path: Optional[Path] = None
+                        if "masks" in data and data["masks"] is not None:
+                            mf = pdir_new / f"mask_{j}.npy"
+                            np.save(str(mf), data["masks"][j])
+                            mf_path = mf
+                        mask_paths.append(mf_path)
+                        all_labels.append(label)
+                        all_pids.append(pid)
+                    (pdir_new / "_done").touch()
+                    n_patients_loaded += 1
+            except Exception:
+                logger.warning(
+                    f"Failed to read legacy cache for {pid}, skipping."
+                )
+            continue
 
-    if len(all_slices) == 0:
+        # Patient was not extracted (failed or skipped)
+        logger.debug(f"No cache entry for {pid} after extraction phase.")
+
+    if len(slice_paths) == 0:
         raise RuntimeError(
             "No slices could be extracted for CNN training. "
             "Check image/mask paths and data integrity."
         )
 
+    lazy_slices = _LazyNpyList(slice_paths)
+    lazy_masks: Optional[_LazyNpyList] = None
+    if return_masks:
+        lazy_masks = _LazyNpyList(
+            [p if p is not None else None for p in mask_paths]
+        )
+
     logger.info(
-        f"CNN slice extraction: {len(all_slices)} slices from "
-        f"{len(patient_ids) - n_failed}/{len(patient_ids)} patients "
-        f"({n_failed} failed, {n_cache_hits} from cache)"
+        f"CNN slice extraction: {len(slice_paths)} slices from "
+        f"{n_patients_loaded}/{len(patient_ids)} patients "
+        f"({n_failed} failed, {n_already_cached} from cache). "
+        f"Slices are lazy-loaded from disk — minimal RAM usage."
     )
 
     return (
-        all_slices,
+        lazy_slices,
         np.array(all_labels, dtype=np.float32),
         all_pids,
-        all_masks if return_masks else None,
+        lazy_masks,
     )
 
 
@@ -1410,23 +1473,28 @@ def train_cnn_pipeline(
     train_pid_set = set(train_pid_arr.tolist())
     val_pid_set = set(val_pid_arr.tolist())
 
-    train_slices = [s for s, p in zip(all_slices, slice_pids) if p in train_pid_set]
+    # Build index-based subsets so _LazyNpyList can be sliced efficiently
+    # without materialising all slices in memory.
+    train_indices = [i for i, p in enumerate(slice_pids) if p in train_pid_set]
+    val_indices = [i for i, p in enumerate(slice_pids) if p in val_pid_set]
+
+    train_slices = all_slices.subset(train_indices) if isinstance(all_slices, _LazyNpyList) else [all_slices[i] for i in train_indices]
     train_labels_arr = np.array(
-        [l for l, p in zip(slice_labels, slice_pids) if p in train_pid_set],
+        [slice_labels[i] for i in train_indices],
         dtype=np.float32,
     )
-    val_slices = [s for s, p in zip(all_slices, slice_pids) if p in val_pid_set]
+    val_slices = all_slices.subset(val_indices) if isinstance(all_slices, _LazyNpyList) else [all_slices[i] for i in val_indices]
     val_labels_arr = np.array(
-        [l for l, p in zip(slice_labels, slice_pids) if p in val_pid_set],
+        [slice_labels[i] for i in val_indices],
         dtype=np.float32,
     )
 
     # Split masks if mask-channel mode
-    train_masks_list: Optional[list[NDArray]] = None
-    val_masks_list: Optional[list[NDArray]] = None
+    train_masks_list: Optional[_LazyNpyList] = None
+    val_masks_list: Optional[_LazyNpyList] = None
     if use_mask_channel and all_masks is not None:
-        train_masks_list = [m for m, p in zip(all_masks, slice_pids) if p in train_pid_set]
-        val_masks_list = [m for m, p in zip(all_masks, slice_pids) if p in val_pid_set]
+        train_masks_list = all_masks.subset(train_indices) if isinstance(all_masks, _LazyNpyList) else [all_masks[i] for i in train_indices]
+        val_masks_list = all_masks.subset(val_indices) if isinstance(all_masks, _LazyNpyList) else [all_masks[i] for i in val_indices]
 
     logger.info(
         f"Patient-aware split: {len(train_pid_set)} train patients "
