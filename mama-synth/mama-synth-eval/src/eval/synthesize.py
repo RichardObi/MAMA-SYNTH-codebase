@@ -605,7 +605,11 @@ def _discover_input_images(
 
     # Fall back to flat layout
     for f in sorted(input_dir.iterdir()):
-        if f.is_file() and phase_suffix in f.stem:
+        if (
+            f.is_file()
+            and phase_suffix in f.stem
+            and f.suffix in (".gz", ".nii", ".mha")
+        ):
             images.append(f)
 
     return images
@@ -628,6 +632,38 @@ def _extract_patient_id(path: Path) -> str:
     if len(parts) == 2 and parts[1].isdigit() and len(parts[1]) == 4:
         return parts[0]
     return stem
+
+
+def _strip_extensions(filename: str) -> str:
+    """Remove medical-image extensions from a filename."""
+    for ext in (".nii.gz", ".nii", ".mha", ".mhd", ".png"):
+        if filename.endswith(ext):
+            return filename[: -len(ext)]
+    return Path(filename).stem
+
+
+def _stem_matches_patient(filename: str, patient_id: str) -> bool:
+    """Test whether *filename* belongs to *patient_id*.
+
+    Strips medical-image extensions, then checks for:
+
+    1. Exact match (e.g. ``DUKE_055.nii.gz`` for patient ``DUKE_055``).
+    2. Match with a trailing ``_DDDD`` phase / channel suffix
+       (e.g. ``DUKE_055_0000.nii.gz``).
+
+    This avoids the ambiguity in :func:`_extract_patient_id`, which
+    cannot distinguish a 4-digit patient-ID suffix from a phase suffix
+    when the file has no phase tag.
+    """
+    stem = _strip_extensions(filename)
+    if stem == patient_id:
+        return True
+    # Check for {patient_id}_{4-digit-suffix} pattern
+    if stem.startswith(patient_id + "_"):
+        suffix = stem[len(patient_id) + 1 :]
+        if suffix.isdigit() and len(suffix) == 4:
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -722,7 +758,7 @@ def _load_mask_for_patient(
     for ext in (".nii.gz", ".nii", ".mha", ".mhd"):
         # Flat layout: masks_dir/{pid}*{ext}
         for candidate in sorted(masks_dir.glob(f"{patient_id}*{ext}")):
-            if _extract_patient_id(candidate) == patient_id:
+            if _stem_matches_patient(candidate.name, patient_id):
                 try:
                     arr = sitk.GetArrayFromImage(
                         sitk.ReadImage(str(candidate), sitk.sitkUInt8)
@@ -737,7 +773,7 @@ def _load_mask_for_patient(
         nested = masks_dir / patient_id
         if nested.is_dir():
             for candidate in sorted(nested.glob(f"{patient_id}*{ext}")):
-                if _extract_patient_id(candidate) == patient_id:
+                if _stem_matches_patient(candidate.name, patient_id):
                     try:
                         arr = sitk.GetArrayFromImage(
                             sitk.ReadImage(str(candidate), sitk.sitkUInt8)
@@ -1287,6 +1323,17 @@ def parse_synthesize_and_evaluate_args(
         ),
     )
     synth.add_argument(
+        "--masks-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Segmentation masks directory used for slice selection "
+            "during synthesis. Falls back to --masks-path (evaluation "
+            "masks) when not set. Auto-resolved from "
+            "<data-dir>/segmentations if --data-dir is given."
+        ),
+    )
+    synth.add_argument(
         "--skip-synthesis",
         action="store_true",
         help=(
@@ -1428,6 +1475,11 @@ def parse_synthesize_and_evaluate_args(
             if candidate.exists():
                 args.masks_path = candidate
 
+    # Resolve masks_dir for synthesis slice selection:
+    #   explicit --masks-dir  >  --masks-path  >  <data-dir>/segmentations
+    if args.masks_dir is None:
+        args.masks_dir = args.masks_path
+
     args._skip_synthesis = skip_synthesis
     return args
 
@@ -1461,7 +1513,7 @@ def synthesize_and_evaluate_main(
             synthesize_with_medigan(
                 input_dir=args.input_dir,
                 output_dir=args.output_dir,
-                masks_dir=args.masks_path,
+                masks_dir=args.masks_dir,
                 slice_mode=args.slice_mode,
                 model_id=args.model_id,
                 phase=args.phase,
@@ -1478,12 +1530,12 @@ def synthesize_and_evaluate_main(
         gt_eval_dir = args.output_dir / GT_SLICES_SUBDIR
         mask_eval_dir = (
             args.output_dir / MASK_SLICES_SUBDIR
-            if args.masks_path else None
+            if args.masks_dir else None
         )
         logger.info("\n--- Step 1b: Extracting GT slices ---")
         extract_ground_truth_slices(
             gt_dir=args.ground_truth_path,
-            masks_dir=args.masks_path,
+            masks_dir=args.masks_dir,
             output_dir=gt_eval_dir,
             slice_mode=args.slice_mode,
             phase=DEFAULT_PHASE_POST,

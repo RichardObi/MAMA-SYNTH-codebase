@@ -1127,6 +1127,107 @@ class TestLoadMaskForPatient:
         with tempfile.TemporaryDirectory() as tmp:
             assert _load_mask_for_patient("P999", Path(tmp)) is None
 
+    def test_mask_without_phase_suffix_4digit_pid(self):
+        """Regression: mask named {pid}.nii.gz where pid ends in 4 digits.
+
+        _extract_patient_id previously stripped the trailing 4-digit part
+        from the mask filename, causing a mismatch when the patient ID
+        itself ended in 4 digits (e.g. ISPY1_1001.nii.gz -> ISPY1).
+        """
+        from eval.synthesize import _load_mask_for_patient
+
+        import SimpleITK as sitk
+
+        with tempfile.TemporaryDirectory() as tmp:
+            masks_dir = Path(tmp)
+            # Flat mask WITHOUT phase suffix, pid ends in 4 digits
+            arr = np.ones((4, 8, 8), dtype=np.uint8)
+            img = sitk.GetImageFromArray(arr)
+            sitk.WriteImage(img, str(masks_dir / "ISPY1_1001.nii.gz"))
+
+            result = _load_mask_for_patient("ISPY1_1001", masks_dir)
+            assert result is not None, (
+                "Mask should be found for 4-digit patient ID without phase suffix"
+            )
+            assert result.dtype == bool
+
+    def test_nested_mask_without_phase_suffix_4digit_pid(self):
+        """Regression: nested mask named {pid}/{pid}.nii.gz, 4-digit pid."""
+        from eval.synthesize import _load_mask_for_patient
+
+        import SimpleITK as sitk
+
+        with tempfile.TemporaryDirectory() as tmp:
+            masks_dir = Path(tmp)
+            nested = masks_dir / "ISPY1_1001"
+            nested.mkdir()
+            arr = np.ones((4, 8, 8), dtype=np.uint8)
+            img = sitk.GetImageFromArray(arr)
+            sitk.WriteImage(img, str(nested / "ISPY1_1001.nii.gz"))
+
+            result = _load_mask_for_patient("ISPY1_1001", masks_dir)
+            assert result is not None, (
+                "Nested mask should be found for 4-digit patient ID"
+            )
+
+
+# ---------------------------------------------------------------------------
+# _stem_matches_patient
+# ---------------------------------------------------------------------------
+
+
+class TestStemMatchesPatient:
+    """Tests for the _stem_matches_patient helper."""
+
+    def test_exact_match_no_suffix(self):
+        from eval.synthesize import _stem_matches_patient
+
+        assert _stem_matches_patient("DUKE_055.nii.gz", "DUKE_055")
+
+    def test_match_with_phase_suffix(self):
+        from eval.synthesize import _stem_matches_patient
+
+        assert _stem_matches_patient("DUKE_055_0000.nii.gz", "DUKE_055")
+
+    def test_no_match_different_patient(self):
+        from eval.synthesize import _stem_matches_patient
+
+        assert not _stem_matches_patient("DUKE_056.nii.gz", "DUKE_055")
+
+    def test_no_false_positive_prefix(self):
+        """DUKE_05 must not match DUKE_055."""
+        from eval.synthesize import _stem_matches_patient
+
+        assert not _stem_matches_patient("DUKE_055.nii.gz", "DUKE_05")
+        assert not _stem_matches_patient("DUKE_055_0000.nii.gz", "DUKE_05")
+
+    def test_4digit_pid_exact(self):
+        """Patient ID ends in 4 digits — still a valid exact match."""
+        from eval.synthesize import _stem_matches_patient
+
+        assert _stem_matches_patient("ISPY1_1001.nii.gz", "ISPY1_1001")
+
+    def test_4digit_pid_with_phase(self):
+        from eval.synthesize import _stem_matches_patient
+
+        assert _stem_matches_patient("ISPY1_1001_0000.nii.gz", "ISPY1_1001")
+
+    def test_png_extension(self):
+        from eval.synthesize import _stem_matches_patient
+
+        assert _stem_matches_patient("DUKE_055.png", "DUKE_055")
+
+    def test_mha_extension(self):
+        from eval.synthesize import _stem_matches_patient
+
+        assert _stem_matches_patient("DUKE_055_0000.mha", "DUKE_055")
+
+    def test_no_match_non_phase_suffix(self):
+        """DUKE_055_seg.nii.gz should NOT match (suffix 'seg' is not 4 digits)."""
+        from eval.synthesize import _stem_matches_patient
+
+        assert not _stem_matches_patient("DUKE_055_seg.nii.gz", "DUKE_055")
+
 
 # ---------------------------------------------------------------------------
 # _extract_and_save_slices
@@ -1366,6 +1467,59 @@ class TestSliceModeCLI:
             "--slice-mode", "center_tumor",
         ])
         assert args.slice_mode == "center_tumor"
+
+    def test_synth_and_eval_masks_dir_explicit(self):
+        from eval.synthesize import parse_synthesize_and_evaluate_args
+
+        args = parse_synthesize_and_evaluate_args([
+            "--predictions-dir", "/preds",
+            "--ground-truth-path", "/gt",
+            "--output-file", "m.json",
+            "--masks-dir", "/my/masks",
+        ])
+        assert args.masks_dir == Path("/my/masks")
+
+    def test_synth_and_eval_masks_dir_falls_back_to_masks_path(self):
+        from eval.synthesize import parse_synthesize_and_evaluate_args
+
+        args = parse_synthesize_and_evaluate_args([
+            "--predictions-dir", "/preds",
+            "--ground-truth-path", "/gt",
+            "--output-file", "m.json",
+            "--masks-path", "/eval/masks",
+        ])
+        # No --masks-dir given → falls back to --masks-path
+        assert args.masks_dir == Path("/eval/masks")
+
+    def test_synth_and_eval_masks_dir_overrides_masks_path(self):
+        from eval.synthesize import parse_synthesize_and_evaluate_args
+
+        args = parse_synthesize_and_evaluate_args([
+            "--predictions-dir", "/preds",
+            "--ground-truth-path", "/gt",
+            "--output-file", "m.json",
+            "--masks-dir", "/synth/masks",
+            "--masks-path", "/eval/masks",
+        ])
+        # Explicit --masks-dir takes precedence
+        assert args.masks_dir == Path("/synth/masks")
+        # --masks-path is still available for evaluation
+        assert args.masks_path == Path("/eval/masks")
+
+    def test_synth_and_eval_masks_dir_auto_from_data_dir(self):
+        from eval.synthesize import parse_synthesize_and_evaluate_args
+
+        with tempfile.TemporaryDirectory() as tmp:
+            seg_dir = Path(tmp) / "segmentations"
+            seg_dir.mkdir()
+            args = parse_synthesize_and_evaluate_args([
+                "--data-dir", tmp,
+                "--output-dir", "/out",
+                "--output-file", "m.json",
+            ])
+            # Both masks_path and masks_dir auto-resolve
+            assert args.masks_path == seg_dir
+            assert args.masks_dir == seg_dir
 
 
 # ---------------------------------------------------------------------------

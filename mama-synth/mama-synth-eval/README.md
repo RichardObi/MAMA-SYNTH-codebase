@@ -55,6 +55,9 @@ Rankings use **Borda-style hierarchical rank aggregation** with tie-break priori
   - Removed unused `batch_size_extract` parameter from `extract_slices_for_cnn()`.
   - Fixed hardcoded "4-channel" in mask channel log message — now reflects actual channel count.
   - Fixed inaccurate docstrings for channel counts in `MRISliceDataset` and `train_cnn` (now document both single-phase and dual-phase cases).
+  - **Fixed mask loading failure for patients whose ID ends in 4 digits** (e.g. `ISPY1_1001`). `_load_mask_for_patient()` used `_extract_patient_id()` for matching, which incorrectly stripped the trailing 4-digit component of the patient ID when the mask file had no `_DDDD` phase suffix. Replaced with robust `_stem_matches_patient()` helper that checks for exact match or valid phase-suffix extension.
+  - **Fixed `num_samples=1` hardcoded in medigan call** — `all_tumor` slice mode now correctly passes the actual number of extracted slices to `medigan.Generators.generate()`, so all selected slices are synthesised.
+  - Fixed flat-layout image discovery (`_discover_input_images`) accepting non-NIfTI files (e.g. PNGs, logs) in the fallback path — now filters by extension.
 
 ## What's New in v0.8.0
 
