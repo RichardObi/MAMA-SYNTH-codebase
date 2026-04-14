@@ -521,7 +521,7 @@ def synthesize_with_medigan(
                 model_id=model_id,
                 input_path=str(work_input),
                 output_path=str(work_output),
-                num_samples=1,
+                num_samples=len(slice_infos),
                 save_images=True,
                 image_size=str(image_size),
                 gpu_id=device_str,

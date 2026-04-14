@@ -673,7 +673,82 @@ class TestSynthesizeWithMedigan:
             assert result[0].exists()
             assert result[0].suffix == ".png"
 
-    def test_no_input_images_raises(self):
+            # num_samples should equal the number of extracted slices
+            kw = (
+                mock_gen_instance.generate.call_args.kwargs
+                if mock_gen_instance.generate.call_args.kwargs
+                else mock_gen_instance.generate.call_args[1]
+            )
+            assert kw["num_samples"] == 1  # single slice (no mask → middle)
+
+    def test_num_samples_matches_slice_count(self):
+        """num_samples passed to medigan must equal the extracted slice count."""
+        pytest.importorskip("SimpleITK")
+        from eval.synthesize import synthesize_with_medigan
+
+        import SimpleITK as sitk
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(os.path.realpath(tmp))
+            input_dir = tmp / "input" / "P001"
+            input_dir.mkdir(parents=True)
+            output_dir = tmp / "output"
+            masks_dir = tmp / "masks"
+            masks_dir.mkdir()
+
+            _make_test_nifti(
+                input_dir / "P001_0000.nii.gz", shape=(10, 8, 8),
+            )
+
+            # Create a mask with tumour in 3 slices
+            mask = np.zeros((10, 8, 8), dtype=np.uint8)
+            mask[2, 3:5, 3:5] = 1
+            mask[5, 3:5, 3:5] = 1
+            mask[8, 3:5, 3:5] = 1
+            img = sitk.GetImageFromArray(mask)
+            sitk.WriteImage(img, str(masks_dir / "P001_0000.nii.gz"))
+
+            mock_gen_instance = MagicMock()
+
+            def fake_generate(**kwargs):
+                in_dir = Path(kwargs["input_path"])
+                out_dir = Path(kwargs["output_path"]) / "batch_0"
+                out_dir.mkdir(parents=True, exist_ok=True)
+                import shutil as _sh
+                for png in sorted(in_dir.glob("*.png")):
+                    _sh.copy(png, out_dir / png.name)
+
+            mock_gen_instance.generate.side_effect = fake_generate
+            mock_medigan = MagicMock()
+            mock_medigan.Generators.return_value = mock_gen_instance
+
+            original_cwd = os.getcwd()
+            original_path = list(sys.path)
+            try:
+                os.chdir(tmp)
+                with patch.dict("sys.modules", {"medigan": mock_medigan}):
+                    with patch("eval.synthesize._ensure_medigan_importable"):
+                        result = synthesize_with_medigan(
+                            input_dir=tmp / "input",
+                            output_dir=output_dir,
+                            gpu_id="-1",
+                            image_size=256,
+                            masks_dir=masks_dir,
+                            slice_mode="all_tumor",
+                        )
+            finally:
+                os.chdir(original_cwd)
+                sys.path = original_path
+
+            kw = (
+                mock_gen_instance.generate.call_args.kwargs
+                if mock_gen_instance.generate.call_args.kwargs
+                else mock_gen_instance.generate.call_args[1]
+            )
+            assert kw["num_samples"] == 3, (
+                f"Expected num_samples=3 (3 tumour slices), got {kw['num_samples']}"
+            )
+            assert len(result) == 3
         """Should raise FileNotFoundError when input dir is empty."""
         from eval.synthesize import synthesize_with_medigan
 
