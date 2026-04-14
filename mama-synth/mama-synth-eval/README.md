@@ -79,11 +79,11 @@ Rankings use **Borda-style hierarchical rank aggregation** with tie-break priori
 ## What's New in v0.6.0
 
 - **EfficientNet CNN classifier** — `--classifier-type cnn` trains an EfficientNet-B0 deep learning classifier as a higher-capacity alternative to the radiomics-based models (~0.6 AUROC). Includes ImageNet pre-training, cosine LR scheduling, class-weighted loss, early stopping, and gradient clipping.
-- **Synthesis pipeline** — two new CLI commands (`mamasynth-synthesize` and `mamasynth-synthesize-and-evaluate`) wrap medigan's Pix2PixHD model for one-command synthesis and evaluation. Participants can also point `--predictions-dir` at their own model outputs.
+- **Synthesis pipeline** — two new CLI commands (`mamasynth-synthesize` and `mamasynth-synthesize-and-evaluate`) wrap medigan's Pix2PixHD model for one-command synthesis and evaluation. The synthesis pipeline operates on **2D axial slices** — input NIfTI volumes are sliced according to a segmentation mask (`--slice-mode max_tumor | center_tumor | all_tumor`) and output is saved as **PNG images**. Participants can also point `--predictions-dir` at their own model outputs.
 - **New optional extras** — `[cnn]` (torch + timm), `[synthesis]` (medigan), `[full]` (everything)
 - **Improved radiomics classifiers** — all models now use `Pipeline(StandardScaler → VarianceThreshold → Classifier)` with class-balanced weights; added Logistic Regression (4 configs) and SVM-RBF (3 configs) alongside XGBoost and Random Forest (13 total configs)
 - **Radiomics feature caching improvements** — `all_tumor` mode now caches correctly; added `--clear-cache` CLI flag and `allow_pickle=False` security
-- **282 tests** — 36 new tests for CNN training, synthesis pipeline, and CLI integration
+- **282 tests** — 36 new tests for CNN training, synthesis pipeline, CLI integration, and 2D PNG slice extraction
 
 ## What's New in v0.5.0
 
@@ -766,28 +766,45 @@ pip install "eval[synthesis]"  # Installs medigan
 
 ### Synthesize Only
 
+Synthesis operates on **2D axial slices**: input NIfTI volumes are sliced according to the segmentation mask (controlled by `--slice-mode`), run through medigan, and the output is saved as **PNG images** (one `.png` per selected slice per patient).
+
 ```bash
-# Generate post-contrast images from MAMA-MIA pre-contrast data
+# Generate post-contrast images — default uses the max-tumor slice
 mamasynth-synthesize \
     --data-dir /path/to/mama-mia-dataset \
     --output-dir ./synthesized_images
 
-# Or specify input directory explicitly
+# Select the center-tumor slice instead
+mamasynth-synthesize \
+    --data-dir /path/to/mama-mia-dataset \
+    --output-dir ./synthesized_images \
+    --slice-mode center_tumor
+
+# Synthesize ALL tumor-containing slices
+mamasynth-synthesize \
+    --data-dir /path/to/mama-mia-dataset \
+    --output-dir ./synthesized_images \
+    --slice-mode all_tumor
+
+# Specify input/masks directories explicitly
 mamasynth-synthesize \
     --input-dir /path/to/pre-contrast-images \
-    --output-dir ./synthesized_images
+    --output-dir ./synthesized_images \
+    --masks-dir /path/to/segmentations \
+    --slice-mode max_tumor
 ```
 
 ### Synthesize and Evaluate (One Command)
 
 ```bash
-# Full pipeline: synthesize + evaluate
+# Full pipeline: synthesize + evaluate (outputs 2D PNG slices)
 mamasynth-synthesize-and-evaluate \
     --data-dir /path/to/mama-mia-dataset \
     --output-dir ./synthesized_images \
-    --output-file metrics.json
+    --output-file metrics.json \
+    --slice-mode max_tumor
 
-# Skip synthesis and evaluate existing predictions
+# Skip synthesis and evaluate existing predictions (PNG or NIfTI)
 mamasynth-synthesize-and-evaluate \
     --predictions-dir ./my_model_outputs \
     --ground-truth-path /path/to/ground-truth \
@@ -817,7 +834,9 @@ mamasynth-synthesize-and-evaluate \
 |---|---|---|
 | `--data-dir` | `None` | MAMA-MIA dataset root (auto-resolves images/GT paths) |
 | `--input-dir` | `None` | Directory with pre-contrast images (overrides `--data-dir`) |
-| `--output-dir` | `./synthesized_output` | Where to save generated images |
+| `--output-dir` | `./synthesized_output` | Where to save generated PNG images |
+| `--slice-mode` | `max_tumor` | Slice selection strategy: `max_tumor` (largest tumour area), `center_tumor` (tumour centroid), `all_tumor` (every tumour-containing slice) |
+| `--masks-dir` | `None` | Segmentation masks directory (auto-resolved from `--data-dir`/segmentations if not set) |
 | `--model` | `medigan` | Synthesis model name |
 | `--model-id` | `00023_PIX2PIXHD_BREAST_DCEMRI` | medigan model ID |
 | `--phase` | `0` | DCE-MRI phase of input images (0=pre-contrast) |

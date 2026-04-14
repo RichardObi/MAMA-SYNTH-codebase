@@ -687,12 +687,17 @@ class MamaSynthEval:
                         cnn_images.append(img)
                         mask_arr: Optional[NDArray] = None
                         if self.masks_path and self.masks_path.exists():
-                            for ext in (".nii.gz", ".nii", ".mha"):
+                            for ext in (".nii.gz", ".nii", ".mha", ".png"):
                                 mp = self.masks_path / f"{stem}{ext}"
                                 if mp.exists():
-                                    mask_arr = sitk.GetArrayFromImage(
-                                        sitk.ReadImage(str(mp), sitk.sitkUInt8)
-                                    ).astype(bool)
+                                    if ext == ".png":
+                                        mask_arr = (
+                                            self._load_image(mp) > 0
+                                        )
+                                    else:
+                                        mask_arr = sitk.GetArrayFromImage(
+                                            sitk.ReadImage(str(mp), sitk.sitkUInt8)
+                                        ).astype(bool)
                                     break
                         cnn_masks.append(mask_arr)
 
@@ -747,12 +752,17 @@ class MamaSynthEval:
                         # Try to load mask for better slice selection
                         mask_arr_single: Optional[NDArray] = None
                         if self.masks_path and self.masks_path.exists():
-                            for ext in (".nii.gz", ".nii", ".mha"):
+                            for ext in (".nii.gz", ".nii", ".mha", ".png"):
                                 mp = self.masks_path / f"{stem}{ext}"
                                 if mp.exists():
-                                    mask_arr_single = sitk.GetArrayFromImage(
-                                        sitk.ReadImage(str(mp), sitk.sitkUInt8)
-                                    ).astype(bool)
+                                    if ext == ".png":
+                                        mask_arr_single = (
+                                            self._load_image(mp) > 0
+                                        )
+                                    else:
+                                        mask_arr_single = sitk.GetArrayFromImage(
+                                            sitk.ReadImage(str(mp), sitk.sitkUInt8)
+                                        ).astype(bool)
                                     break
                         cnn_msks.append(mask_arr_single)
                         cnn_y.append(
@@ -888,13 +898,20 @@ class MamaSynthEval:
             # Load mask
             mask_arr: Optional[NDArray[np.bool_]] = None
             if self.masks_path:
-                for ext in (".nii.gz", ".nii", ".mha"):
+                for ext in (".nii.gz", ".nii", ".mha", ".png"):
                     mask_file = self.masks_path / f"{stem}{ext}"
                     if mask_file.exists():
                         try:
-                            mask_arr = sitk.GetArrayFromImage(
-                                sitk.ReadImage(str(mask_file), sitk.sitkUInt8)
-                            ).astype(bool)
+                            if ext == ".png":
+                                mask_arr = (
+                                    self._load_image(mask_file) > 0
+                                )
+                            else:
+                                mask_arr = sitk.GetArrayFromImage(
+                                    sitk.ReadImage(
+                                        str(mask_file), sitk.sitkUInt8
+                                    )
+                                ).astype(bool)
                         except Exception as e:
                             logger.warning(
                                 f"Failed to load mask for {stem}: {e}"

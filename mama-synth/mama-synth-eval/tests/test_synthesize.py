@@ -668,9 +668,10 @@ class TestSynthesizeWithMedigan:
             assert kw["image_size"] == "256"
             assert kw["gpu_id"] == "cpu"
 
-            # Output NIfTI should have been written
+            # Output PNG should have been written (no longer NIfTI)
             assert len(result) == 1
             assert result[0].exists()
+            assert result[0].suffix == ".png"
 
     def test_no_input_images_raises(self):
         """Should raise FileNotFoundError when input dir is empty."""
@@ -896,9 +897,10 @@ class TestStagingDirectoryBehaviour:
 
             # Work dir should be removed (or at least empty)
             assert not work_root.exists() or not list(work_root.iterdir())
-            # But output NIfTI should exist
+            # But output PNG should exist
             assert len(result) == 1
             assert result[0].exists()
+            assert result[0].suffix == ".png"
 
     def test_keep_work_dir_preserves_staging(self):
         """With keep_work_dir=True, staging dirs should persist."""
@@ -929,6 +931,448 @@ class TestStagingDirectoryBehaviour:
             patient_dirs = list(work_root.iterdir())
             assert len(patient_dirs) == 1
             assert patient_dirs[0].name == "P001"
+
+
+# ---------------------------------------------------------------------------
+# _select_slices
+# ---------------------------------------------------------------------------
+
+
+class TestSelectSlices:
+    """Tests for _select_slices helper."""
+
+    def test_max_tumor_returns_single_index(self):
+        from eval.synthesize import _select_slices
+
+        volume = np.zeros((10, 8, 8), dtype=np.float32)
+        mask = np.zeros((10, 8, 8), dtype=bool)
+        mask[7, 2:6, 2:6] = True  # large area at slice 7
+
+        result = _select_slices(volume, mask, "max_tumor")
+        assert result == [7]
+
+    def test_center_tumor_returns_centroid_slice(self):
+        from eval.synthesize import _select_slices
+
+        volume = np.zeros((10, 8, 8), dtype=np.float32)
+        mask = np.zeros((10, 8, 8), dtype=bool)
+        mask[3:7, 3:5, 3:5] = True  # span slices 3–6, centroid at ~4.5
+
+        result = _select_slices(volume, mask, "center_tumor")
+        assert len(result) == 1
+        assert 3 <= result[0] <= 6  # within tumour extent
+
+    def test_all_tumor_returns_all_foreground_slices(self):
+        from eval.synthesize import _select_slices
+
+        volume = np.zeros((10, 8, 8), dtype=np.float32)
+        mask = np.zeros((10, 8, 8), dtype=bool)
+        mask[2, 4, 4] = True
+        mask[5, 3, 3] = True
+        mask[8, 2, 2] = True
+
+        result = _select_slices(volume, mask, "all_tumor")
+        assert result == [2, 5, 8]
+
+    def test_max_tumor_no_mask_falls_back_to_middle(self):
+        from eval.synthesize import _select_slices
+
+        volume = np.zeros((10, 8, 8), dtype=np.float32)
+        result = _select_slices(volume, None, "max_tumor")
+        assert result == [5]
+
+    def test_all_tumor_no_mask_raises(self):
+        from eval.synthesize import _select_slices
+
+        volume = np.zeros((10, 8, 8), dtype=np.float32)
+        with pytest.raises(ValueError, match="requires a segmentation mask"):
+            _select_slices(volume, None, "all_tumor")
+
+    def test_unknown_mode_raises(self):
+        from eval.synthesize import _select_slices
+
+        volume = np.zeros((10, 8, 8), dtype=np.float32)
+        with pytest.raises(ValueError, match="Unknown slice_mode"):
+            _select_slices(volume, None, "invalid_mode")
+
+
+# ---------------------------------------------------------------------------
+# _load_mask_for_patient
+# ---------------------------------------------------------------------------
+
+
+class TestLoadMaskForPatient:
+    """Tests for _load_mask_for_patient helper."""
+
+    @pytest.fixture(autouse=True)
+    def _check_sitk(self):
+        pytest.importorskip("SimpleITK")
+
+    def test_flat_layout(self):
+        from eval.synthesize import _load_mask_for_patient
+
+        import SimpleITK as sitk
+
+        with tempfile.TemporaryDirectory() as tmp:
+            masks_dir = Path(tmp)
+            # Create mask file {pid}_0000.nii.gz
+            arr = np.ones((4, 8, 8), dtype=np.uint8)
+            img = sitk.GetImageFromArray(arr)
+            sitk.WriteImage(img, str(masks_dir / "P001_0000.nii.gz"))
+
+            result = _load_mask_for_patient("P001", masks_dir)
+            assert result is not None
+            assert result.dtype == bool
+            assert result.shape == (4, 8, 8)
+
+    def test_nested_layout(self):
+        from eval.synthesize import _load_mask_for_patient
+
+        import SimpleITK as sitk
+
+        with tempfile.TemporaryDirectory() as tmp:
+            masks_dir = Path(tmp)
+            nested = masks_dir / "P001"
+            nested.mkdir()
+            arr = np.ones((4, 8, 8), dtype=np.uint8)
+            img = sitk.GetImageFromArray(arr)
+            sitk.WriteImage(img, str(nested / "P001_0000.nii.gz"))
+
+            result = _load_mask_for_patient("P001", masks_dir)
+            assert result is not None
+
+    def test_no_masks_dir_returns_none(self):
+        from eval.synthesize import _load_mask_for_patient
+
+        assert _load_mask_for_patient("P001", None) is None
+
+    def test_no_matching_file_returns_none(self):
+        from eval.synthesize import _load_mask_for_patient
+
+        with tempfile.TemporaryDirectory() as tmp:
+            assert _load_mask_for_patient("P999", Path(tmp)) is None
+
+
+# ---------------------------------------------------------------------------
+# _extract_and_save_slices
+# ---------------------------------------------------------------------------
+
+
+class TestExtractAndSaveSlices:
+    """Tests for _extract_and_save_slices helper."""
+
+    @pytest.fixture(autouse=True)
+    def _check_deps(self):
+        pytest.importorskip("SimpleITK")
+        pytest.importorskip("PIL")
+
+    def test_single_slice_patient_naming(self):
+        from eval.synthesize import _extract_and_save_slices
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            nifti = tmp / "test.nii.gz"
+            out = tmp / "slices"
+            _make_test_nifti(nifti, shape=(4, 8, 8))
+
+            result = _extract_and_save_slices(
+                nifti, out, "P001", slice_mode="max_tumor",
+            )
+            assert len(result) == 1
+            assert result[0][0].name == "P001.png"
+            assert result[0][0].exists()
+
+    def test_sequential_naming(self):
+        from eval.synthesize import _extract_and_save_slices
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            nifti = tmp / "test.nii.gz"
+            out = tmp / "slices"
+            _make_test_nifti(nifti, shape=(4, 8, 8))
+
+            result = _extract_and_save_slices(
+                nifti, out, "P001", slice_mode="max_tumor",
+                sequential_naming=True,
+            )
+            assert len(result) == 1
+            assert result[0][0].name == "slice_0000.png"
+
+    def test_all_tumor_multi_slice_naming(self):
+        from eval.synthesize import _extract_and_save_slices
+
+        import SimpleITK as sitk
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            nifti = tmp / "test.nii.gz"
+            out = tmp / "slices"
+            _make_test_nifti(nifti, shape=(10, 8, 8))
+
+            # Create mask with tumour in slices 2 and 7
+            mask = np.zeros((10, 8, 8), dtype=bool)
+            mask[2, 3:5, 3:5] = True
+            mask[7, 2:6, 2:6] = True
+
+            result = _extract_and_save_slices(
+                nifti, out, "P001", mask_arr=mask,
+                slice_mode="all_tumor",
+            )
+            assert len(result) == 2
+            names = [r[0].name for r in result]
+            assert "P001_s0002.png" in names
+            assert "P001_s0007.png" in names
+
+    def test_output_is_grayscale_png(self):
+        from eval.synthesize import _extract_and_save_slices
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            nifti = tmp / "test.nii.gz"
+            out = tmp / "slices"
+            _make_test_nifti(nifti, shape=(4, 16, 16))
+
+            result = _extract_and_save_slices(
+                nifti, out, "P001", slice_mode="max_tumor",
+            )
+            img = Image.open(result[0][0])
+            assert img.mode == "L"
+            assert img.size == (16, 16)
+
+
+# ---------------------------------------------------------------------------
+# extract_ground_truth_slices
+# ---------------------------------------------------------------------------
+
+
+class TestExtractGroundTruthSlices:
+    """Tests for extract_ground_truth_slices."""
+
+    @pytest.fixture(autouse=True)
+    def _check_deps(self):
+        pytest.importorskip("SimpleITK")
+        pytest.importorskip("PIL")
+
+    def test_extracts_gt_slices_as_png(self):
+        from eval.synthesize import extract_ground_truth_slices
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            # Create GT dir with post-contrast NIfTI
+            gt_dir = tmp / "gt" / "P001"
+            gt_dir.mkdir(parents=True)
+            _make_test_nifti(gt_dir / "P001_0001.nii.gz", shape=(4, 8, 8))
+
+            out = tmp / "gt_slices"
+            result = extract_ground_truth_slices(
+                gt_dir=tmp / "gt",
+                masks_dir=None,
+                output_dir=out,
+                slice_mode="max_tumor",
+                phase=1,
+            )
+            assert len(result) == 1
+            assert result[0].suffix == ".png"
+            assert result[0].exists()
+
+    def test_extracts_mask_slices_when_requested(self):
+        from eval.synthesize import extract_ground_truth_slices
+
+        import SimpleITK as sitk
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            # Create GT
+            gt_dir = tmp / "gt" / "P001"
+            gt_dir.mkdir(parents=True)
+            _make_test_nifti(gt_dir / "P001_0001.nii.gz", shape=(4, 8, 8))
+            # Create mask
+            masks_dir = tmp / "masks"
+            masks_dir.mkdir()
+            mask_arr = np.zeros((4, 8, 8), dtype=np.uint8)
+            mask_arr[2, 3:5, 3:5] = 1
+            img = sitk.GetImageFromArray(mask_arr)
+            sitk.WriteImage(img, str(masks_dir / "P001_0000.nii.gz"))
+
+            out = tmp / "gt_slices"
+            mask_out = tmp / "mask_slices"
+
+            result = extract_ground_truth_slices(
+                gt_dir=tmp / "gt",
+                masks_dir=masks_dir,
+                output_dir=out,
+                slice_mode="max_tumor",
+                phase=1,
+                masks_output_dir=mask_out,
+            )
+            assert len(result) == 1
+            # Mask slice should also exist
+            mask_files = list(mask_out.glob("*.png"))
+            assert len(mask_files) == 1
+
+
+# ---------------------------------------------------------------------------
+# CLI argument parsing — slice mode and masks
+# ---------------------------------------------------------------------------
+
+
+class TestSliceModeCLI:
+    """Tests for --slice-mode and --masks-dir CLI options."""
+
+    def test_synthesize_slice_mode_default(self):
+        from eval.synthesize import parse_synthesize_args
+
+        args = parse_synthesize_args([
+            "--data-dir", "/data",
+            "--output-dir", "/out",
+        ])
+        assert args.slice_mode == "max_tumor"
+
+    def test_synthesize_slice_mode_custom(self):
+        from eval.synthesize import parse_synthesize_args
+
+        args = parse_synthesize_args([
+            "--data-dir", "/data",
+            "--output-dir", "/out",
+            "--slice-mode", "all_tumor",
+        ])
+        assert args.slice_mode == "all_tumor"
+
+    def test_synthesize_slice_mode_center(self):
+        from eval.synthesize import parse_synthesize_args
+
+        args = parse_synthesize_args([
+            "--data-dir", "/data",
+            "--output-dir", "/out",
+            "--slice-mode", "center_tumor",
+        ])
+        assert args.slice_mode == "center_tumor"
+
+    def test_synthesize_invalid_mode_fails(self):
+        from eval.synthesize import parse_synthesize_args
+
+        with pytest.raises(SystemExit):
+            parse_synthesize_args([
+                "--data-dir", "/data",
+                "--output-dir", "/out",
+                "--slice-mode", "invalid",
+            ])
+
+    def test_synthesize_masks_dir_explicit(self):
+        from eval.synthesize import parse_synthesize_args
+
+        args = parse_synthesize_args([
+            "--data-dir", "/data",
+            "--output-dir", "/out",
+            "--masks-dir", "/masks",
+        ])
+        assert args.masks_dir == Path("/masks")
+
+    def test_synthesize_masks_dir_auto_from_data_dir(self):
+        from eval.synthesize import parse_synthesize_args
+
+        with tempfile.TemporaryDirectory() as tmp:
+            seg_dir = Path(tmp) / "segmentations"
+            seg_dir.mkdir()
+            args = parse_synthesize_args([
+                "--data-dir", tmp,
+                "--output-dir", "/out",
+            ])
+            assert args.masks_dir == seg_dir
+
+    def test_synth_and_eval_slice_mode(self):
+        from eval.synthesize import parse_synthesize_and_evaluate_args
+
+        args = parse_synthesize_and_evaluate_args([
+            "--predictions-dir", "/preds",
+            "--ground-truth-path", "/gt",
+            "--output-file", "m.json",
+            "--slice-mode", "center_tumor",
+        ])
+        assert args.slice_mode == "center_tumor"
+
+
+# ---------------------------------------------------------------------------
+# SLICE_MODE_CHOICES constant
+# ---------------------------------------------------------------------------
+
+
+class TestSliceModeChoices:
+    """Tests for SLICE_MODE_CHOICES constant."""
+
+    def test_includes_expected_modes(self):
+        from eval.synthesize import SLICE_MODE_CHOICES
+
+        assert "max_tumor" in SLICE_MODE_CHOICES
+        assert "center_tumor" in SLICE_MODE_CHOICES
+        assert "all_tumor" in SLICE_MODE_CHOICES
+        assert len(SLICE_MODE_CHOICES) == 3
+
+
+# ---------------------------------------------------------------------------
+# PNG output format verification
+# ---------------------------------------------------------------------------
+
+
+class TestPngOutputFormat:
+    """Tests that synthesis produces PNG output (not NIfTI)."""
+
+    @pytest.fixture(autouse=True)
+    def _check_deps(self):
+        pytest.importorskip("SimpleITK")
+        pytest.importorskip("PIL")
+
+    def test_output_is_png_not_nifti(self):
+        """synthesize_with_medigan should produce .png files, not .nii.gz."""
+        from eval.synthesize import synthesize_with_medigan
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(os.path.realpath(tmp))
+            input_dir = tmp / "input" / "P001"
+            input_dir.mkdir(parents=True)
+            output_dir = tmp / "output"
+
+            _make_test_nifti(
+                input_dir / "P001_0000.nii.gz", shape=(3, 8, 8)
+            )
+
+            mock_gen_instance = MagicMock()
+
+            def fake_generate(**kwargs):
+                in_dir = Path(kwargs["input_path"])
+                out_dir = Path(kwargs["output_path"]) / "batch_0"
+                out_dir.mkdir(parents=True, exist_ok=True)
+                import shutil as _sh
+                for png in sorted(in_dir.glob("*.png")):
+                    _sh.copy(png, out_dir / png.name)
+
+            mock_gen_instance.generate.side_effect = fake_generate
+            mock_medigan = MagicMock()
+            mock_medigan.Generators.return_value = mock_gen_instance
+
+            original_cwd = os.getcwd()
+            original_path = list(sys.path)
+            try:
+                os.chdir(tmp)
+                with patch.dict("sys.modules", {"medigan": mock_medigan}):
+                    with patch("eval.synthesize._ensure_medigan_importable"):
+                        result = synthesize_with_medigan(
+                            input_dir=tmp / "input",
+                            output_dir=output_dir,
+                            gpu_id="-1",
+                            image_size=256,
+                        )
+            finally:
+                os.chdir(original_cwd)
+                sys.path = original_path
+
+            # All output files should be PNGs
+            for path in result:
+                assert path.suffix == ".png", f"Expected .png, got {path.suffix}"
+            # No NIfTI files in the output directory
+            nifti_files = list(output_dir.glob("*.nii.gz"))
+            assert len(nifti_files) == 0, f"Unexpected NIfTI files: {nifti_files}"
 
 
 # ---------------------------------------------------------------------------

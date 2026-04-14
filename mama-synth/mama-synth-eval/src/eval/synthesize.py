@@ -81,9 +81,14 @@ DEFAULT_PHASE_PRE = 0   # pre-contrast
 DEFAULT_PHASE_POST = 1  # first post-contrast
 
 # Staging sub-directory placed *inside* output_dir so that intermediate
-# PNG slices live on the same filesystem as the final NIfTI outputs and
+# PNG slices live on the same filesystem as the final outputs and
 # survive failures for debugging.
 WORK_SUBDIR = ".synthesis_work"
+
+# Sub-directories for extracted ground-truth / mask slices used during
+# the combined synthesize-and-evaluate pipeline.
+GT_SLICES_SUBDIR = ".gt_slices"
+MASK_SLICES_SUBDIR = ".mask_slices"
 
 
 # ---------------------------------------------------------------------------
@@ -373,6 +378,8 @@ def _png_slices_to_nifti(
 def synthesize_with_medigan(
     input_dir: Path,
     output_dir: Path,
+    masks_dir: Optional[Path] = None,
+    slice_mode: str = "max_tumor",
     model_id: str = MEDIGAN_MODEL_ID,
     phase: int = DEFAULT_PHASE_PRE,
     batch_size: int = 1,
@@ -380,22 +387,31 @@ def synthesize_with_medigan(
     image_size: int = 512,
     keep_work_dir: bool = False,
 ) -> list[Path]:
-    """Generate synthetic post-contrast images using medigan.
+    """Generate synthetic post-contrast **2D PNG slices** using medigan.
 
     For each pre-contrast NIfTI volume found in *input_dir* the pipeline:
 
-    1. Slices the 3D volume into 2D axial PNG files (the format expected
-       by medigan model 23 / Pix2PixHD).
-    2. Calls ``medigan.Generators.generate()`` with the PNG directory.
-    3. Reassembles the generated 2D slices into a 3D NIfTI volume and
-       saves it to *output_dir*.
+    1. Loads the volume and an optional tumour segmentation mask from
+       *masks_dir*.
+    2. Selects specific axial slices based on *slice_mode* and the mask.
+    3. Saves the selected slices as 8-bit grayscale PNG files in a
+       per-patient staging directory.
+    4. Calls ``medigan.Generators.generate()`` on the PNG slices.
+    5. Copies the generated output PNGs to *output_dir* with
+       patient-based filenames.
 
-    Intermediate files (input/output PNG slices) are stored in a
-    staging directory ``<output_dir>/.synthesis_work/<patient_id>/``
-    so they live on the **same filesystem** as the final outputs.
-    On success the staging directory is removed (unless
-    *keep_work_dir* is ``True``).  On failure it is **kept** so that
-    users can inspect intermediate state for debugging.
+    The output is a flat directory of **2D PNG images** (not 3D NIfTI
+    volumes).  File naming convention:
+
+    * Single-slice modes (``max_tumor`` / ``center_tumor``):
+      ``{patient_id}.png``
+    * Multi-slice mode (``all_tumor``):
+      ``{patient_id}_s{slice_index:04d}.png``
+
+    Intermediate files are staged in
+    ``<output_dir>/.synthesis_work/<patient_id>/`` and cleaned up on
+    success unless *keep_work_dir* is ``True``.  On failure the staging
+    directory is **kept** for debugging.
 
     Parameters
     ----------
@@ -403,29 +419,31 @@ def synthesize_with_medigan(
         Directory containing pre-contrast NIfTI images (or patient
         sub-folders with ``{pid}_0000.nii.gz`` files).
     output_dir : Path
-        Target directory for generated post-contrast images.
+        Target directory for generated PNG images.
+    masks_dir : Path or None
+        Directory with tumour segmentation masks for slice selection.
+        When ``None``, single-slice modes fall back to the middle slice.
+    slice_mode : str
+        ``"max_tumor"`` (default), ``"center_tumor"``, or
+        ``"all_tumor"``.
     model_id : str
         Medigan model identifier (default: Pix2PixHD breast DCE-MRI).
     phase : int
-        MRI phase index of the **input** images (default: 0 = pre-contrast).
+        MRI phase index of the **input** images (default: 0 = pre).
     batch_size : int
         Number of images to generate per batch.
     gpu_id : str
-        GPU identifier.  Accepts bare integers (``"0"``, ``"1"``,
-        ``"-1"`` for CPU) or full PyTorch device strings
-        (``"cuda:0"``, ``"cpu"``).  Bare integers are normalised to
-        ``"cuda:<N>"`` (or ``"cpu"`` when negative) before being
-        forwarded to medigan.
+        GPU identifier.  Bare integers are normalised to ``"cuda:<N>"``
+        (or ``"cpu"`` when negative).
     image_size : int
         Spatial resolution expected by the model (default: 512).
     keep_work_dir : bool
-        If ``True`` the per-patient staging directories are never
-        deleted, even after a successful run.  Useful for debugging.
+        If ``True`` staging directories are never deleted.
 
     Returns
     -------
     list[Path]
-        Paths to the generated NIfTI files.
+        Paths to the generated PNG files.
     """
     try:
         from medigan import Generators
@@ -452,7 +470,8 @@ def synthesize_with_medigan(
 
     logger.info(
         f"Running medigan synthesis (model={model_id}, "
-        f"gpu_id={device_str}, image_size={image_size}) on {input_dir}"
+        f"gpu_id={device_str}, image_size={image_size}, "
+        f"slice_mode={slice_mode}) on {input_dir}"
     )
     logger.info(f"Staging directory: {work_root}")
 
@@ -468,7 +487,6 @@ def synthesize_with_medigan(
 
     for img_path in input_images:
         patient_id = _extract_patient_id(img_path)
-        out_nifti = output_dir / f"{patient_id}_0001.nii.gz"
         patient_work = work_root / patient_id
         work_input = patient_work / "input_slices"
         work_output = patient_work / "output_slices"
@@ -480,11 +498,22 @@ def synthesize_with_medigan(
             work_input.mkdir(parents=True)
             work_output.mkdir(parents=True)
 
-            # 1. Slice NIfTI → 2D PNGs
-            slice_meta = _nifti_to_png_slices(img_path, work_input)
+            # Load mask for slice selection
+            mask_arr = _load_mask_for_patient(patient_id, masks_dir)
+
+            # 1. Extract selected slices as PNG (sequential naming for
+            #    medigan, which processes a directory of PNGs).
+            slice_infos = _extract_and_save_slices(
+                img_path,
+                work_input,
+                patient_id,
+                mask_arr=mask_arr,
+                slice_mode=slice_mode,
+                sequential_naming=True,
+            )
             logger.debug(
-                f"{patient_id}: {slice_meta['num_slices']} slices "
-                f"extracted to {work_input}"
+                f"{patient_id}: {len(slice_infos)} slice(s) extracted "
+                f"(indices: {[idx for _, idx in slice_infos]})"
             )
 
             # 2. Run medigan synthesis
@@ -498,20 +527,31 @@ def synthesize_with_medigan(
                 gpu_id=device_str,
             )
 
-            # Log what medigan actually produced (helpful for debugging)
-            produced = list(work_output.rglob("*"))
-            produced_files = [p for p in produced if p.is_file()]
+            # Collect output PNGs
+            produced = sorted(_find_generated_images(work_output))
             logger.debug(
-                f"{patient_id}: medigan produced {len(produced_files)} "
-                f"file(s) under {work_output}: "
-                f"{[str(p.relative_to(work_output)) for p in produced_files[:10]]}"
+                f"{patient_id}: medigan produced {len(produced)} file(s)"
             )
 
-            # 3. Reassemble output images → 3D NIfTI
-            _png_slices_to_nifti(work_output, out_nifti, slice_meta)
+            if len(produced) != len(slice_infos):
+                logger.warning(
+                    f"{patient_id}: expected {len(slice_infos)} output "
+                    f"image(s) but medigan produced {len(produced)}"
+                )
 
-            generated_files.append(out_nifti)
-            logger.debug(f"Generated: {out_nifti.name}")
+            # 3. Copy output PNGs to output_dir with patient-based naming
+            for i, (_, slice_idx) in enumerate(slice_infos):
+                if i >= len(produced):
+                    break
+                if len(slice_infos) == 1:
+                    out_name = f"{patient_id}.png"
+                else:
+                    out_name = f"{patient_id}_s{slice_idx:04d}.png"
+                dest = output_dir / out_name
+                shutil.copy2(str(produced[i]), str(dest))
+                generated_files.append(dest)
+
+            logger.debug(f"Generated PNG(s) for {patient_id}")
 
             # Clean up staging dir on success (unless user wants to keep it)
             if not keep_work_dir:
@@ -535,8 +575,8 @@ def synthesize_with_medigan(
             )
 
     logger.info(
-        f"Synthesis complete: {len(generated_files)}/{len(input_images)} "
-        f"images generated → {output_dir}"
+        f"Synthesis complete: {len(generated_files)} PNG(s) from "
+        f"{len(input_images)} input volume(s) → {output_dir}"
     )
     return generated_files
 
@@ -588,6 +628,309 @@ def _extract_patient_id(path: Path) -> str:
     if len(parts) == 2 and parts[1].isdigit() and len(parts[1]) == 4:
         return parts[0]
     return stem
+
+
+# ---------------------------------------------------------------------------
+# 2D slice selection and extraction helpers
+# ---------------------------------------------------------------------------
+
+# Slice selection modes exposed via CLI (a subset of SliceMode in
+# slice_extraction.py, limited to the three modes that make sense for
+# the synthesis→evaluation pipeline).
+SLICE_MODE_CHOICES = ("max_tumor", "center_tumor", "all_tumor")
+
+
+def _select_slices(
+    volume: np.ndarray,
+    mask: Optional[np.ndarray],
+    slice_mode: str,
+) -> list[int]:
+    """Select axial slice indices from a 3D volume.
+
+    Parameters
+    ----------
+    volume : ndarray
+        3D array ``(D, H, W)``.
+    mask : ndarray or None
+        3D boolean mask.  Required for tumour-based modes; when
+        ``None`` the function falls back to the middle slice.
+    slice_mode : str
+        ``"max_tumor"``, ``"center_tumor"``, or ``"all_tumor"``.
+
+    Returns
+    -------
+    list[int]
+        Sorted slice indices.
+    """
+    from eval.slice_extraction import (
+        find_max_tumor_slice,
+        find_center_tumor_slice,
+    )
+
+    has_mask = mask is not None and mask.ndim == 3 and np.any(mask)
+    n_slices = volume.shape[0]
+
+    if slice_mode == "max_tumor":
+        if has_mask:
+            return [find_max_tumor_slice(mask)]
+        logger.warning(
+            "No mask for max_tumor mode; falling back to middle slice."
+        )
+        return [n_slices // 2]
+
+    if slice_mode == "center_tumor":
+        if has_mask:
+            return [find_center_tumor_slice(mask)]
+        logger.warning(
+            "No mask for center_tumor mode; falling back to middle slice."
+        )
+        return [n_slices // 2]
+
+    if slice_mode == "all_tumor":
+        if not has_mask:
+            raise ValueError(
+                "all_tumor slice mode requires a segmentation mask "
+                "but none was provided or the mask is empty."
+            )
+        areas = np.sum(mask, axis=(1, 2))
+        return sorted(int(i) for i in np.nonzero(areas)[0])
+
+    raise ValueError(f"Unknown slice_mode: {slice_mode!r}")
+
+
+def _load_mask_for_patient(
+    patient_id: str,
+    masks_dir: Optional[Path],
+) -> Optional[np.ndarray]:
+    """Load a 3D segmentation mask for *patient_id* from *masks_dir*.
+
+    Searches for files whose extracted patient ID matches, trying common
+    medical-image extensions in both flat and nested directory layouts.
+
+    Returns ``None`` when *masks_dir* is ``None``, does not exist, or no
+    matching mask file is found.
+    """
+    if masks_dir is None or not masks_dir.exists():
+        return None
+
+    try:
+        import SimpleITK as sitk
+    except ImportError:
+        logger.warning("SimpleITK not available — cannot load masks.")
+        return None
+
+    for ext in (".nii.gz", ".nii", ".mha", ".mhd"):
+        # Flat layout: masks_dir/{pid}*{ext}
+        for candidate in sorted(masks_dir.glob(f"{patient_id}*{ext}")):
+            if _extract_patient_id(candidate) == patient_id:
+                try:
+                    arr = sitk.GetArrayFromImage(
+                        sitk.ReadImage(str(candidate), sitk.sitkUInt8)
+                    )
+                    if arr.ndim == 4:
+                        arr = arr[0]
+                    return arr.astype(bool)
+                except Exception as e:
+                    logger.warning(f"Failed to load mask {candidate}: {e}")
+
+        # Nested layout: masks_dir/{pid}/{pid}*{ext}
+        nested = masks_dir / patient_id
+        if nested.is_dir():
+            for candidate in sorted(nested.glob(f"{patient_id}*{ext}")):
+                if _extract_patient_id(candidate) == patient_id:
+                    try:
+                        arr = sitk.GetArrayFromImage(
+                            sitk.ReadImage(str(candidate), sitk.sitkUInt8)
+                        )
+                        if arr.ndim == 4:
+                            arr = arr[0]
+                        return arr.astype(bool)
+                    except Exception as e:
+                        logger.warning(
+                            f"Failed to load mask {candidate}: {e}"
+                        )
+
+    return None
+
+
+def _extract_and_save_slices(
+    nifti_path: Path,
+    output_dir: Path,
+    patient_id: str,
+    mask_arr: Optional[np.ndarray] = None,
+    slice_mode: str = "max_tumor",
+    sequential_naming: bool = False,
+) -> list[tuple[Path, int]]:
+    """Extract selected axial slices from a NIfTI volume and save as PNG.
+
+    The full 3D volume is normalised to ``[0, 255]`` using the global
+    min/max, and the selected slices are saved as 8-bit grayscale PNGs.
+
+    Parameters
+    ----------
+    nifti_path : Path
+        Input NIfTI file.
+    output_dir : Path
+        Target directory for PNG files.
+    patient_id : str
+        Patient identifier (used in filenames).
+    mask_arr : ndarray or None
+        3D boolean mask for slice selection.
+    slice_mode : str
+        ``"max_tumor"``, ``"center_tumor"``, or ``"all_tumor"``.
+    sequential_naming : bool
+        If ``True`` files are named ``slice_0000.png``, ``slice_0001.png``,
+        … (positional, for medigan input staging).  If ``False`` files use
+        ``{patient_id}.png`` (single-slice) or
+        ``{patient_id}_s{idx:04d}.png`` (multi-slice).
+
+    Returns
+    -------
+    list[tuple[Path, int]]
+        ``(png_path, slice_index)`` pairs sorted by slice index.
+    """
+    try:
+        import SimpleITK as sitk
+    except ImportError:
+        raise ImportError("NIfTI I/O requires SimpleITK.")
+    try:
+        from PIL import Image
+    except ImportError:
+        raise ImportError("PNG I/O requires Pillow.")
+
+    img = sitk.ReadImage(str(nifti_path))
+    arr = sitk.GetArrayFromImage(img).astype(np.float64)
+    if arr.ndim == 4:
+        arr = arr[0]
+    elif arr.ndim != 3:
+        raise ValueError(
+            f"Expected 3D or 4D NIfTI, got {arr.ndim}D from {nifti_path}"
+        )
+
+    # Select slices
+    indices = _select_slices(arr, mask_arr, slice_mode)
+
+    # Normalise to [0, 255] based on full volume range
+    vmin, vmax = float(arr.min()), float(arr.max())
+    if vmax > vmin:
+        norm = (arr - vmin) / (vmax - vmin) * 255.0
+    else:
+        norm = np.zeros_like(arr)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    results: list[tuple[Path, int]] = []
+
+    for seq_i, idx in enumerate(indices):
+        slice_arr = norm[idx].astype(np.uint8)
+        if sequential_naming:
+            name = f"slice_{seq_i:04d}.png"
+        elif len(indices) == 1:
+            name = f"{patient_id}.png"
+        else:
+            name = f"{patient_id}_s{idx:04d}.png"
+
+        png_path = output_dir / name
+        Image.fromarray(slice_arr, mode="L").save(png_path)
+        results.append((png_path, int(idx)))
+
+    return results
+
+
+def extract_ground_truth_slices(
+    gt_dir: Path,
+    masks_dir: Optional[Path],
+    output_dir: Path,
+    slice_mode: str = "max_tumor",
+    phase: int = DEFAULT_PHASE_POST,
+    masks_output_dir: Optional[Path] = None,
+) -> list[Path]:
+    """Extract 2D ground-truth slices from 3D NIfTI volumes.
+
+    Uses the same slice-selection logic (mask + *slice_mode*) as
+    :func:`synthesize_with_medigan` so that predictions and ground truth
+    are compared at the same anatomical positions.
+
+    When *masks_output_dir* is provided, the corresponding 2D binary
+    mask slices are also saved there (as 8-bit grayscale PNGs with the
+    same filenames) so that ROI-based evaluation metrics can consume
+    them directly.
+
+    Parameters
+    ----------
+    gt_dir : Path
+        Directory with ground-truth post-contrast NIfTI volumes.
+    masks_dir : Path or None
+        Segmentation masks directory (for slice selection).
+    output_dir : Path
+        Target directory for extracted GT PNG slices.
+    slice_mode : str
+        Slice selection strategy (must match what was used for synthesis).
+    phase : int
+        Phase index of GT images (default 1 = post-contrast).
+    masks_output_dir : Path or None
+        If given, matching 2D mask slices are saved here.
+
+    Returns
+    -------
+    list[Path]
+        Paths to saved GT PNG files.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    if masks_output_dir is not None:
+        masks_output_dir.mkdir(parents=True, exist_ok=True)
+
+    gt_images = _discover_input_images(gt_dir, phase=phase)
+    if not gt_images:
+        # Fall back: try all NIfTI-like files (GT may lack phase suffix)
+        gt_images = sorted(
+            f for f in gt_dir.iterdir()
+            if f.is_file()
+            and any(f.name.endswith(e) for e in (".nii.gz", ".nii", ".mha"))
+        )
+
+    saved: list[Path] = []
+
+    for gt_path in gt_images:
+        patient_id = _extract_patient_id(gt_path)
+        mask_arr = _load_mask_for_patient(patient_id, masks_dir)
+
+        try:
+            slice_infos = _extract_and_save_slices(
+                gt_path, output_dir, patient_id,
+                mask_arr=mask_arr,
+                slice_mode=slice_mode,
+                sequential_naming=False,
+            )
+            saved.extend(p for p, _ in slice_infos)
+
+            # Save matching mask slices
+            if masks_output_dir is not None and mask_arr is not None:
+                try:
+                    from PIL import Image as _PIL
+
+                    for _, idx in slice_infos:
+                        mask_slice = (mask_arr[idx] > 0).astype(np.uint8) * 255
+                        if len(slice_infos) == 1:
+                            mname = f"{patient_id}.png"
+                        else:
+                            mname = f"{patient_id}_s{idx:04d}.png"
+                        _PIL.fromarray(mask_slice, mode="L").save(
+                            masks_output_dir / mname
+                        )
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to save mask slices for {patient_id}: {e}"
+                    )
+
+        except Exception as e:
+            logger.warning(
+                f"Failed to extract GT slices for {patient_id}: {e}"
+            )
+
+    logger.info(
+        f"Extracted {len(saved)} ground-truth PNG slice(s) → {output_dir}"
+    )
+    return saved
 
 
 # ---------------------------------------------------------------------------
@@ -734,6 +1077,29 @@ def parse_synthesize_args(
         help="Spatial resolution for the model. Default: 512.",
     )
     parser.add_argument(
+        "--slice-mode",
+        type=str,
+        choices=SLICE_MODE_CHOICES,
+        default="max_tumor",
+        help=(
+            "Slice selection strategy for extracting 2D slices from "
+            "3D input volumes. 'max_tumor' (default): slice with "
+            "largest tumour area. 'center_tumor': slice through "
+            "tumour centre of mass. 'all_tumor': every slice with "
+            "tumour."
+        ),
+    )
+    parser.add_argument(
+        "--masks-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Directory with segmentation masks for slice selection. "
+            "Required for accurate tumour-based slice modes. "
+            "Default: <data-dir>/segmentations if --data-dir is set."
+        ),
+    )
+    parser.add_argument(
         "--keep-work-dir",
         action="store_true",
         help=(
@@ -758,6 +1124,12 @@ def parse_synthesize_args(
             parser.error(
                 "At least one of --data-dir or --input-dir is required."
             )
+
+    # Resolve masks directory
+    if args.masks_dir is None and args.data_dir is not None:
+        candidate = args.data_dir / SEGMENTATIONS_SUBDIR
+        if candidate.exists():
+            args.masks_dir = candidate
 
     return args
 
@@ -784,13 +1156,15 @@ def synthesize_main(argv: Optional[list[str]] = None) -> None:
         generated = synthesize_with_medigan(
             input_dir=args.input_dir,
             output_dir=args.output_dir,
+            masks_dir=args.masks_dir,
+            slice_mode=args.slice_mode,
             model_id=args.model_id,
             phase=args.phase,
             gpu_id=args.gpu_id,
             image_size=args.image_size,
             keep_work_dir=args.keep_work_dir,
         )
-        logger.info(f"Generated {len(generated)} synthetic images.")
+        logger.info(f"Generated {len(generated)} synthetic PNG(s).")
     else:
         logger.error(
             f"Unknown model '{args.model}'. Currently supported: 'medigan'. "
@@ -892,6 +1266,16 @@ def parse_synthesize_and_evaluate_args(
         type=int,
         default=512,
         help="Spatial resolution for the model. Default: 512.",
+    )
+    synth.add_argument(
+        "--slice-mode",
+        type=str,
+        choices=SLICE_MODE_CHOICES,
+        default="max_tumor",
+        help=(
+            "Slice selection strategy: 'max_tumor' (default), "
+            "'center_tumor', or 'all_tumor'."
+        ),
     )
     synth.add_argument(
         "--keep-work-dir",
@@ -1071,11 +1455,14 @@ def synthesize_and_evaluate_main(
         logger.info(f"Input:  {args.input_dir}")
         logger.info(f"Output: {args.output_dir}")
         logger.info(f"Model:  {args.model}")
+        logger.info(f"Slice mode: {args.slice_mode}")
 
         if args.model == "medigan":
             synthesize_with_medigan(
                 input_dir=args.input_dir,
                 output_dir=args.output_dir,
+                masks_dir=args.masks_path,
+                slice_mode=args.slice_mode,
                 model_id=args.model_id,
                 phase=args.phase,
                 gpu_id=args.gpu_id,
@@ -1083,17 +1470,37 @@ def synthesize_and_evaluate_main(
                 keep_work_dir=args.keep_work_dir,
             )
 
+    # --- Step 1b: Extract matching GT and mask slices ---------------------
+    gt_eval_dir: Path = args.ground_truth_path
+    mask_eval_dir: Optional[Path] = args.masks_path
+
+    if not args._skip_synthesis:
+        gt_eval_dir = args.output_dir / GT_SLICES_SUBDIR
+        mask_eval_dir = (
+            args.output_dir / MASK_SLICES_SUBDIR
+            if args.masks_path else None
+        )
+        logger.info("\n--- Step 1b: Extracting GT slices ---")
+        extract_ground_truth_slices(
+            gt_dir=args.ground_truth_path,
+            masks_dir=args.masks_path,
+            output_dir=gt_eval_dir,
+            slice_mode=args.slice_mode,
+            phase=DEFAULT_PHASE_POST,
+            masks_output_dir=mask_eval_dir,
+        )
+
     # --- Step 2: Evaluation -----------------------------------------------
     logger.info("\n--- Step 2: Evaluation ---")
     logger.info(f"Predictions:   {args.predictions_dir}")
-    logger.info(f"Ground truth:  {args.ground_truth_path}")
+    logger.info(f"Ground truth:  {gt_eval_dir}")
     logger.info(f"Output:        {args.output_file}")
 
     results = run_evaluation(
         predictions_dir=args.predictions_dir,
-        ground_truth_dir=args.ground_truth_path,
+        ground_truth_dir=gt_eval_dir,
         output_file=args.output_file,
-        masks_dir=args.masks_path,
+        masks_dir=mask_eval_dir,
         labels_path=args.labels_path,
         clf_model_dir=args.clf_model_dir,
         seg_model_path=args.seg_model_path,
