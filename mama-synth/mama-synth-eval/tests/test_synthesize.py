@@ -450,6 +450,78 @@ class TestNiftiPngRoundtrip:
                      "direction": (1, 0, 0, 0, 1, 0, 0, 0, 1)},
                 )
 
+    def test_png_to_nifti_finds_subdir(self):
+        """_png_slices_to_nifti should find PNGs in subdirectories like batch_0/."""
+        from eval.synthesize import _nifti_to_png_slices, _png_slices_to_nifti
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            nifti_path = tmp / "test.nii.gz"
+            png_dir = tmp / "slices"
+            out_root = tmp / "output"
+            out_path = tmp / "reassembled.nii.gz"
+
+            _make_test_nifti(nifti_path, shape=(3, 8, 8))
+            meta = _nifti_to_png_slices(nifti_path, png_dir)
+
+            # Simulate medigan saving into a batch_0/ subdirectory
+            batch_dir = out_root / "batch_0"
+            batch_dir.mkdir(parents=True)
+            import shutil
+            for png in png_dir.glob("*.png"):
+                shutil.copy(png, batch_dir / png.name)
+
+            # Pass the parent — the function should find batch_0/
+            _png_slices_to_nifti(out_root, out_path, meta)
+
+            import SimpleITK as sitk
+            result = sitk.GetArrayFromImage(sitk.ReadImage(str(out_path)))
+            assert result.shape == (3, 8, 8)
+
+
+# ---------------------------------------------------------------------------
+# _find_png_output_dir
+# ---------------------------------------------------------------------------
+
+
+class TestFindPngOutputDir:
+    """Tests for _find_png_output_dir helper."""
+
+    def test_root_has_pngs(self):
+        from eval.synthesize import _find_png_output_dir
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "a.png").touch()
+            assert _find_png_output_dir(root) == root
+
+    def test_subdir_has_pngs(self):
+        from eval.synthesize import _find_png_output_dir
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sub = root / "batch_0"
+            sub.mkdir()
+            (sub / "out.png").touch()
+            assert _find_png_output_dir(root) == sub
+
+    def test_nested_subdir(self):
+        from eval.synthesize import _find_png_output_dir
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            deep = root / "a" / "b"
+            deep.mkdir(parents=True)
+            (deep / "img.png").touch()
+            assert _find_png_output_dir(root) == deep
+
+    def test_empty_dir_raises(self):
+        from eval.synthesize import _find_png_output_dir
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with pytest.raises(FileNotFoundError, match="No PNG files"):
+                _find_png_output_dir(Path(tmp))
+
 
 # ---------------------------------------------------------------------------
 # synthesize_with_medigan (mocked medigan)
@@ -482,10 +554,10 @@ class TestSynthesizeWithMedigan:
             mock_gen_instance = MagicMock()
 
             # Make generate() side-effect: copy input PNGs to output dir
-            # to simulate the model producing output
+            # in a batch_0/ subdirectory (matching real medigan behaviour)
             def fake_generate(**kwargs):
                 in_dir = Path(kwargs["input_path"])
-                out_dir = Path(kwargs["output_path"])
+                out_dir = Path(kwargs["output_path"]) / "batch_0"
                 out_dir.mkdir(parents=True, exist_ok=True)
                 import shutil
                 for png in sorted(in_dir.glob("*.png")):

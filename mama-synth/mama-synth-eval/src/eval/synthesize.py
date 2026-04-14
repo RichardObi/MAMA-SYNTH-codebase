@@ -220,6 +220,35 @@ def _nifti_to_png_slices(
     }
 
 
+def _find_png_output_dir(root: Path) -> Path:
+    """Locate the directory that actually contains generated PNGs.
+
+    medigan may save output images in a subdirectory of the provided
+    ``output_path`` (e.g. ``output/batch_0/``).  This helper walks the
+    tree rooted at *root* and returns the first directory that contains
+    at least one ``*.png`` file.  If *root* itself contains PNGs it is
+    returned immediately.
+
+    Raises
+    ------
+    FileNotFoundError
+        If no directory under *root* contains any PNG files.
+    """
+    # Check root itself first
+    if list(root.glob("*.png")):
+        return root
+
+    # Walk subdirectories (breadth-first / sorted for determinism)
+    for dirpath in sorted(root.rglob("*")):
+        if dirpath.is_dir() and list(dirpath.glob("*.png")):
+            return dirpath
+
+    raise FileNotFoundError(
+        f"No PNG files found in {root} or any of its subdirectories — "
+        "the model may not have produced output images."
+    )
+
+
 def _png_slices_to_nifti(
     png_dir: Path,
     output_path: Path,
@@ -233,7 +262,10 @@ def _png_slices_to_nifti(
     Parameters
     ----------
     png_dir : Path
-        Directory containing the generated PNG slices.
+        Root directory containing the generated PNG slices.  If the
+        model saved images in a subdirectory (e.g. ``batch_0/``), this
+        function searches recursively for the first directory that
+        actually contains PNG files.
     output_path : Path
         Destination NIfTI file path (e.g. ``patient_0001.nii.gz``).
     metadata : dict
@@ -250,10 +282,15 @@ def _png_slices_to_nifti(
 
     png_files = sorted(png_dir.glob("*.png"))
     if not png_files:
-        raise FileNotFoundError(
-            f"No PNG files found in {png_dir} — the model may not have "
-            "produced output images."
-        )
+        # medigan may save in a subdirectory (e.g. output/batch_0/)
+        try:
+            actual_dir = _find_png_output_dir(png_dir)
+        except FileNotFoundError:
+            raise FileNotFoundError(
+                f"No PNG files found in {png_dir} or its subdirectories "
+                "— the model may not have produced output images."
+            )
+        png_files = sorted(actual_dir.glob("*.png"))
 
     slices = []
     for pf in png_files:
