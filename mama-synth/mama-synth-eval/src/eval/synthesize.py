@@ -1548,13 +1548,43 @@ def synthesize_and_evaluate_main(
             )
 
     # --- Step 1b: Extract matching GT and mask slices ---------------------
+    #
+    # Predictions are 2D PNG slices.  The ground-truth directory typically
+    # contains 3D NIfTI volumes in nested patient folders, so we must
+    # extract the corresponding 2D GT slices as PNGs before evaluation.
+    #
+    # When synthesis was just run, we always (re-)extract.  When synthesis
+    # was skipped (--skip-synthesis / --predictions-dir), we still need
+    # matching GT slices — reuse a previous extraction if the directory
+    # already exists, otherwise extract now.
     gt_eval_dir: Path = args.ground_truth_path
     mask_eval_dir: Optional[Path] = args.masks_path
 
-    if not args._skip_synthesis:
-        gt_eval_dir = args.output_dir / GT_SLICES_SUBDIR
+    # Determine output base for GT/mask slice directories.
+    # Use --output-dir if given, otherwise place next to predictions.
+    _slice_base = args.output_dir if args.output_dir else args.predictions_dir
+    _gt_slices_candidate = _slice_base / GT_SLICES_SUBDIR
+    _mask_slices_candidate = _slice_base / MASK_SLICES_SUBDIR
+
+    need_gt_extraction = not args._skip_synthesis  # always extract after fresh synthesis
+
+    if args._skip_synthesis:
+        # Check whether a previous extraction already exists and has files
+        if _gt_slices_candidate.exists() and any(_gt_slices_candidate.glob("*.png")):
+            logger.info(
+                f"Reusing previously extracted GT slices: {_gt_slices_candidate}"
+            )
+            gt_eval_dir = _gt_slices_candidate
+            if _mask_slices_candidate.exists() and any(_mask_slices_candidate.glob("*.png")):
+                mask_eval_dir = _mask_slices_candidate
+        else:
+            # GT slices not yet extracted — we need to do it now
+            need_gt_extraction = True
+
+    if need_gt_extraction:
+        gt_eval_dir = _gt_slices_candidate
         mask_eval_dir = (
-            args.output_dir / MASK_SLICES_SUBDIR
+            _mask_slices_candidate
             if args.masks_dir else None
         )
         logger.info("\n--- Step 1b: Extracting GT slices ---")

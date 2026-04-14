@@ -58,6 +58,8 @@ Rankings use **Borda-style hierarchical rank aggregation** with tie-break priori
   - **Fixed mask loading failure for patients whose ID ends in 4 digits** (e.g. `ISPY1_1001`). `_load_mask_for_patient()` used `_extract_patient_id()` for matching, which incorrectly stripped the trailing 4-digit component of the patient ID when the mask file had no `_DDDD` phase suffix. Replaced with robust `_stem_matches_patient()` helper that checks for exact match or valid phase-suffix extension.
   - **Fixed `num_samples=1` hardcoded in medigan call** — `all_tumor` slice mode now correctly passes the actual number of extracted slices to `medigan.Generators.generate()`, so all selected slices are synthesised.
   - Fixed flat-layout image discovery (`_discover_input_images`) accepting non-NIfTI files (e.g. PNGs, logs) in the fallback path — now filters by extension.
+  - **Fixed resolution mismatch between synthesized and ground-truth images** — medigan outputs at the requested `--image-size` (e.g. 512×512) while ground-truth slices retain their native NIfTI resolution (e.g. 448×448). Synthesized PNGs are now resized back to the native input resolution using Pillow BICUBIC interpolation before saving.
+  - **Fixed `--skip-synthesis` failing with "No matching image pairs found"** — when synthesis was skipped, the pipeline pointed evaluation at the raw NIfTI ground-truth directory (3D volumes with phase-suffixed filenames in nested folders), which could not match 2D PNG prediction stems. GT slice extraction now runs in three scenarios: (a) after fresh synthesis → always extract, (b) skip-synthesis with existing `.gt_slices/` containing PNGs → reuse, (c) skip-synthesis with no previous extraction → extract now.
 
 ## What's New in v0.8.0
 

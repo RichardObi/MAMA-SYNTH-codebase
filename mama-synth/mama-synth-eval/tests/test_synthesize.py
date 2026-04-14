@@ -1698,3 +1698,207 @@ class TestNormalizeGpuId:
     def test_whitespace_stripped(self):
         from eval.synthesize import _normalize_gpu_id
         assert _normalize_gpu_id("  0  ") == "cuda:0"
+
+
+# ---------------------------------------------------------------------------
+# --skip-synthesis GT slice extraction
+# ---------------------------------------------------------------------------
+
+
+class TestSkipSynthesisGTExtraction:
+    """Tests that GT slices are correctly handled when --skip-synthesis is used.
+
+    The combined pipeline must still produce matching 2D GT PNG slices
+    for evaluation, even when synthesis itself is skipped.  Three cases:
+
+    1. Fresh synthesis (not skipped) → always extract GT slices.
+    2. Skip synthesis + previous ``.gt_slices/`` with PNGs → reuse.
+    3. Skip synthesis + no previous extraction → extract now.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _check_deps(self):
+        pytest.importorskip("SimpleITK")
+        pytest.importorskip("PIL")
+
+    # -- helpers -----------------------------------------------------------
+
+    @staticmethod
+    def _build_env(tmp: Path, *, with_gt_slices: bool = False,
+                   with_mask_slices: bool = False):
+        """Create a minimal filesystem layout for skip-synthesis tests.
+
+        Returns (predictions_dir, gt_dir, masks_dir).
+        """
+        # predictions: some fake PNGs
+        preds = tmp / "predictions"
+        preds.mkdir()
+        from PIL import Image as _PIL
+        for pid in ("P001", "P002"):
+            img = _PIL.new("L", (8, 8), color=128)
+            img.save(preds / f"{pid}.png")
+
+        # Ground-truth NIfTI volumes (nested MAMA-MIA layout)
+        gt_dir = tmp / "images"
+        for pid in ("P001", "P002"):
+            d = gt_dir / pid
+            d.mkdir(parents=True)
+            _make_test_nifti(d / f"{pid}_0001.nii.gz", shape=(3, 8, 8))
+
+        # Masks
+        masks_dir = tmp / "segmentations"
+        for pid in ("P001", "P002"):
+            d = masks_dir / pid
+            d.mkdir(parents=True)
+            _make_test_nifti(d / f"{pid}.nii.gz", shape=(3, 8, 8))
+
+        # Optionally pre-populate .gt_slices / .mask_slices inside preds
+        if with_gt_slices:
+            gs = preds / ".gt_slices"
+            gs.mkdir()
+            for pid in ("P001", "P002"):
+                _PIL.new("L", (8, 8), color=64).save(gs / f"{pid}.png")
+        if with_mask_slices:
+            ms = preds / ".mask_slices"
+            ms.mkdir()
+            for pid in ("P001", "P002"):
+                _PIL.new("L", (8, 8), color=255).save(ms / f"{pid}.png")
+
+        return preds, gt_dir, masks_dir
+
+    # -- Case 2: skip + previous extraction exists → reuse -----------------
+
+    def test_reuses_existing_gt_slices(self):
+        """When .gt_slices/ already has PNGs, they are reused (no re-extract)."""
+        from eval.synthesize import synthesize_and_evaluate_main
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(os.path.realpath(tmp))
+            preds, gt_dir, masks_dir = self._build_env(
+                tmp, with_gt_slices=True, with_mask_slices=True,
+            )
+            out_json = tmp / "metrics.json"
+
+            with patch("eval.synthesize.run_evaluation", return_value={"aggregates": {}}) as mock_eval, \
+                 patch("eval.synthesize.extract_ground_truth_slices") as mock_extract:
+                synthesize_and_evaluate_main([
+                    "--predictions-dir", str(preds),
+                    "--ground-truth-path", str(gt_dir),
+                    "--masks-path", str(masks_dir),
+                    "--output-file", str(out_json),
+                ])
+
+            # extract_ground_truth_slices should NOT have been called
+            mock_extract.assert_not_called()
+
+            # Evaluation should receive the pre-existing .gt_slices dir
+            mock_eval.assert_called_once()
+            call_kwargs = mock_eval.call_args
+            assert call_kwargs[1]["ground_truth_dir"] == preds / ".gt_slices"
+            assert call_kwargs[1]["masks_dir"] == preds / ".mask_slices"
+
+    # -- Case 3: skip + no previous → extract now -------------------------
+
+    def test_extracts_gt_slices_when_missing(self):
+        """When .gt_slices/ does not exist, GT slices are extracted even with skip."""
+        from eval.synthesize import synthesize_and_evaluate_main
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(os.path.realpath(tmp))
+            preds, gt_dir, masks_dir = self._build_env(tmp)
+            out_json = tmp / "metrics.json"
+
+            with patch("eval.synthesize.run_evaluation", return_value={"aggregates": {}}) as mock_eval, \
+                 patch("eval.synthesize.extract_ground_truth_slices") as mock_extract:
+                synthesize_and_evaluate_main([
+                    "--predictions-dir", str(preds),
+                    "--ground-truth-path", str(gt_dir),
+                    "--masks-dir", str(masks_dir),
+                    "--output-file", str(out_json),
+                ])
+
+            # extract_ground_truth_slices SHOULD have been called
+            mock_extract.assert_called_once()
+            call_kwargs = mock_extract.call_args
+            assert call_kwargs[1]["gt_dir"] == gt_dir
+            assert call_kwargs[1]["output_dir"] == preds / ".gt_slices"
+
+    # -- Case 1: fresh synthesis → always extract --------------------------
+
+    def test_always_extracts_after_fresh_synthesis(self):
+        """After fresh synthesis, GT slices are always (re-)extracted."""
+        from eval.synthesize import synthesize_and_evaluate_main
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(os.path.realpath(tmp))
+            preds, gt_dir, masks_dir = self._build_env(
+                tmp, with_gt_slices=True,  # pre-existing should be overwritten
+            )
+            input_dir = gt_dir  # reuse as input for synthesis
+            output_dir = preds
+            out_json = tmp / "metrics.json"
+
+            with patch("eval.synthesize.run_evaluation", return_value={"aggregates": {}}) as mock_eval, \
+                 patch("eval.synthesize.extract_ground_truth_slices") as mock_extract, \
+                 patch("eval.synthesize.synthesize_with_medigan"):
+                synthesize_and_evaluate_main([
+                    "--data-dir", str(tmp),
+                    "--output-dir", str(output_dir),
+                    "--output-file", str(out_json),
+                ])
+
+            # extract_ground_truth_slices SHOULD be called even though
+            # .gt_slices/ already exists
+            mock_extract.assert_called_once()
+
+    # -- Edge case: skip + empty .gt_slices dir → extract ------------------
+
+    def test_extracts_when_gt_slices_dir_empty(self):
+        """An empty .gt_slices/ directory triggers fresh extraction."""
+        from eval.synthesize import synthesize_and_evaluate_main
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(os.path.realpath(tmp))
+            preds, gt_dir, masks_dir = self._build_env(tmp)
+            # Create empty .gt_slices (no PNGs inside)
+            (preds / ".gt_slices").mkdir()
+            out_json = tmp / "metrics.json"
+
+            with patch("eval.synthesize.run_evaluation", return_value={"aggregates": {}}), \
+                 patch("eval.synthesize.extract_ground_truth_slices") as mock_extract:
+                synthesize_and_evaluate_main([
+                    "--predictions-dir", str(preds),
+                    "--ground-truth-path", str(gt_dir),
+                    "--masks-dir", str(masks_dir),
+                    "--output-file", str(out_json),
+                ])
+
+            # Empty dir ≠ valid extraction → must re-extract
+            mock_extract.assert_called_once()
+
+    # -- Edge case: skip + reuse when only GT (no masks) -------------------
+
+    def test_reuses_gt_slices_without_mask_slices(self):
+        """Reuse works when .gt_slices/ exists but .mask_slices/ does not."""
+        from eval.synthesize import synthesize_and_evaluate_main
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(os.path.realpath(tmp))
+            preds, gt_dir, _ = self._build_env(
+                tmp, with_gt_slices=True, with_mask_slices=False,
+            )
+            out_json = tmp / "metrics.json"
+
+            with patch("eval.synthesize.run_evaluation", return_value={"aggregates": {}}) as mock_eval, \
+                 patch("eval.synthesize.extract_ground_truth_slices") as mock_extract:
+                synthesize_and_evaluate_main([
+                    "--predictions-dir", str(preds),
+                    "--ground-truth-path", str(gt_dir),
+                    "--output-file", str(out_json),
+                ])
+
+            mock_extract.assert_not_called()
+            call_kwargs = mock_eval.call_args
+            assert call_kwargs[1]["ground_truth_dir"] == preds / ".gt_slices"
+            # masks_dir should be None since .mask_slices/ does not exist
+            assert call_kwargs[1]["masks_dir"] is None
