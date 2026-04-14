@@ -1603,6 +1603,61 @@ class TestPngOutputFormat:
             nifti_files = list(output_dir.glob("*.nii.gz"))
             assert len(nifti_files) == 0, f"Unexpected NIfTI files: {nifti_files}"
 
+    def test_output_resized_to_native_resolution(self):
+        """When medigan output differs from native slice size, resize to match."""
+        from eval.synthesize import synthesize_with_medigan
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(os.path.realpath(tmp))
+            input_dir = tmp / "input" / "P001"
+            input_dir.mkdir(parents=True)
+            output_dir = tmp / "output"
+
+            # Native NIfTI has 48×48 slices (not 512)
+            _make_test_nifti(
+                input_dir / "P001_0000.nii.gz", shape=(3, 48, 48),
+            )
+
+            mock_gen_instance = MagicMock()
+
+            def fake_generate(**kwargs):
+                """Simulate medigan producing 512×512 output."""
+                in_dir = Path(kwargs["input_path"])
+                out_dir = Path(kwargs["output_path"]) / "batch_0"
+                out_dir.mkdir(parents=True, exist_ok=True)
+                for png in sorted(in_dir.glob("*.png")):
+                    # Upscale input to 512×512 to simulate medigan behaviour
+                    img = Image.open(png).resize((512, 512))
+                    img.save(out_dir / png.name)
+
+            mock_gen_instance.generate.side_effect = fake_generate
+            mock_medigan = MagicMock()
+            mock_medigan.Generators.return_value = mock_gen_instance
+
+            original_cwd = os.getcwd()
+            original_path = list(sys.path)
+            try:
+                os.chdir(tmp)
+                with patch.dict("sys.modules", {"medigan": mock_medigan}):
+                    with patch("eval.synthesize._ensure_medigan_importable"):
+                        result = synthesize_with_medigan(
+                            input_dir=tmp / "input",
+                            output_dir=output_dir,
+                            gpu_id="-1",
+                            image_size=512,
+                        )
+            finally:
+                os.chdir(original_cwd)
+                sys.path = original_path
+
+            assert len(result) == 1
+            # Output must be resized back to native 48×48
+            out_img = Image.open(result[0])
+            assert out_img.size == (48, 48), (
+                f"Expected (48, 48), got {out_img.size}"
+            )
+
 
 # ---------------------------------------------------------------------------
 # _normalize_gpu_id

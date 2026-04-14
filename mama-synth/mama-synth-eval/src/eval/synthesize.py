@@ -539,7 +539,20 @@ def synthesize_with_medigan(
                     f"image(s) but medigan produced {len(produced)}"
                 )
 
-            # 3. Copy output PNGs to output_dir with patient-based naming
+            # Determine native spatial resolution from the input slice(s)
+            # so we can resize the model output back to the original grid.
+            input_pngs = sorted(work_input.glob("*.png"))
+            native_size: tuple[int, int] | None = None
+            if input_pngs:
+                from PIL import Image as _PILImg
+
+                with _PILImg.open(input_pngs[0]) as _inp:
+                    native_size = _inp.size  # (width, height)
+
+            # 3. Copy output PNGs to output_dir with patient-based naming,
+            #    resizing to native resolution when the model output size
+            #    differs (e.g. medigan produces 512×512 but the original
+            #    volume slices are 448×448).
             for i, (_, slice_idx) in enumerate(slice_infos):
                 if i >= len(produced):
                     break
@@ -548,7 +561,19 @@ def synthesize_with_medigan(
                 else:
                     out_name = f"{patient_id}_s{slice_idx:04d}.png"
                 dest = output_dir / out_name
-                shutil.copy2(str(produced[i]), str(dest))
+
+                if native_size is not None:
+                    from PIL import Image as _PILImg
+
+                    with _PILImg.open(produced[i]) as out_img:
+                        if out_img.size != native_size:
+                            out_img = out_img.resize(
+                                native_size, _PILImg.BICUBIC,
+                            )
+                        out_img.save(dest)
+                else:
+                    shutil.copy2(str(produced[i]), str(dest))
+
                 generated_files.append(dest)
 
             logger.debug(f"Generated PNG(s) for {patient_id}")
