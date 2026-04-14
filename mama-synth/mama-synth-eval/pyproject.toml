@@ -82,6 +82,7 @@ cnn = [
 ]
 synthesis = [
     "medigan>=0.1.0",
+    "Pillow>=9.0.0",
 ]
 all = [
     "mama-synth-eval[frd,lpips,classification,training,viz,progress]",

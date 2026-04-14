@@ -56,7 +56,9 @@ Usage examples::
 
 import argparse
 import logging
+import os
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any, Optional
 
@@ -83,17 +85,203 @@ DEFAULT_PHASE_POST = 1  # first post-contrast
 # Medigan-based synthesis
 # ---------------------------------------------------------------------------
 
+
+def _ensure_medigan_importable() -> None:
+    """Add CWD to ``sys.path`` so medigan model imports succeed.
+
+    medigan stores downloaded model packages under ``./models/`` (relative
+    to the current working directory) and loads them at runtime via
+    ``importlib.import_module("models.<model_id>.<package>")``.  Two things
+    must be true for that import to work:
+
+    1. CWD is on ``sys.path`` so that the top-level ``models`` package is
+       discoverable.
+    2. ``models/`` contains an ``__init__.py`` so Python treats it as a
+       regular package (namespace packages *can* work on ≥ 3.3 but adding
+       the file is safer and avoids edge-cases in importlib).
+    """
+    cwd = os.getcwd()
+    if cwd not in sys.path:
+        sys.path.insert(0, cwd)
+
+    models_pkg = Path(cwd) / "models"
+    models_pkg.mkdir(exist_ok=True)
+    init_file = models_pkg / "__init__.py"
+    if not init_file.exists():
+        init_file.touch()
+
+
+def _nifti_to_png_slices(
+    nifti_path: Path,
+    output_dir: Path,
+) -> dict[str, Any]:
+    """Slice a 3D NIfTI volume into 2D axial PNG files for medigan.
+
+    Each axial slice is normalised to ``[0, 255]`` and saved as an 8-bit
+    grayscale PNG.  The returned *metadata* dictionary captures the
+    spatial information needed by :func:`_png_slices_to_nifti` to
+    reassemble the generated slices into a proper 3D NIfTI volume.
+
+    Parameters
+    ----------
+    nifti_path : Path
+        Input NIfTI file (``*.nii.gz`` or ``*.nii``).
+    output_dir : Path
+        Directory into which PNG slices are written.
+
+    Returns
+    -------
+    dict
+        Keys: ``shape``, ``spacing``, ``origin``, ``direction``,
+        ``min_val``, ``max_val``, ``num_slices``.
+    """
+    try:
+        import SimpleITK as sitk
+    except ImportError:
+        raise ImportError(
+            "NIfTI I/O requires SimpleITK. "
+            "Install with: pip install SimpleITK"
+        )
+    try:
+        from PIL import Image
+    except ImportError:
+        raise ImportError(
+            "PNG I/O requires Pillow. "
+            "Install with: pip install Pillow"
+        )
+
+    img = sitk.ReadImage(str(nifti_path))
+    arr = sitk.GetArrayFromImage(img).astype(np.float64)
+
+    # Handle 4D volumes — take the first time-point
+    if arr.ndim == 4:
+        arr = arr[0]
+    elif arr.ndim != 3:
+        raise ValueError(
+            f"Expected 3D or 4D NIfTI, got {arr.ndim}D from {nifti_path}"
+        )
+
+    vmin, vmax = float(arr.min()), float(arr.max())
+    if vmax > vmin:
+        norm = (arr - vmin) / (vmax - vmin) * 255.0
+    else:
+        norm = np.zeros_like(arr)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    num_slices = arr.shape[0]
+    for i in range(num_slices):
+        pil_img = Image.fromarray(norm[i].astype(np.uint8), mode="L")
+        pil_img.save(output_dir / f"slice_{i:04d}.png")
+
+    return {
+        "shape": arr.shape,
+        "spacing": img.GetSpacing(),
+        "origin": img.GetOrigin(),
+        "direction": img.GetDirection(),
+        "min_val": vmin,
+        "max_val": vmax,
+        "num_slices": num_slices,
+    }
+
+
+def _png_slices_to_nifti(
+    png_dir: Path,
+    output_path: Path,
+    metadata: dict[str, Any],
+) -> None:
+    """Reassemble 2D PNG slices into a 3D NIfTI volume.
+
+    Output intensities are rescaled from ``[0, 255]`` back to the
+    original intensity range recorded in *metadata*.
+
+    Parameters
+    ----------
+    png_dir : Path
+        Directory containing the generated PNG slices.
+    output_path : Path
+        Destination NIfTI file path (e.g. ``patient_0001.nii.gz``).
+    metadata : dict
+        Metadata dict returned by :func:`_nifti_to_png_slices`.
+    """
+    try:
+        import SimpleITK as sitk
+    except ImportError:
+        raise ImportError("NIfTI I/O requires SimpleITK.")
+    try:
+        from PIL import Image
+    except ImportError:
+        raise ImportError("PNG I/O requires Pillow.")
+
+    png_files = sorted(png_dir.glob("*.png"))
+    if not png_files:
+        raise FileNotFoundError(
+            f"No PNG files found in {png_dir} — the model may not have "
+            "produced output images."
+        )
+
+    slices = []
+    for pf in png_files:
+        pil_img = Image.open(pf).convert("L")
+        slices.append(np.array(pil_img, dtype=np.float32))
+
+    arr = np.stack(slices, axis=0)  # [Z, Y, X]
+
+    # Rescale to original intensity range
+    vmin, vmax = metadata["min_val"], metadata["max_val"]
+    if vmax > vmin:
+        arr = arr / 255.0 * (vmax - vmin) + vmin
+
+    # Resize slices if spatial dimensions changed
+    orig = metadata["shape"]
+    if arr.shape[1:] != orig[1:]:
+        resized = []
+        for i in range(arr.shape[0]):
+            pil_tmp = Image.fromarray(arr[i])
+            pil_tmp = pil_tmp.resize(
+                (orig[2], orig[1]),  # PIL expects (width, height)
+                Image.BILINEAR,
+            )
+            resized.append(np.array(pil_tmp, dtype=np.float32))
+        arr = np.stack(resized, axis=0)
+
+    # Pad / truncate slice count to match original volume
+    if arr.shape[0] < orig[0]:
+        pad = np.full(
+            (orig[0] - arr.shape[0],) + arr.shape[1:],
+            vmin,
+            dtype=arr.dtype,
+        )
+        arr = np.concatenate([arr, pad], axis=0)
+    elif arr.shape[0] > orig[0]:
+        arr = arr[: orig[0]]
+
+    sitk_img = sitk.GetImageFromArray(arr)
+    sitk_img.SetSpacing(metadata["spacing"])
+    sitk_img.SetOrigin(metadata["origin"])
+    sitk_img.SetDirection(metadata["direction"])
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    sitk.WriteImage(sitk_img, str(output_path))
+
+
 def synthesize_with_medigan(
     input_dir: Path,
     output_dir: Path,
     model_id: str = MEDIGAN_MODEL_ID,
     phase: int = DEFAULT_PHASE_PRE,
     batch_size: int = 1,
+    gpu_id: str = "0",
+    image_size: int = 512,
 ) -> list[Path]:
     """Generate synthetic post-contrast images using medigan.
 
-    Loads pre-contrast images from *input_dir*, runs them through the
-    specified medigan model, and saves results to *output_dir*.
+    For each pre-contrast NIfTI volume found in *input_dir* the pipeline:
+
+    1. Slices the 3D volume into 2D axial PNG files (the format expected
+       by medigan model 23 / Pix2PixHD).
+    2. Calls ``medigan.Generators.generate()`` with the PNG directory.
+    3. Reassembles the generated 2D slices into a 3D NIfTI volume and
+       saves it to *output_dir*.
 
     Parameters
     ----------
@@ -108,11 +296,16 @@ def synthesize_with_medigan(
         MRI phase index of the **input** images (default: 0 = pre-contrast).
     batch_size : int
         Number of images to generate per batch.
+    gpu_id : str
+        CUDA device ID used by the synthesis model (``"0"`` by default,
+        ``"-1"`` to force CPU).
+    image_size : int
+        Spatial resolution expected by the model (default: 512).
 
     Returns
     -------
     list[Path]
-        Paths to the generated files.
+        Paths to the generated NIfTI files.
     """
     try:
         from medigan import Generators
@@ -122,13 +315,17 @@ def synthesize_with_medigan(
             "Install with: pip install 'mama-synth-eval[synthesis]'"
         )
 
+    # Ensure medigan can import its downloaded model packages
+    _ensure_medigan_importable()
+
     generators = Generators()
     output_dir.mkdir(parents=True, exist_ok=True)
 
     generated_files: list[Path] = []
 
     logger.info(
-        f"Running medigan synthesis (model={model_id}) on {input_dir}"
+        f"Running medigan synthesis (model={model_id}, "
+        f"gpu_id={gpu_id}, image_size={image_size}) on {input_dir}"
     )
 
     # Discover input images
@@ -143,18 +340,41 @@ def synthesize_with_medigan(
 
     for img_path in input_images:
         patient_id = _extract_patient_id(img_path)
-        out_path = output_dir / f"{patient_id}_0001.nii.gz"
+        out_nifti = output_dir / f"{patient_id}_0001.nii.gz"
 
         try:
-            # Use medigan's generate method
-            generators.generate(
-                model_id=model_id,
-                input_path=str(img_path),
-                output_path=str(out_path),
-                num_samples=1,
-            )
-            generated_files.append(out_path)
-            logger.debug(f"Generated: {out_path.name}")
+            with tempfile.TemporaryDirectory(
+                prefix="mamasynth_",
+            ) as tmpdir:
+                tmp = Path(tmpdir)
+                tmp_input = tmp / "input"
+                tmp_output = tmp / "output"
+                tmp_input.mkdir()
+                tmp_output.mkdir()
+
+                # 1. Slice NIfTI → 2D PNGs
+                slice_meta = _nifti_to_png_slices(img_path, tmp_input)
+                logger.debug(
+                    f"{patient_id}: {slice_meta['num_slices']} slices "
+                    f"extracted to {tmp_input}"
+                )
+
+                # 2. Run medigan synthesis
+                generators.generate(
+                    model_id=model_id,
+                    input_path=str(tmp_input),
+                    output_path=str(tmp_output),
+                    num_samples=1,
+                    save_images=True,
+                    image_size=str(image_size),
+                    gpu_id=str(gpu_id),
+                )
+
+                # 3. Reassemble output PNGs → 3D NIfTI
+                _png_slices_to_nifti(tmp_output, out_nifti, slice_meta)
+
+            generated_files.append(out_nifti)
+            logger.debug(f"Generated: {out_nifti.name}")
         except Exception as e:
             logger.warning(f"Synthesis failed for {patient_id}: {e}")
 
@@ -341,6 +561,21 @@ def parse_synthesize_args(
         help="Input MRI phase index (0 = pre-contrast). Default: 0.",
     )
     parser.add_argument(
+        "--gpu-id",
+        type=str,
+        default="0",
+        help=(
+            "CUDA device ID for the synthesis model. "
+            "Use '-1' for CPU. Default: 0."
+        ),
+    )
+    parser.add_argument(
+        "--image-size",
+        type=int,
+        default=512,
+        help="Spatial resolution for the model. Default: 512.",
+    )
+    parser.add_argument(
         "--verbose", "-v",
         action="store_true",
         help="Enable verbose (DEBUG level) logging.",
@@ -384,6 +619,8 @@ def synthesize_main(argv: Optional[list[str]] = None) -> None:
             output_dir=args.output_dir,
             model_id=args.model_id,
             phase=args.phase,
+            gpu_id=args.gpu_id,
+            image_size=args.image_size,
         )
         logger.info(f"Generated {len(generated)} synthetic images.")
     else:
@@ -470,6 +707,21 @@ def parse_synthesize_and_evaluate_args(
         type=int,
         default=DEFAULT_PHASE_PRE,
         help="Input MRI phase index. Default: 0 (pre-contrast).",
+    )
+    synth.add_argument(
+        "--gpu-id",
+        type=str,
+        default="0",
+        help=(
+            "CUDA device ID for the synthesis model. "
+            "Use '-1' for CPU. Default: 0."
+        ),
+    )
+    synth.add_argument(
+        "--image-size",
+        type=int,
+        default=512,
+        help="Spatial resolution for the model. Default: 512.",
     )
     synth.add_argument(
         "--skip-synthesis",
@@ -647,6 +899,8 @@ def synthesize_and_evaluate_main(
                 output_dir=args.output_dir,
                 model_id=args.model_id,
                 phase=args.phase,
+                gpu_id=args.gpu_id,
+                image_size=args.image_size,
             )
         else:
             logger.error(

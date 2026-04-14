@@ -818,9 +818,11 @@ mamasynth-synthesize-and-evaluate \
 | `--data-dir` | `None` | MAMA-MIA dataset root (auto-resolves images/GT paths) |
 | `--input-dir` | `None` | Directory with pre-contrast images (overrides `--data-dir`) |
 | `--output-dir` | `./synthesized_output` | Where to save generated images |
-| `--model` | `pix2pixhd` | Synthesis model name |
-| `--model-id` | `23` | medigan model ID |
+| `--model` | `medigan` | Synthesis model name |
+| `--model-id` | `00023_PIX2PIXHD_BREAST_DCEMRI` | medigan model ID |
 | `--phase` | `0` | DCE-MRI phase of input images (0=pre-contrast) |
+| `--gpu-id` | `0` | CUDA device ID for synthesis (`-1` for CPU) |
+| `--image-size` | `512` | Spatial resolution for the model |
 | `--predictions-dir` | `None` | Skip synthesis, evaluate existing predictions |
 | `--ground-truth-path` | `None` | Ground-truth directory for evaluation |
 | `--output-file` | `metrics.json` | Evaluation output JSON path |

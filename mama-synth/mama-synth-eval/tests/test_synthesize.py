@@ -3,8 +3,10 @@
 
 """Tests for the synthesis module (synthesize.py)."""
 
+import os
 import tempfile
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
@@ -255,3 +257,374 @@ class TestRunEvaluation:
         mock_cls.assert_called_once()
         mock_eval.evaluate.assert_called_once()
         assert "aggregates" in result
+
+
+# ---------------------------------------------------------------------------
+# _ensure_medigan_importable
+# ---------------------------------------------------------------------------
+
+
+class TestEnsureMediganImportable:
+    """Tests for _ensure_medigan_importable helper."""
+
+    def test_adds_cwd_to_sys_path(self):
+        from eval.synthesize import _ensure_medigan_importable
+
+        with tempfile.TemporaryDirectory() as tmp:
+            real_tmp = os.path.realpath(tmp)
+            original_cwd = os.getcwd()
+            original_path = list(sys.path)
+            try:
+                os.chdir(real_tmp)
+                # Remove it from sys.path if already there
+                sys.path = [p for p in sys.path if p != real_tmp]
+
+                _ensure_medigan_importable()
+
+                assert real_tmp in sys.path
+            finally:
+                os.chdir(original_cwd)
+                sys.path = original_path
+
+    def test_creates_models_init_py(self):
+        from eval.synthesize import _ensure_medigan_importable
+
+        with tempfile.TemporaryDirectory() as tmp:
+            original_cwd = os.getcwd()
+            original_path = list(sys.path)
+            try:
+                os.chdir(tmp)
+                _ensure_medigan_importable()
+
+                assert (Path(tmp) / "models" / "__init__.py").exists()
+            finally:
+                os.chdir(original_cwd)
+                sys.path = original_path
+
+    def test_idempotent(self):
+        from eval.synthesize import _ensure_medigan_importable
+
+        with tempfile.TemporaryDirectory() as tmp:
+            real_tmp = os.path.realpath(tmp)
+            original_cwd = os.getcwd()
+            original_path = list(sys.path)
+            try:
+                os.chdir(real_tmp)
+                _ensure_medigan_importable()
+                _ensure_medigan_importable()  # second call should not error
+
+                assert (Path(real_tmp) / "models" / "__init__.py").exists()
+                assert sys.path.count(real_tmp) == 1
+            finally:
+                os.chdir(original_cwd)
+                sys.path = original_path
+
+
+# ---------------------------------------------------------------------------
+# _nifti_to_png_slices / _png_slices_to_nifti roundtrip
+# ---------------------------------------------------------------------------
+
+# Import sys at module level for the path cleanup in tests
+import sys
+
+
+def _make_test_nifti(path: Path, shape: tuple = (4, 8, 8)) -> np.ndarray:
+    """Create a small NIfTI file and return the underlying array."""
+    import SimpleITK as sitk
+
+    arr = np.random.RandomState(42).rand(*shape).astype(np.float32) * 1000
+    img = sitk.GetImageFromArray(arr)
+    img.SetSpacing((1.0, 1.0, 1.0))
+    img.SetOrigin((0.0, 0.0, 0.0))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    sitk.WriteImage(img, str(path))
+    return arr
+
+
+class TestNiftiPngRoundtrip:
+    """Tests for _nifti_to_png_slices and _png_slices_to_nifti."""
+
+    @pytest.fixture(autouse=True)
+    def _check_sitk(self):
+        pytest.importorskip("SimpleITK")
+        pytest.importorskip("PIL")
+
+    def test_roundtrip_preserves_shape(self):
+        from eval.synthesize import _nifti_to_png_slices, _png_slices_to_nifti
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            nifti_path = tmp / "test.nii.gz"
+            png_dir = tmp / "slices"
+            out_path = tmp / "roundtrip.nii.gz"
+
+            original = _make_test_nifti(nifti_path, shape=(4, 16, 16))
+            meta = _nifti_to_png_slices(nifti_path, png_dir)
+
+            assert meta["num_slices"] == 4
+            assert meta["shape"] == (4, 16, 16)
+            assert len(list(png_dir.glob("*.png"))) == 4
+
+            _png_slices_to_nifti(png_dir, out_path, meta)
+
+            import SimpleITK as sitk
+
+            result = sitk.GetArrayFromImage(
+                sitk.ReadImage(str(out_path))
+            )
+            assert result.shape == original.shape
+
+    def test_roundtrip_preserves_intensity_range(self):
+        from eval.synthesize import _nifti_to_png_slices, _png_slices_to_nifti
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            nifti_path = tmp / "test.nii.gz"
+            png_dir = tmp / "slices"
+            out_path = tmp / "roundtrip.nii.gz"
+
+            original = _make_test_nifti(nifti_path, shape=(3, 10, 10))
+            meta = _nifti_to_png_slices(nifti_path, png_dir)
+            _png_slices_to_nifti(png_dir, out_path, meta)
+
+            import SimpleITK as sitk
+
+            result = sitk.GetArrayFromImage(
+                sitk.ReadImage(str(out_path))
+            ).astype(np.float32)
+
+            # Intensity range should be approximately preserved
+            # (quantisation to uint8 introduces some error)
+            assert abs(result.min() - original.min()) < (
+                original.max() - original.min()
+            ) * 0.05
+            assert abs(result.max() - original.max()) < (
+                original.max() - original.min()
+            ) * 0.05
+
+    def test_roundtrip_preserves_spacing(self):
+        from eval.synthesize import _nifti_to_png_slices, _png_slices_to_nifti
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            nifti_path = tmp / "test.nii.gz"
+            png_dir = tmp / "slices"
+            out_path = tmp / "roundtrip.nii.gz"
+
+            _make_test_nifti(nifti_path)
+            meta = _nifti_to_png_slices(nifti_path, png_dir)
+            _png_slices_to_nifti(png_dir, out_path, meta)
+
+            import SimpleITK as sitk
+
+            result_img = sitk.ReadImage(str(out_path))
+            assert result_img.GetSpacing() == pytest.approx((1.0, 1.0, 1.0))
+
+    def test_nifti_to_png_invalid_dim_raises(self):
+        from eval.synthesize import _nifti_to_png_slices
+
+        import SimpleITK as sitk
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            nifti_path = tmp / "flat.nii.gz"
+            arr = np.zeros((8, 8), dtype=np.float32)
+            img = sitk.GetImageFromArray(arr)
+            sitk.WriteImage(img, str(nifti_path))
+
+            with pytest.raises(ValueError, match="Expected 3D or 4D"):
+                _nifti_to_png_slices(nifti_path, tmp / "out")
+
+    def test_png_to_nifti_empty_dir_raises(self):
+        from eval.synthesize import _png_slices_to_nifti
+
+        with tempfile.TemporaryDirectory() as tmp:
+            empty = Path(tmp) / "empty"
+            empty.mkdir()
+            with pytest.raises(FileNotFoundError, match="No PNG files"):
+                _png_slices_to_nifti(
+                    empty,
+                    Path(tmp) / "out.nii.gz",
+                    {"shape": (1, 8, 8), "min_val": 0, "max_val": 1,
+                     "spacing": (1, 1, 1), "origin": (0, 0, 0),
+                     "direction": (1, 0, 0, 0, 1, 0, 0, 0, 1)},
+                )
+
+
+# ---------------------------------------------------------------------------
+# synthesize_with_medigan (mocked medigan)
+# ---------------------------------------------------------------------------
+
+
+class TestSynthesizeWithMedigan:
+    """Tests for the synthesize_with_medigan pipeline (medigan is mocked)."""
+
+    @pytest.fixture(autouse=True)
+    def _check_sitk(self):
+        pytest.importorskip("SimpleITK")
+        pytest.importorskip("PIL")
+
+    def test_calls_medigan_with_png_dirs(self):
+        """synthesize_with_medigan should pass temporary PNG directories
+        to generators.generate(), not raw NIfTI paths."""
+        from eval.synthesize import synthesize_with_medigan
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(os.path.realpath(tmp))
+            input_dir = tmp / "input" / "P001"
+            input_dir.mkdir(parents=True)
+            output_dir = tmp / "output"
+
+            _make_test_nifti(
+                input_dir / "P001_0000.nii.gz", shape=(3, 8, 8)
+            )
+
+            mock_gen_instance = MagicMock()
+
+            # Make generate() side-effect: copy input PNGs to output dir
+            # to simulate the model producing output
+            def fake_generate(**kwargs):
+                in_dir = Path(kwargs["input_path"])
+                out_dir = Path(kwargs["output_path"])
+                out_dir.mkdir(parents=True, exist_ok=True)
+                import shutil
+                for png in sorted(in_dir.glob("*.png")):
+                    shutil.copy(png, out_dir / png.name)
+
+            mock_gen_instance.generate.side_effect = fake_generate
+
+            # Build a fake medigan module with a Generators class
+            mock_medigan = MagicMock()
+            mock_medigan.Generators.return_value = mock_gen_instance
+
+            original_cwd = os.getcwd()
+            original_path = list(sys.path)
+            try:
+                os.chdir(tmp)
+                with patch.dict(
+                    "sys.modules",
+                    {"medigan": mock_medigan},
+                ):
+                    with patch(
+                        "eval.synthesize._ensure_medigan_importable"
+                    ):
+                        result = synthesize_with_medigan(
+                            input_dir=tmp / "input",
+                            output_dir=output_dir,
+                            gpu_id="-1",
+                            image_size=256,
+                        )
+            finally:
+                os.chdir(original_cwd)
+                sys.path = original_path
+
+            # Verify generate was called with directory paths (not NIfTI)
+            call_kwargs = mock_gen_instance.generate.call_args
+            assert call_kwargs is not None
+            kw = call_kwargs.kwargs if call_kwargs.kwargs else call_kwargs[1]
+            assert not kw["input_path"].endswith(".nii.gz")
+            assert kw["image_size"] == "256"
+            assert kw["gpu_id"] == "-1"
+
+            # Output NIfTI should have been written
+            assert len(result) == 1
+            assert result[0].exists()
+
+    def test_no_input_images_raises(self):
+        """Should raise FileNotFoundError when input dir is empty."""
+        from eval.synthesize import synthesize_with_medigan
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(os.path.realpath(tmp))
+            (tmp / "input").mkdir()
+
+            mock_medigan = MagicMock()
+
+            original_cwd = os.getcwd()
+            original_path = list(sys.path)
+            try:
+                os.chdir(tmp)
+                with patch.dict(
+                    "sys.modules",
+                    {"medigan": mock_medigan},
+                ):
+                    with patch(
+                        "eval.synthesize._ensure_medigan_importable"
+                    ):
+                        with pytest.raises(FileNotFoundError, match="No pre-contrast"):
+                            synthesize_with_medigan(
+                                input_dir=tmp / "input",
+                                output_dir=tmp / "output",
+                            )
+            finally:
+                os.chdir(original_cwd)
+                sys.path = original_path
+
+
+# ---------------------------------------------------------------------------
+# CLI argument parsing — new options
+# ---------------------------------------------------------------------------
+
+
+class TestNewCLIOptions:
+    """Tests for --gpu-id and --image-size CLI options."""
+
+    def test_synthesize_gpu_id_default(self):
+        from eval.synthesize import parse_synthesize_args
+
+        args = parse_synthesize_args([
+            "--data-dir", "/data",
+            "--output-dir", "/out",
+        ])
+        assert args.gpu_id == "0"
+
+    def test_synthesize_gpu_id_custom(self):
+        from eval.synthesize import parse_synthesize_args
+
+        args = parse_synthesize_args([
+            "--data-dir", "/data",
+            "--output-dir", "/out",
+            "--gpu-id", "-1",
+        ])
+        assert args.gpu_id == "-1"
+
+    def test_synthesize_image_size_default(self):
+        from eval.synthesize import parse_synthesize_args
+
+        args = parse_synthesize_args([
+            "--data-dir", "/data",
+            "--output-dir", "/out",
+        ])
+        assert args.image_size == 512
+
+    def test_synthesize_image_size_custom(self):
+        from eval.synthesize import parse_synthesize_args
+
+        args = parse_synthesize_args([
+            "--data-dir", "/data",
+            "--output-dir", "/out",
+            "--image-size", "256",
+        ])
+        assert args.image_size == 256
+
+    def test_synth_and_eval_gpu_id(self):
+        from eval.synthesize import parse_synthesize_and_evaluate_args
+
+        args = parse_synthesize_and_evaluate_args([
+            "--predictions-dir", "/preds",
+            "--ground-truth-path", "/gt",
+            "--output-file", "m.json",
+            "--gpu-id", "2",
+        ])
+        assert args.gpu_id == "2"
+
+    def test_synth_and_eval_image_size(self):
+        from eval.synthesize import parse_synthesize_and_evaluate_args
+
+        args = parse_synthesize_and_evaluate_args([
+            "--predictions-dir", "/preds",
+            "--ground-truth-path", "/gt",
+            "--output-file", "m.json",
+            "--image-size", "1024",
+        ])
+        assert args.image_size == 1024
