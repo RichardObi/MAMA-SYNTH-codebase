@@ -441,7 +441,7 @@ class TestNiftiPngRoundtrip:
         with tempfile.TemporaryDirectory() as tmp:
             empty = Path(tmp) / "empty"
             empty.mkdir()
-            with pytest.raises(FileNotFoundError, match="No PNG files"):
+            with pytest.raises(FileNotFoundError, match="No image files"):
                 _png_slices_to_nifti(
                     empty,
                     Path(tmp) / "out.nii.gz",
@@ -477,6 +477,76 @@ class TestNiftiPngRoundtrip:
             import SimpleITK as sitk
             result = sitk.GetArrayFromImage(sitk.ReadImage(str(out_path)))
             assert result.shape == (3, 8, 8)
+
+
+# ---------------------------------------------------------------------------
+# _find_generated_images
+# ---------------------------------------------------------------------------
+
+
+class TestFindGeneratedImages:
+    """Tests for _find_generated_images helper."""
+
+    def test_root_has_pngs(self):
+        from eval.synthesize import _find_generated_images
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "a.png").touch()
+            (root / "b.png").touch()
+            result = _find_generated_images(root)
+            assert len(result) == 2
+            assert all(p.suffix == ".png" for p in result)
+
+    def test_finds_in_subdirectory(self):
+        from eval.synthesize import _find_generated_images
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sub = root / "batch_0"
+            sub.mkdir()
+            (sub / "out.png").touch()
+            result = _find_generated_images(root)
+            assert len(result) == 1
+
+    def test_multiple_image_formats(self):
+        from eval.synthesize import _find_generated_images
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for ext in (".png", ".jpg", ".jpeg", ".tiff", ".bmp"):
+                (root / f"img{ext}").touch()
+            result = _find_generated_images(root)
+            assert len(result) == 5
+
+    def test_ignores_non_image_files(self):
+        from eval.synthesize import _find_generated_images
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "readme.txt").touch()
+            (root / "data.csv").touch()
+            (root / "image.png").touch()
+            result = _find_generated_images(root)
+            assert len(result) == 1
+            assert result[0].name == "image.png"
+
+    def test_sorted_output(self):
+        from eval.synthesize import _find_generated_images
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for name in ("c.png", "a.png", "b.png"):
+                (root / name).touch()
+            result = _find_generated_images(root)
+            assert [p.name for p in result] == ["a.png", "b.png", "c.png"]
+
+    def test_empty_dir_raises(self):
+        from eval.synthesize import _find_generated_images
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with pytest.raises(FileNotFoundError, match="No image files"):
+                _find_generated_images(Path(tmp))
 
 
 # ---------------------------------------------------------------------------
@@ -700,6 +770,165 @@ class TestNewCLIOptions:
             "--image-size", "1024",
         ])
         assert args.image_size == 1024
+
+    def test_synthesize_keep_work_dir_default(self):
+        from eval.synthesize import parse_synthesize_args
+
+        args = parse_synthesize_args([
+            "--data-dir", "/data",
+            "--output-dir", "/out",
+        ])
+        assert args.keep_work_dir is False
+
+    def test_synthesize_keep_work_dir_flag(self):
+        from eval.synthesize import parse_synthesize_args
+
+        args = parse_synthesize_args([
+            "--data-dir", "/data",
+            "--output-dir", "/out",
+            "--keep-work-dir",
+        ])
+        assert args.keep_work_dir is True
+
+    def test_synth_and_eval_keep_work_dir_default(self):
+        from eval.synthesize import parse_synthesize_and_evaluate_args
+
+        args = parse_synthesize_and_evaluate_args([
+            "--predictions-dir", "/preds",
+            "--ground-truth-path", "/gt",
+            "--output-file", "m.json",
+        ])
+        assert args.keep_work_dir is False
+
+    def test_synth_and_eval_keep_work_dir_flag(self):
+        from eval.synthesize import parse_synthesize_and_evaluate_args
+
+        args = parse_synthesize_and_evaluate_args([
+            "--predictions-dir", "/preds",
+            "--ground-truth-path", "/gt",
+            "--output-file", "m.json",
+            "--keep-work-dir",
+        ])
+        assert args.keep_work_dir is True
+
+
+# ---------------------------------------------------------------------------
+# Staging directory behaviour (synthesize_with_medigan)
+# ---------------------------------------------------------------------------
+
+
+class TestStagingDirectoryBehaviour:
+    """Tests that synthesize_with_medigan uses in-project staging dirs."""
+
+    @pytest.fixture(autouse=True)
+    def _check_sitk(self):
+        pytest.importorskip("SimpleITK")
+        pytest.importorskip("PIL")
+
+    def _run_synthesis(self, tmp, *, keep_work_dir=False, fail=False):
+        """Helper: run synthesize_with_medigan with mocked medigan."""
+        from eval.synthesize import synthesize_with_medigan, WORK_SUBDIR
+
+        input_dir = tmp / "input" / "P001"
+        input_dir.mkdir(parents=True)
+        output_dir = tmp / "output"
+
+        _make_test_nifti(
+            input_dir / "P001_0000.nii.gz", shape=(3, 8, 8)
+        )
+
+        mock_gen_instance = MagicMock()
+
+        def fake_generate(**kwargs):
+            if fail:
+                raise RuntimeError("Simulated medigan failure")
+            in_dir = Path(kwargs["input_path"])
+            out_dir = Path(kwargs["output_path"]) / "batch_0"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            import shutil as _shutil
+            for png in sorted(in_dir.glob("*.png")):
+                _shutil.copy(png, out_dir / png.name)
+
+        mock_gen_instance.generate.side_effect = fake_generate
+
+        mock_medigan = MagicMock()
+        mock_medigan.Generators.return_value = mock_gen_instance
+
+        original_cwd = os.getcwd()
+        original_path = list(sys.path)
+        try:
+            os.chdir(tmp)
+            with patch.dict("sys.modules", {"medigan": mock_medigan}):
+                with patch("eval.synthesize._ensure_medigan_importable"):
+                    result = synthesize_with_medigan(
+                        input_dir=tmp / "input",
+                        output_dir=output_dir,
+                        gpu_id="-1",
+                        image_size=256,
+                        keep_work_dir=keep_work_dir,
+                    )
+        finally:
+            os.chdir(original_cwd)
+            sys.path = original_path
+
+        return result, output_dir, output_dir / WORK_SUBDIR
+
+    def test_staging_dir_inside_output_dir(self):
+        """Staging directory should be created inside output_dir."""
+        from eval.synthesize import WORK_SUBDIR
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(os.path.realpath(tmp))
+            result, output_dir, work_root = self._run_synthesis(
+                tmp, keep_work_dir=True
+            )
+
+            # Work dir exists inside output_dir
+            assert work_root.parent == output_dir
+            assert work_root.name == WORK_SUBDIR
+            assert work_root.exists()
+
+    def test_work_dir_cleaned_on_success(self):
+        """Staging dirs should be removed after successful synthesis."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(os.path.realpath(tmp))
+            result, output_dir, work_root = self._run_synthesis(tmp)
+
+            # Work dir should be removed (or at least empty)
+            assert not work_root.exists() or not list(work_root.iterdir())
+            # But output NIfTI should exist
+            assert len(result) == 1
+            assert result[0].exists()
+
+    def test_keep_work_dir_preserves_staging(self):
+        """With keep_work_dir=True, staging dirs should persist."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(os.path.realpath(tmp))
+            result, output_dir, work_root = self._run_synthesis(
+                tmp, keep_work_dir=True
+            )
+
+            assert work_root.exists()
+            # Patient dir should still be there
+            patient_dirs = list(work_root.iterdir())
+            assert len(patient_dirs) == 1
+            assert patient_dirs[0].name == "P001"
+
+    def test_work_dir_retained_on_failure(self):
+        """On synthesis failure, staging dirs should be kept for debugging."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(os.path.realpath(tmp))
+            result, output_dir, work_root = self._run_synthesis(
+                tmp, fail=True
+            )
+
+            # Should have 0 successful results
+            assert len(result) == 0
+            # But work dir should still exist with patient subdirectory
+            assert work_root.exists()
+            patient_dirs = list(work_root.iterdir())
+            assert len(patient_dirs) == 1
+            assert patient_dirs[0].name == "P001"
 
 
 # ---------------------------------------------------------------------------

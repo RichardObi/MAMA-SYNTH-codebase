@@ -57,8 +57,8 @@ Usage examples::
 import argparse
 import logging
 import os
+import shutil
 import sys
-import tempfile
 from pathlib import Path
 from typing import Any, Optional
 
@@ -79,6 +79,11 @@ IMAGES_SUBDIR = "images"
 SEGMENTATIONS_SUBDIR = "segmentations"
 DEFAULT_PHASE_PRE = 0   # pre-contrast
 DEFAULT_PHASE_POST = 1  # first post-contrast
+
+# Staging sub-directory placed *inside* output_dir so that intermediate
+# PNG slices live on the same filesystem as the final NIfTI outputs and
+# survive failures for debugging.
+WORK_SUBDIR = ".synthesis_work"
 
 
 # ---------------------------------------------------------------------------
@@ -220,6 +225,42 @@ def _nifti_to_png_slices(
     }
 
 
+def _find_generated_images(root: Path) -> list[Path]:
+    """Collect all generated image files under *root*, recursively.
+
+    medigan may save output images in a subdirectory of the provided
+    ``output_path`` (e.g. ``output/batch_0/``) and may use different
+    extensions depending on the model.  This helper walks *root* and
+    collects every file whose suffix matches a common image format.
+
+    The returned list is **sorted** so that reassembly order is
+    deterministic (critical for correct slice ordering).
+
+    Raises
+    ------
+    FileNotFoundError
+        If no image files are found anywhere under *root*.
+    """
+    IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
+    images = sorted(
+        p for p in root.rglob("*")
+        if p.is_file() and p.suffix.lower() in IMAGE_SUFFIXES
+    )
+    if not images:
+        # List actual contents for debugging
+        all_files = list(root.rglob("*"))
+        logger.error(
+            f"No image files found under {root}. "
+            f"Directory contains {len(all_files)} entries: "
+            f"{[str(f.relative_to(root)) for f in all_files[:20]]}"
+        )
+        raise FileNotFoundError(
+            f"No image files found in {root} or any of its "
+            "subdirectories — the model may not have produced output."
+        )
+    return images
+
+
 def _find_png_output_dir(root: Path) -> Path:
     """Locate the directory that actually contains generated PNGs.
 
@@ -262,10 +303,10 @@ def _png_slices_to_nifti(
     Parameters
     ----------
     png_dir : Path
-        Root directory containing the generated PNG slices.  If the
-        model saved images in a subdirectory (e.g. ``batch_0/``), this
-        function searches recursively for the first directory that
-        actually contains PNG files.
+        Root directory containing the generated image slices.  The
+        function searches recursively for image files (PNG, JPEG, TIFF,
+        BMP) — medigan may place them in a subdirectory such as
+        ``batch_0/`` or rename them with a ``batch_N_`` prefix.
     output_path : Path
         Destination NIfTI file path (e.g. ``patient_0001.nii.gz``).
     metadata : dict
@@ -280,20 +321,12 @@ def _png_slices_to_nifti(
     except ImportError:
         raise ImportError("PNG I/O requires Pillow.")
 
-    png_files = sorted(png_dir.glob("*.png"))
-    if not png_files:
-        # medigan may save in a subdirectory (e.g. output/batch_0/)
-        try:
-            actual_dir = _find_png_output_dir(png_dir)
-        except FileNotFoundError:
-            raise FileNotFoundError(
-                f"No PNG files found in {png_dir} or its subdirectories "
-                "— the model may not have produced output images."
-            )
-        png_files = sorted(actual_dir.glob("*.png"))
+    # Find all image files medigan produced (may be in subdirectories
+    # and/or renamed with a batch_N_ prefix).
+    image_files = _find_generated_images(png_dir)
 
     slices = []
-    for pf in png_files:
+    for pf in image_files:
         pil_img = Image.open(pf).convert("L")
         slices.append(np.array(pil_img, dtype=np.float32))
 
@@ -345,6 +378,7 @@ def synthesize_with_medigan(
     batch_size: int = 1,
     gpu_id: str = "0",
     image_size: int = 512,
+    keep_work_dir: bool = False,
 ) -> list[Path]:
     """Generate synthetic post-contrast images using medigan.
 
@@ -355,6 +389,13 @@ def synthesize_with_medigan(
     2. Calls ``medigan.Generators.generate()`` with the PNG directory.
     3. Reassembles the generated 2D slices into a 3D NIfTI volume and
        saves it to *output_dir*.
+
+    Intermediate files (input/output PNG slices) are stored in a
+    staging directory ``<output_dir>/.synthesis_work/<patient_id>/``
+    so they live on the **same filesystem** as the final outputs.
+    On success the staging directory is removed (unless
+    *keep_work_dir* is ``True``).  On failure it is **kept** so that
+    users can inspect intermediate state for debugging.
 
     Parameters
     ----------
@@ -377,6 +418,9 @@ def synthesize_with_medigan(
         forwarded to medigan.
     image_size : int
         Spatial resolution expected by the model (default: 512).
+    keep_work_dir : bool
+        If ``True`` the per-patient staging directories are never
+        deleted, even after a successful run.  Useful for debugging.
 
     Returns
     -------
@@ -400,12 +444,17 @@ def synthesize_with_medigan(
     generators = Generators()
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Staging area inside output_dir — same filesystem, survives failures
+    work_root = output_dir / WORK_SUBDIR
+    work_root.mkdir(exist_ok=True)
+
     generated_files: list[Path] = []
 
     logger.info(
         f"Running medigan synthesis (model={model_id}, "
         f"gpu_id={device_str}, image_size={image_size}) on {input_dir}"
     )
+    logger.info(f"Staging directory: {work_root}")
 
     # Discover input images
     input_images = _discover_input_images(input_dir, phase=phase)
@@ -420,42 +469,70 @@ def synthesize_with_medigan(
     for img_path in input_images:
         patient_id = _extract_patient_id(img_path)
         out_nifti = output_dir / f"{patient_id}_0001.nii.gz"
+        patient_work = work_root / patient_id
+        work_input = patient_work / "input_slices"
+        work_output = patient_work / "output_slices"
 
         try:
-            with tempfile.TemporaryDirectory(
-                prefix="mamasynth_",
-            ) as tmpdir:
-                tmp = Path(tmpdir)
-                tmp_input = tmp / "input"
-                tmp_output = tmp / "output"
-                tmp_input.mkdir()
-                tmp_output.mkdir()
+            # Prepare fresh per-patient staging dirs
+            if patient_work.exists():
+                shutil.rmtree(patient_work)
+            work_input.mkdir(parents=True)
+            work_output.mkdir(parents=True)
 
-                # 1. Slice NIfTI → 2D PNGs
-                slice_meta = _nifti_to_png_slices(img_path, tmp_input)
-                logger.debug(
-                    f"{patient_id}: {slice_meta['num_slices']} slices "
-                    f"extracted to {tmp_input}"
-                )
+            # 1. Slice NIfTI → 2D PNGs
+            slice_meta = _nifti_to_png_slices(img_path, work_input)
+            logger.debug(
+                f"{patient_id}: {slice_meta['num_slices']} slices "
+                f"extracted to {work_input}"
+            )
 
-                # 2. Run medigan synthesis
-                generators.generate(
-                    model_id=model_id,
-                    input_path=str(tmp_input),
-                    output_path=str(tmp_output),
-                    num_samples=1,
-                    save_images=True,
-                    image_size=str(image_size),
-                    gpu_id=device_str,
-                )
+            # 2. Run medigan synthesis
+            generators.generate(
+                model_id=model_id,
+                input_path=str(work_input),
+                output_path=str(work_output),
+                num_samples=1,
+                save_images=True,
+                image_size=str(image_size),
+                gpu_id=device_str,
+            )
 
-                # 3. Reassemble output PNGs → 3D NIfTI
-                _png_slices_to_nifti(tmp_output, out_nifti, slice_meta)
+            # Log what medigan actually produced (helpful for debugging)
+            produced = list(work_output.rglob("*"))
+            produced_files = [p for p in produced if p.is_file()]
+            logger.debug(
+                f"{patient_id}: medigan produced {len(produced_files)} "
+                f"file(s) under {work_output}: "
+                f"{[str(p.relative_to(work_output)) for p in produced_files[:10]]}"
+            )
+
+            # 3. Reassemble output images → 3D NIfTI
+            _png_slices_to_nifti(work_output, out_nifti, slice_meta)
 
             generated_files.append(out_nifti)
             logger.debug(f"Generated: {out_nifti.name}")
+
+            # Clean up staging dir on success (unless user wants to keep it)
+            if not keep_work_dir:
+                shutil.rmtree(patient_work, ignore_errors=True)
+
         except Exception as e:
-            logger.warning(f"Synthesis failed for {patient_id}: {e}")
+            logger.warning(
+                f"Synthesis failed for {patient_id}: {e}  "
+                f"(intermediate files kept in {patient_work})"
+            )
+
+    # Remove the work root if empty and we're not keeping it
+    if not keep_work_dir:
+        try:
+            work_root.rmdir()  # only succeeds if empty (all patients OK)
+        except OSError:
+            remaining = list(work_root.iterdir())
+            logger.info(
+                f"Staging directory retained ({len(remaining)} failed "
+                f"patient(s)): {work_root}"
+            )
 
     logger.info(
         f"Synthesis complete: {len(generated_files)}/{len(input_images)} "
@@ -657,6 +734,15 @@ def parse_synthesize_args(
         help="Spatial resolution for the model. Default: 512.",
     )
     parser.add_argument(
+        "--keep-work-dir",
+        action="store_true",
+        help=(
+            "Keep the intermediate slice directories inside "
+            "<output-dir>/.synthesis_work/ after successful synthesis "
+            "(always kept on failure for debugging)."
+        ),
+    )
+    parser.add_argument(
         "--verbose", "-v",
         action="store_true",
         help="Enable verbose (DEBUG level) logging.",
@@ -702,6 +788,7 @@ def synthesize_main(argv: Optional[list[str]] = None) -> None:
             phase=args.phase,
             gpu_id=args.gpu_id,
             image_size=args.image_size,
+            keep_work_dir=args.keep_work_dir,
         )
         logger.info(f"Generated {len(generated)} synthetic images.")
     else:
@@ -805,6 +892,15 @@ def parse_synthesize_and_evaluate_args(
         type=int,
         default=512,
         help="Spatial resolution for the model. Default: 512.",
+    )
+    synth.add_argument(
+        "--keep-work-dir",
+        action="store_true",
+        help=(
+            "Keep intermediate slice directories inside "
+            "<output-dir>/.synthesis_work/ after synthesis "
+            "(always kept on failure for debugging)."
+        ),
     )
     synth.add_argument(
         "--skip-synthesis",
@@ -984,19 +1080,8 @@ def synthesize_and_evaluate_main(
                 phase=args.phase,
                 gpu_id=args.gpu_id,
                 image_size=args.image_size,
+                keep_work_dir=args.keep_work_dir,
             )
-        else:
-            logger.error(
-                f"Unknown model '{args.model}'. "
-                "For custom models, use --predictions-dir with pre-generated "
-                "images."
-            )
-            sys.exit(1)
-    else:
-        logger.info(
-            f"\n--- Skipping synthesis — "
-            f"using predictions from {args.predictions_dir} ---"
-        )
 
     # --- Step 2: Evaluation -----------------------------------------------
     logger.info("\n--- Step 2: Evaluation ---")

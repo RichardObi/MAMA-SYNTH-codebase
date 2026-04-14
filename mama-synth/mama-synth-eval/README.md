@@ -823,6 +823,7 @@ mamasynth-synthesize-and-evaluate \
 | `--phase` | `0` | DCE-MRI phase of input images (0=pre-contrast) |
 | `--gpu-id` | `0` | GPU device — bare int (`0`→`cuda:0`, `-1`→CPU) or full string (`cuda:0`, `cpu`) |
 | `--image-size` | `512` | Spatial resolution for the model |
+| `--keep-work-dir` | `false` | Keep intermediate staging directories (PNG slices) for debugging |
 | `--predictions-dir` | `None` | Skip synthesis, evaluate existing predictions |
 | `--ground-truth-path` | `None` | Ground-truth directory for evaluation |
 | `--output-file` | `metrics.json` | Evaluation output JSON path |
