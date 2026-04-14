@@ -524,7 +524,7 @@ class TestSynthesizeWithMedigan:
             kw = call_kwargs.kwargs if call_kwargs.kwargs else call_kwargs[1]
             assert not kw["input_path"].endswith(".nii.gz")
             assert kw["image_size"] == "256"
-            assert kw["gpu_id"] == "-1"
+            assert kw["gpu_id"] == "cpu"
 
             # Output NIfTI should have been written
             assert len(result) == 1
@@ -628,3 +628,44 @@ class TestNewCLIOptions:
             "--image-size", "1024",
         ])
         assert args.image_size == 1024
+
+
+# ---------------------------------------------------------------------------
+# _normalize_gpu_id
+# ---------------------------------------------------------------------------
+
+
+class TestNormalizeGpuId:
+    """Tests for _normalize_gpu_id helper."""
+
+    def test_bare_zero(self):
+        from eval.synthesize import _normalize_gpu_id
+        assert _normalize_gpu_id("0") == "cuda:0"
+
+    def test_bare_one(self):
+        from eval.synthesize import _normalize_gpu_id
+        assert _normalize_gpu_id("1") == "cuda:1"
+
+    def test_negative_one_is_cpu(self):
+        from eval.synthesize import _normalize_gpu_id
+        assert _normalize_gpu_id("-1") == "cpu"
+
+    def test_cpu_string_passthrough(self):
+        from eval.synthesize import _normalize_gpu_id
+        assert _normalize_gpu_id("cpu") == "cpu"
+
+    def test_cuda_string_passthrough(self):
+        from eval.synthesize import _normalize_gpu_id
+        assert _normalize_gpu_id("cuda") == "cuda"
+
+    def test_cuda_colon_passthrough(self):
+        from eval.synthesize import _normalize_gpu_id
+        assert _normalize_gpu_id("cuda:0") == "cuda:0"
+
+    def test_cuda_colon_1_passthrough(self):
+        from eval.synthesize import _normalize_gpu_id
+        assert _normalize_gpu_id("cuda:1") == "cuda:1"
+
+    def test_whitespace_stripped(self):
+        from eval.synthesize import _normalize_gpu_id
+        assert _normalize_gpu_id("  0  ") == "cuda:0"

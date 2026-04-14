@@ -821,7 +821,7 @@ mamasynth-synthesize-and-evaluate \
 | `--model` | `medigan` | Synthesis model name |
 | `--model-id` | `00023_PIX2PIXHD_BREAST_DCEMRI` | medigan model ID |
 | `--phase` | `0` | DCE-MRI phase of input images (0=pre-contrast) |
-| `--gpu-id` | `0` | CUDA device ID for synthesis (`-1` for CPU) |
+| `--gpu-id` | `0` | GPU device — bare int (`0`→`cuda:0`, `-1`→CPU) or full string (`cuda:0`, `cpu`) |
 | `--image-size` | `512` | Spatial resolution for the model |
 | `--predictions-dir` | `None` | Skip synthesis, evaluate existing predictions |
 | `--ground-truth-path` | `None` | Ground-truth directory for evaluation |

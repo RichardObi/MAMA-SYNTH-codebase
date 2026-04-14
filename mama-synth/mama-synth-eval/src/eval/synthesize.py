@@ -86,6 +86,42 @@ DEFAULT_PHASE_POST = 1  # first post-contrast
 # ---------------------------------------------------------------------------
 
 
+def _normalize_gpu_id(gpu_id: str) -> str:
+    """Convert a CLI-style GPU identifier to a valid PyTorch device string.
+
+    medigan model 23 passes the ``gpu_id`` value directly to
+    ``torch.device()``, which requires strings like ``"cuda:0"`` or
+    ``"cpu"`` — bare integers such as ``"0"`` are rejected with
+    *"Invalid device string"*.
+
+    Conversion rules:
+
+    * ``"-1"``  → ``"cpu"``
+    * ``"cpu"`` → ``"cpu"``  (already valid)
+    * ``"0"``   → ``"cuda:0"``
+    * ``"1"``   → ``"cuda:1"``
+    * ``"cuda:0"`` / ``"cuda:1"`` → returned as-is
+    """
+    gpu_id = gpu_id.strip()
+
+    # Already a valid full device string
+    if gpu_id in ("cpu", "cuda"):
+        return gpu_id
+    if gpu_id.startswith("cuda:"):
+        return gpu_id
+
+    # Bare integer
+    try:
+        idx = int(gpu_id)
+    except ValueError:
+        # Unknown format — return as-is and let PyTorch raise if invalid
+        return gpu_id
+
+    if idx < 0:
+        return "cpu"
+    return f"cuda:{idx}"
+
+
 def _ensure_medigan_importable() -> None:
     """Add CWD to ``sys.path`` so medigan model imports succeed.
 
@@ -297,8 +333,11 @@ def synthesize_with_medigan(
     batch_size : int
         Number of images to generate per batch.
     gpu_id : str
-        CUDA device ID used by the synthesis model (``"0"`` by default,
-        ``"-1"`` to force CPU).
+        GPU identifier.  Accepts bare integers (``"0"``, ``"1"``,
+        ``"-1"`` for CPU) or full PyTorch device strings
+        (``"cuda:0"``, ``"cpu"``).  Bare integers are normalised to
+        ``"cuda:<N>"`` (or ``"cpu"`` when negative) before being
+        forwarded to medigan.
     image_size : int
         Spatial resolution expected by the model (default: 512).
 
@@ -318,6 +357,9 @@ def synthesize_with_medigan(
     # Ensure medigan can import its downloaded model packages
     _ensure_medigan_importable()
 
+    # Normalise gpu_id to a valid PyTorch device string
+    device_str = _normalize_gpu_id(gpu_id)
+
     generators = Generators()
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -325,7 +367,7 @@ def synthesize_with_medigan(
 
     logger.info(
         f"Running medigan synthesis (model={model_id}, "
-        f"gpu_id={gpu_id}, image_size={image_size}) on {input_dir}"
+        f"gpu_id={device_str}, image_size={image_size}) on {input_dir}"
     )
 
     # Discover input images
@@ -367,7 +409,7 @@ def synthesize_with_medigan(
                     num_samples=1,
                     save_images=True,
                     image_size=str(image_size),
-                    gpu_id=str(gpu_id),
+                    gpu_id=device_str,
                 )
 
                 # 3. Reassemble output PNGs → 3D NIfTI
@@ -565,8 +607,10 @@ def parse_synthesize_args(
         type=str,
         default="0",
         help=(
-            "CUDA device ID for the synthesis model. "
-            "Use '-1' for CPU. Default: 0."
+            "GPU device for the synthesis model. Accepts a bare "
+            "integer (0, 1, …) which maps to 'cuda:N', '-1' for "
+            "CPU, or a full device string like 'cuda:0' / 'cpu'. "
+            "Default: 0."
         ),
     )
     parser.add_argument(
@@ -713,8 +757,10 @@ def parse_synthesize_and_evaluate_args(
         type=str,
         default="0",
         help=(
-            "CUDA device ID for the synthesis model. "
-            "Use '-1' for CPU. Default: 0."
+            "GPU device for the synthesis model. Accepts a bare "
+            "integer (0, 1, …) which maps to 'cuda:N', '-1' for "
+            "CPU, or a full device string like 'cuda:0' / 'cpu'. "
+            "Default: 0."
         ),
     )
     synth.add_argument(
