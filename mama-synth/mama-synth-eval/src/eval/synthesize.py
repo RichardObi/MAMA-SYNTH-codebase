@@ -1005,6 +1005,10 @@ def run_evaluation(
     masks_dir: Optional[Path] = None,
     labels_path: Optional[Path] = None,
     clf_model_dir: Optional[Path] = None,
+    clf_model_dir_contrast: Optional[Path] = None,
+    clf_model_dir_tumor_roi: Optional[Path] = None,
+    clf_model_dir_luminal: Optional[Path] = None,
+    clf_model_dir_tnbc: Optional[Path] = None,
     seg_model_path: Optional[Path] = None,
     cache_dir: Optional[Path] = None,
     disable_lpips: bool = False,
@@ -1023,8 +1027,15 @@ def run_evaluation(
         Directory with reference post-contrast images.
     output_file : Path
         Output JSON file path.
-    masks_dir, labels_path, clf_model_dir, seg_model_path, cache_dir :
-        Optional paths for ROI / classification / segmentation evaluation.
+    masks_dir, labels_path, seg_model_path, cache_dir :
+        Optional paths for ROI / segmentation evaluation.
+    clf_model_dir : Path or None
+        Legacy fallback directory for all classifier tasks.
+    clf_model_dir_contrast, clf_model_dir_tumor_roi : Path or None
+        Per-task classifier directories (contrast, tumor-ROI).
+    clf_model_dir_luminal, clf_model_dir_tnbc : Path or None
+        Optional per-task directories for luminal / TNBC.  These tasks
+        are only evaluated when a model directory is provided.
     disable_lpips, disable_frd, disable_segmentation, disable_classification :
         Flags to skip specific metric groups.
     verbose : bool
@@ -1044,6 +1055,18 @@ def run_evaluation(
         masks_path=str(masks_dir) if masks_dir else None,
         labels_path=str(labels_path) if labels_path else None,
         clf_model_dir=str(clf_model_dir) if clf_model_dir else None,
+        clf_model_dir_contrast=(
+            str(clf_model_dir_contrast) if clf_model_dir_contrast else None
+        ),
+        clf_model_dir_tumor_roi=(
+            str(clf_model_dir_tumor_roi) if clf_model_dir_tumor_roi else None
+        ),
+        clf_model_dir_luminal=(
+            str(clf_model_dir_luminal) if clf_model_dir_luminal else None
+        ),
+        clf_model_dir_tnbc=(
+            str(clf_model_dir_tnbc) if clf_model_dir_tnbc else None
+        ),
         seg_model_path=str(seg_model_path) if seg_model_path else None,
         cache_dir=str(cache_dir) if cache_dir else None,
         enable_lpips=not disable_lpips,
@@ -1413,7 +1436,51 @@ def parse_synthesize_and_evaluate_args(
         "--clf-model-dir",
         type=Path,
         default=None,
-        help="Directory with pre-trained classifier models (.pkl or .pt).",
+        help=(
+            "Legacy fallback: single directory with pre-trained classifier "
+            "models for all tasks (.pkl or .pt).  Per-task directories "
+            "(--clf-model-dir-contrast, etc.) take precedence."
+        ),
+    )
+    evl.add_argument(
+        "--clf-model-dir-contrast",
+        type=Path,
+        default=None,
+        help=(
+            "Directory with pre-trained contrast classifier models "
+            "(contrast_classifier.pkl / contrast_classifier_cnn.pt)."
+        ),
+    )
+    evl.add_argument(
+        "--clf-model-dir-tumor-roi",
+        type=Path,
+        default=None,
+        help=(
+            "Directory with pre-trained tumor-ROI classifier models "
+            "(tumor_roi_classifier.pkl)."
+        ),
+    )
+    evl.add_argument(
+        "--clf-model-dir-luminal",
+        type=Path,
+        default=None,
+        help=(
+            "Directory with pre-trained luminal classifier models "
+            "(luminal_classifier.pkl / luminal_classifier_cnn.pt).  "
+            "Luminal classification is only evaluated when this (or "
+            "--clf-model-dir) is provided."
+        ),
+    )
+    evl.add_argument(
+        "--clf-model-dir-tnbc",
+        type=Path,
+        default=None,
+        help=(
+            "Directory with pre-trained TNBC classifier models "
+            "(tnbc_classifier.pkl / tnbc_classifier_cnn.pt).  "
+            "TNBC classification is only evaluated when this (or "
+            "--clf-model-dir) is provided."
+        ),
     )
     evl.add_argument(
         "--seg-model-path",
@@ -1610,6 +1677,10 @@ def synthesize_and_evaluate_main(
         masks_dir=mask_eval_dir,
         labels_path=args.labels_path,
         clf_model_dir=args.clf_model_dir,
+        clf_model_dir_contrast=args.clf_model_dir_contrast,
+        clf_model_dir_tumor_roi=args.clf_model_dir_tumor_roi,
+        clf_model_dir_luminal=args.clf_model_dir_luminal,
+        clf_model_dir_tnbc=args.clf_model_dir_tnbc,
         seg_model_path=args.seg_model_path,
         cache_dir=args.cache_dir,
         disable_lpips=args.disable_lpips,

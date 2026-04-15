@@ -106,7 +106,46 @@ def main() -> int:
         "--clf-model-dir",
         type=Path,
         default=None,
-        help="Directory with pre-trained classifier .pkl files (tnbc_classifier.pkl, luminal_classifier.pkl).",
+        help=(
+            "Legacy fallback: single directory with pre-trained classifier "
+            "models for all tasks.  Per-task directories take precedence."
+        ),
+    )
+    parser.add_argument(
+        "--clf-model-dir-contrast",
+        type=Path,
+        default=None,
+        help=(
+            "Directory with pre-trained contrast classifier models "
+            "(contrast_classifier.pkl / contrast_classifier_cnn.pt)."
+        ),
+    )
+    parser.add_argument(
+        "--clf-model-dir-tumor-roi",
+        type=Path,
+        default=None,
+        help=(
+            "Directory with pre-trained tumor-ROI classifier models "
+            "(tumor_roi_classifier.pkl)."
+        ),
+    )
+    parser.add_argument(
+        "--clf-model-dir-luminal",
+        type=Path,
+        default=None,
+        help=(
+            "Directory with pre-trained luminal classifier models.  "
+            "Luminal classification is only evaluated when provided."
+        ),
+    )
+    parser.add_argument(
+        "--clf-model-dir-tnbc",
+        type=Path,
+        default=None,
+        help=(
+            "Directory with pre-trained TNBC classifier models.  "
+            "TNBC classification is only evaluated when provided."
+        ),
     )
     parser.add_argument(
         "--ensemble",
@@ -189,6 +228,10 @@ def main() -> int:
             enable_classification=not args.disable_classification,
             seg_model_path=args.seg_model_path,
             clf_model_dir=args.clf_model_dir,
+            clf_model_dir_contrast=args.clf_model_dir_contrast,
+            clf_model_dir_tumor_roi=args.clf_model_dir_tumor_roi,
+            clf_model_dir_luminal=args.clf_model_dir_luminal,
+            clf_model_dir_tnbc=args.clf_model_dir_tnbc,
             cache_dir=args.cache_dir,
             ensemble=args.ensemble,
             dual_phase=getattr(args, "dual_phase", False),

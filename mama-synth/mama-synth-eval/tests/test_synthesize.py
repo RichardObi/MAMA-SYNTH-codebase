@@ -1902,3 +1902,194 @@ class TestSkipSynthesisGTExtraction:
             assert call_kwargs[1]["ground_truth_dir"] == preds / ".gt_slices"
             # masks_dir should be None since .mask_slices/ does not exist
             assert call_kwargs[1]["masks_dir"] is None
+
+
+# ---------------------------------------------------------------------------
+# Per-task --clf-model-dir-* CLI options
+# ---------------------------------------------------------------------------
+
+
+class TestPerTaskClfModelDir:
+    """Tests for per-task classifier model directory CLI arguments."""
+
+    # -- CLI parsing -------------------------------------------------------
+
+    def test_per_task_args_parsed(self):
+        """All four per-task --clf-model-dir-* args are parsed correctly."""
+        from eval.synthesize import parse_synthesize_and_evaluate_args
+
+        args = parse_synthesize_and_evaluate_args([
+            "--predictions-dir", "/preds",
+            "--ground-truth-path", "/gt",
+            "--output-file", "m.json",
+            "--clf-model-dir-contrast", "/c",
+            "--clf-model-dir-tumor-roi", "/t",
+            "--clf-model-dir-luminal", "/l",
+            "--clf-model-dir-tnbc", "/n",
+        ])
+        assert args.clf_model_dir_contrast == Path("/c")
+        assert args.clf_model_dir_tumor_roi == Path("/t")
+        assert args.clf_model_dir_luminal == Path("/l")
+        assert args.clf_model_dir_tnbc == Path("/n")
+        assert args.clf_model_dir is None  # legacy not set
+
+    def test_legacy_fallback_still_works(self):
+        """--clf-model-dir alone still sets fallback for all tasks."""
+        from eval.synthesize import parse_synthesize_and_evaluate_args
+
+        args = parse_synthesize_and_evaluate_args([
+            "--predictions-dir", "/preds",
+            "--ground-truth-path", "/gt",
+            "--output-file", "m.json",
+            "--clf-model-dir", "/all",
+        ])
+        assert args.clf_model_dir == Path("/all")
+        assert args.clf_model_dir_contrast is None
+        assert args.clf_model_dir_tumor_roi is None
+
+    def test_per_task_overrides_legacy(self):
+        """Per-task args take precedence over --clf-model-dir in MamaSynthEval."""
+        from eval.evaluation import MamaSynthEval
+
+        evaluator = MamaSynthEval(
+            ground_truth_path="/gt",
+            predictions_path="/pred",
+            output_file="/out.json",
+            clf_model_dir="/fallback",
+            clf_model_dir_contrast="/contrast_only",
+        )
+        assert evaluator.clf_model_dir_contrast == Path("/contrast_only")
+        assert evaluator.clf_model_dir_tumor_roi == Path("/fallback")
+        assert evaluator.clf_model_dir_luminal == Path("/fallback")
+        assert evaluator.clf_model_dir_tnbc == Path("/fallback")
+
+    def test_legacy_propagates_to_all_tasks(self):
+        """When only --clf-model-dir is given, all tasks inherit it."""
+        from eval.evaluation import MamaSynthEval
+
+        evaluator = MamaSynthEval(
+            ground_truth_path="/gt",
+            predictions_path="/pred",
+            output_file="/out.json",
+            clf_model_dir="/shared",
+        )
+        assert evaluator.clf_model_dir_contrast == Path("/shared")
+        assert evaluator.clf_model_dir_tumor_roi == Path("/shared")
+        assert evaluator.clf_model_dir_luminal == Path("/shared")
+        assert evaluator.clf_model_dir_tnbc == Path("/shared")
+
+    def test_none_when_nothing_provided(self):
+        """Without any clf dirs, all tasks have None."""
+        from eval.evaluation import MamaSynthEval
+
+        evaluator = MamaSynthEval(
+            ground_truth_path="/gt",
+            predictions_path="/pred",
+            output_file="/out.json",
+        )
+        assert evaluator.clf_model_dir is None
+        assert evaluator.clf_model_dir_contrast is None
+        assert evaluator.clf_model_dir_tumor_roi is None
+        assert evaluator.clf_model_dir_luminal is None
+        assert evaluator.clf_model_dir_tnbc is None
+
+    # -- _clf_model_dir_for_task helper ------------------------------------
+
+    def test_clf_model_dir_for_task_returns_correct_dir(self):
+        """_clf_model_dir_for_task resolves the right per-task directory."""
+        from eval.evaluation import MamaSynthEval
+
+        evaluator = MamaSynthEval(
+            ground_truth_path="/gt",
+            predictions_path="/pred",
+            output_file="/out.json",
+            clf_model_dir="/fallback",
+            clf_model_dir_contrast="/c",
+            clf_model_dir_tumor_roi="/t",
+        )
+        assert evaluator._clf_model_dir_for_task("contrast") == Path("/c")
+        assert evaluator._clf_model_dir_for_task("tumor_roi") == Path("/t")
+        assert evaluator._clf_model_dir_for_task("luminal") == Path("/fallback")
+        assert evaluator._clf_model_dir_for_task("tnbc") == Path("/fallback")
+
+    def test_clf_model_dir_for_task_unknown_falls_back(self):
+        """Unknown task names fall back to legacy clf_model_dir."""
+        from eval.evaluation import MamaSynthEval
+
+        evaluator = MamaSynthEval(
+            ground_truth_path="/gt",
+            predictions_path="/pred",
+            output_file="/out.json",
+            clf_model_dir="/legacy",
+        )
+        assert evaluator._clf_model_dir_for_task("unknown_task") == Path("/legacy")
+
+    # -- run_evaluation bridge ---------------------------------------------
+
+    def test_run_evaluation_passes_per_task_dirs(self):
+        """run_evaluation forwards per-task dirs to MamaSynthEval."""
+        from unittest.mock import patch, MagicMock
+
+        mock_eval = MagicMock()
+        mock_eval.evaluate.return_value = {"aggregates": {}, "results": []}
+
+        with patch("eval.evaluation.MamaSynthEval", return_value=mock_eval) as mock_cls:
+            from eval.synthesize import run_evaluation
+
+            run_evaluation(
+                predictions_dir=Path("/preds"),
+                ground_truth_dir=Path("/gt"),
+                output_file=Path("/out.json"),
+                clf_model_dir=Path("/fallback"),
+                clf_model_dir_contrast=Path("/c"),
+                clf_model_dir_tumor_roi=Path("/t"),
+                clf_model_dir_luminal=Path("/l"),
+                clf_model_dir_tnbc=Path("/n"),
+            )
+
+        call_kwargs = mock_cls.call_args[1]
+        assert call_kwargs["clf_model_dir"] == "/fallback"
+        assert call_kwargs["clf_model_dir_contrast"] == "/c"
+        assert call_kwargs["clf_model_dir_tumor_roi"] == "/t"
+        assert call_kwargs["clf_model_dir_luminal"] == "/l"
+        assert call_kwargs["clf_model_dir_tnbc"] == "/n"
+
+    # -- Integration: synthesize_and_evaluate_main -------------------------
+
+    def test_main_passes_per_task_dirs_to_run_evaluation(self):
+        """synthesize_and_evaluate_main forwards per-task dirs correctly."""
+        from eval.synthesize import synthesize_and_evaluate_main
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(os.path.realpath(tmp))
+            preds = tmp / "predictions"
+            preds.mkdir()
+            gt_dir = tmp / "gt"
+            gt_dir.mkdir()
+            # Need at least one matching pair for evaluation not to fail early
+            from PIL import Image as _PIL
+            _PIL.new("L", (8, 8), 128).save(preds / "P001.png")
+
+            # Create .gt_slices with matching file so GT extraction is skipped
+            gs = preds / ".gt_slices"
+            gs.mkdir()
+            _PIL.new("L", (8, 8), 64).save(gs / "P001.png")
+
+            out_json = tmp / "metrics.json"
+
+            with patch("eval.synthesize.run_evaluation", return_value={"aggregates": {}}) as mock_eval:
+                synthesize_and_evaluate_main([
+                    "--predictions-dir", str(preds),
+                    "--ground-truth-path", str(gt_dir),
+                    "--output-file", str(out_json),
+                    "--clf-model-dir", str(tmp / "all"),
+                    "--clf-model-dir-contrast", str(tmp / "c"),
+                    "--clf-model-dir-tumor-roi", str(tmp / "t"),
+                ])
+
+            call_kwargs = mock_eval.call_args[1]
+            assert call_kwargs["clf_model_dir"] == Path(tmp / "all")
+            assert call_kwargs["clf_model_dir_contrast"] == Path(tmp / "c")
+            assert call_kwargs["clf_model_dir_tumor_roi"] == Path(tmp / "t")
+            assert call_kwargs["clf_model_dir_luminal"] is None
+            assert call_kwargs["clf_model_dir_tnbc"] is None

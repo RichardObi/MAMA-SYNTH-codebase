@@ -192,7 +192,11 @@ class MamaSynthEval:
         enable_segmentation: Whether to run segmentation evaluation.
         enable_classification: Whether to run classification evaluation.
         seg_model_path: Optional path to a pre-trained segmentation model.
-        clf_model_dir: Optional directory containing pre-trained classifiers.
+        clf_model_dir: Legacy fallback directory for all classifiers.
+        clf_model_dir_contrast: Directory with contrast classifier models.
+        clf_model_dir_tumor_roi: Directory with tumor-ROI classifier models.
+        clf_model_dir_luminal: Directory with luminal classifier models.
+        clf_model_dir_tnbc: Directory with TNBC classifier models.
         cache_dir: Optional directory for caching intermediate features.
     """
 
@@ -212,6 +216,10 @@ class MamaSynthEval:
         enable_classification: bool = True,
         seg_model_path: Optional[Path] = None,
         clf_model_dir: Optional[Path] = None,
+        clf_model_dir_contrast: Optional[Path] = None,
+        clf_model_dir_tumor_roi: Optional[Path] = None,
+        clf_model_dir_luminal: Optional[Path] = None,
+        clf_model_dir_tnbc: Optional[Path] = None,
         cache_dir: Optional[Path] = None,
         ensemble: bool = False,
         dual_phase: bool = False,
@@ -228,7 +236,26 @@ class MamaSynthEval:
         self.enable_segmentation = enable_segmentation
         self.enable_classification = enable_classification
         self.seg_model_path = Path(seg_model_path) if seg_model_path else None
-        self.clf_model_dir = Path(clf_model_dir) if clf_model_dir else None
+        # Per-task classifier directories.  Explicit per-task dirs take
+        # precedence; clf_model_dir is a legacy fallback for all tasks.
+        _fallback = Path(clf_model_dir) if clf_model_dir else None
+        self.clf_model_dir = _fallback  # kept for backward compat
+        self.clf_model_dir_contrast = (
+            Path(clf_model_dir_contrast) if clf_model_dir_contrast
+            else _fallback
+        )
+        self.clf_model_dir_tumor_roi = (
+            Path(clf_model_dir_tumor_roi) if clf_model_dir_tumor_roi
+            else _fallback
+        )
+        self.clf_model_dir_luminal = (
+            Path(clf_model_dir_luminal) if clf_model_dir_luminal
+            else _fallback
+        )
+        self.clf_model_dir_tnbc = (
+            Path(clf_model_dir_tnbc) if clf_model_dir_tnbc
+            else _fallback
+        )
         self.cache_dir = Path(cache_dir) if cache_dir else None
         self.ensemble = ensemble
         self.dual_phase = dual_phase
@@ -240,6 +267,20 @@ class MamaSynthEval:
         # Per-evaluation image cache to avoid redundant NIfTI loads.
         # Enabled only during evaluate() and cleared afterwards.
         self._image_cache: Optional[dict[str, NDArray]] = None
+
+    def _clf_model_dir_for_task(self, task: str) -> Optional[Path]:
+        """Return the classifier model directory for *task*.
+
+        Resolution order: explicit per-task attribute → ``clf_model_dir``
+        fallback (already resolved during ``__init__``).
+        """
+        _dirs = {
+            "contrast": self.clf_model_dir_contrast,
+            "tumor_roi": self.clf_model_dir_tumor_roi,
+            "luminal": self.clf_model_dir_luminal,
+            "tnbc": self.clf_model_dir_tnbc,
+        }
+        return _dirs.get(task, self.clf_model_dir)
 
     # ------------------------------------------------------------------
     # Main entry point
@@ -656,17 +697,19 @@ class MamaSynthEval:
             ("luminal", y_luminal, METRIC_AUROC_LUMINAL),
             ("tnbc", y_tnbc, METRIC_AUROC_TNBC),
         ]:
+            _task_dir = self._clf_model_dir_for_task(task)
+
             # ----------------------------------------------------------
             # Ensemble mode: discover all models and average probabilities
             # ----------------------------------------------------------
-            if self.ensemble and self.clf_model_dir and self.clf_model_dir.exists():
+            if self.ensemble and _task_dir and _task_dir.exists():
                 ensemble = EnsembleClassifier.discover_models(
-                    task=task, model_dir=self.clf_model_dir,
+                    task=task, model_dir=_task_dir,
                 )
                 if ensemble.n_models == 0:
                     detail[f"note_{task}"] = (
                         f"No pre-trained {task} models found in "
-                        f"{self.clf_model_dir} for ensemble."
+                        f"{_task_dir} for ensemble."
                     )
                     continue
 
@@ -722,12 +765,12 @@ class MamaSynthEval:
             # ----------------------------------------------------------
             cnn_model_path = None
             pkl_model_path = None
-            if self.clf_model_dir and self.clf_model_dir.exists():
+            if _task_dir and _task_dir.exists():
                 cnn_candidate = (
-                    self.clf_model_dir / f"{task}_classifier_cnn.pt"
+                    _task_dir / f"{task}_classifier_cnn.pt"
                 )
                 pkl_candidate = (
-                    self.clf_model_dir / f"{task}_classifier.pkl"
+                    _task_dir / f"{task}_classifier.pkl"
                 )
                 if cnn_candidate.exists():
                     cnn_model_path = cnn_candidate
@@ -817,7 +860,8 @@ class MamaSynthEval:
             else:
                 detail[f"note_{task}"] = (
                     f"No pre-trained {task} classifier found. "
-                    "Provide model via --clf-model-dir."
+                    f"Provide model via --clf-model-dir-{task.replace('_', '-')} "
+                    f"or --clf-model-dir."
                 )
 
         # --------------------------------------------------------------
@@ -854,16 +898,18 @@ class MamaSynthEval:
         metric_key = METRIC_AUROC_TUMOR_ROI
 
         # Check for a pre-trained tumor_roi model
+        _task_dir = self._clf_model_dir_for_task(task)
         pkl_model_path = None
-        if self.clf_model_dir and self.clf_model_dir.exists():
-            pkl_candidate = self.clf_model_dir / f"{task}_classifier.pkl"
+        if _task_dir and _task_dir.exists():
+            pkl_candidate = _task_dir / f"{task}_classifier.pkl"
             if pkl_candidate.exists():
                 pkl_model_path = pkl_candidate
 
         if pkl_model_path is None:
             detail[f"note_{task}"] = (
                 f"No pre-trained {task} classifier found. "
-                "Provide model via --clf-model-dir."
+                "Provide model via --clf-model-dir-tumor-roi "
+                "or --clf-model-dir."
             )
             return
 
