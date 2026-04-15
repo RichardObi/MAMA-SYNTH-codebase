@@ -226,11 +226,11 @@ class MamaSynthEval:
         dual_phase: bool = False,
         precontrast_path: Optional[Path] = None,
     ) -> None:
-        self.ground_truth_path = Path(ground_truth_path)
-        self.predictions_path = Path(predictions_path)
-        self.output_file = Path(output_file)
-        self.masks_path = Path(masks_path) if masks_path else None
-        self.labels_path = Path(labels_path) if labels_path else None
+        self.ground_truth_path = Path(ground_truth_path).resolve()
+        self.predictions_path = Path(predictions_path).resolve()
+        self.output_file = Path(output_file).resolve()
+        self.masks_path = Path(masks_path).resolve() if masks_path else None
+        self.labels_path = Path(labels_path).resolve() if labels_path else None
         self.roi_margin_mm = roi_margin_mm
         self.enable_lpips = enable_lpips
         self.enable_frd = enable_frd
@@ -606,11 +606,12 @@ class MamaSynthEval:
                 ssim_val = 1.0  # identical constant images
             ssim_values.append(ssim_val)
 
-            # Collect file paths for FRD
+            # Collect file paths for FRD (absolute paths required —
+            # frd-score uses multiprocessing + sitk.ReadImage internally).
             if stem in mask_file_mapping:
-                frd_gt_paths.append(str(gt_path))
-                frd_pred_paths.append(str(pred_path))
-                frd_mask_paths.append(str(mask_file_mapping[stem]))
+                frd_gt_paths.append(str(gt_path.resolve()))
+                frd_pred_paths.append(str(pred_path.resolve()))
+                frd_mask_paths.append(str(mask_file_mapping[stem].resolve()))
 
         if not ssim_values:
             return {}

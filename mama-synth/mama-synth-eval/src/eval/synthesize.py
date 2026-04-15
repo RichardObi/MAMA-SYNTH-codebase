@@ -90,6 +90,24 @@ WORK_SUBDIR = ".synthesis_work"
 GT_SLICES_SUBDIR = ".gt_slices"
 MASK_SLICES_SUBDIR = ".mask_slices"
 
+# 2D image extensions (formats that do *not* require NIfTI slice extraction).
+_2D_IMAGE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"})
+
+
+def _is_2d_image(path: Path) -> bool:
+    """Return ``True`` if *path* has a 2D image extension (PNG, JPEG, …)."""
+    return path.suffix.lower() in _2D_IMAGE_SUFFIXES
+
+
+def _dir_has_2d_images(directory: Path) -> bool:
+    """Return ``True`` if *directory* contains at least one 2D image file."""
+    if not directory.is_dir():
+        return False
+    return any(
+        f.is_file() and f.suffix.lower() in _2D_IMAGE_SUFFIXES
+        for f in directory.iterdir()
+    )
+
 
 # ---------------------------------------------------------------------------
 # Medigan-based synthesis
@@ -479,8 +497,9 @@ def synthesize_with_medigan(
     input_images = _discover_input_images(input_dir, phase=phase)
     if not input_images:
         raise FileNotFoundError(
-            f"No pre-contrast images found in {input_dir}. "
-            f"Expected files matching *_{phase:04d}.nii.gz or similar."
+            f"No input images found in {input_dir}. "
+            f"Expected NIfTI files matching *_{phase:04d}.nii.gz "
+            f"or 2D images (PNG, JPEG, …)."
         )
 
     logger.info(f"Found {len(input_images)} input images.")
@@ -613,7 +632,12 @@ def _discover_input_images(
     """Find pre-contrast images in *input_dir*.
 
     Supports both flat layouts (``{pid}_0000.nii.gz``) and nested layouts
-    (``{pid}/{pid}_0000.nii.gz``).
+    (``{pid}/{pid}_0000.nii.gz``), as well as directories of 2D images
+    (PNG, JPEG, TIFF, BMP) where slice extraction has already been done
+    and no phase suffix is expected.
+
+    3D NIfTI volumes are discovered first.  If none are found, the
+    function falls back to discovering 2D image files.
     """
     phase_suffix = f"_{phase:04d}"
 
@@ -628,13 +652,21 @@ def _discover_input_images(
     if images:
         return images
 
-    # Fall back to flat layout
+    # Fall back to flat layout (3D volumes)
     for f in sorted(input_dir.iterdir()):
         if (
             f.is_file()
             and phase_suffix in f.stem
             and f.suffix in (".gz", ".nii", ".mha")
         ):
+            images.append(f)
+
+    if images:
+        return images
+
+    # Fall back to 2D image files (pre-extracted slices)
+    for f in sorted(input_dir.iterdir()):
+        if f.is_file() and f.suffix.lower() in _2D_IMAGE_SUFFIXES:
             images.append(f)
 
     return images
@@ -763,10 +795,12 @@ def _load_mask_for_patient(
     patient_id: str,
     masks_dir: Optional[Path],
 ) -> Optional[np.ndarray]:
-    """Load a 3D segmentation mask for *patient_id* from *masks_dir*.
+    """Load a segmentation mask for *patient_id* from *masks_dir*.
 
-    Searches for files whose extracted patient ID matches, trying common
-    medical-image extensions in both flat and nested directory layouts.
+    Supports both 3D NIfTI volumes and 2D images (PNG, JPEG, …).
+    Searches for files whose extracted patient ID matches, trying
+    common medical-image extensions first, then 2D formats, in both
+    flat and nested directory layouts.
 
     Returns ``None`` when *masks_dir* is ``None``, does not exist, or no
     matching mask file is found.
@@ -774,30 +808,17 @@ def _load_mask_for_patient(
     if masks_dir is None or not masks_dir.exists():
         return None
 
+    # --- 3D NIfTI / MHA masks -------------------------------------------
+    sitk_available = True
     try:
         import SimpleITK as sitk
     except ImportError:
-        logger.warning("SimpleITK not available — cannot load masks.")
-        return None
+        sitk_available = False
 
-    for ext in (".nii.gz", ".nii", ".mha", ".mhd"):
-        # Flat layout: masks_dir/{pid}*{ext}
-        for candidate in sorted(masks_dir.glob(f"{patient_id}*{ext}")):
-            if _stem_matches_patient(candidate.name, patient_id):
-                try:
-                    arr = sitk.GetArrayFromImage(
-                        sitk.ReadImage(str(candidate), sitk.sitkUInt8)
-                    )
-                    if arr.ndim == 4:
-                        arr = arr[0]
-                    return arr.astype(bool)
-                except Exception as e:
-                    logger.warning(f"Failed to load mask {candidate}: {e}")
-
-        # Nested layout: masks_dir/{pid}/{pid}*{ext}
-        nested = masks_dir / patient_id
-        if nested.is_dir():
-            for candidate in sorted(nested.glob(f"{patient_id}*{ext}")):
+    if sitk_available:
+        for ext in (".nii.gz", ".nii", ".mha", ".mhd"):
+            # Flat layout: masks_dir/{pid}*{ext}
+            for candidate in sorted(masks_dir.glob(f"{patient_id}*{ext}")):
                 if _stem_matches_patient(candidate.name, patient_id):
                     try:
                         arr = sitk.GetArrayFromImage(
@@ -807,36 +828,86 @@ def _load_mask_for_patient(
                             arr = arr[0]
                         return arr.astype(bool)
                     except Exception as e:
+                        logger.warning(f"Failed to load mask {candidate}: {e}")
+
+            # Nested layout: masks_dir/{pid}/{pid}*{ext}
+            nested = masks_dir / patient_id
+            if nested.is_dir():
+                for candidate in sorted(nested.glob(f"{patient_id}*{ext}")):
+                    if _stem_matches_patient(candidate.name, patient_id):
+                        try:
+                            arr = sitk.GetArrayFromImage(
+                                sitk.ReadImage(str(candidate), sitk.sitkUInt8)
+                            )
+                            if arr.ndim == 4:
+                                arr = arr[0]
+                            return arr.astype(bool)
+                        except Exception as e:
+                            logger.warning(
+                                f"Failed to load mask {candidate}: {e}"
+                            )
+
+    # --- 2D image masks (PNG, JPEG, …) -----------------------------------
+    try:
+        from PIL import Image as _PIL
+    except ImportError:
+        if not sitk_available:
+            logger.warning(
+                "Neither SimpleITK nor Pillow available — cannot load masks."
+            )
+        return None
+
+    for ext_dot in sorted(_2D_IMAGE_SUFFIXES):
+        for candidate in sorted(masks_dir.glob(f"{patient_id}*{ext_dot}")):
+            if _stem_matches_patient(candidate.name, patient_id):
+                try:
+                    arr = np.array(_PIL.open(candidate).convert("L"))
+                    return (arr > 0).astype(bool)
+                except Exception as e:
+                    logger.warning(f"Failed to load 2D mask {candidate}: {e}")
+
+        nested = masks_dir / patient_id
+        if nested.is_dir():
+            for candidate in sorted(nested.glob(f"{patient_id}*{ext_dot}")):
+                if _stem_matches_patient(candidate.name, patient_id):
+                    try:
+                        arr = np.array(_PIL.open(candidate).convert("L"))
+                        return (arr > 0).astype(bool)
+                    except Exception as e:
                         logger.warning(
-                            f"Failed to load mask {candidate}: {e}"
+                            f"Failed to load 2D mask {candidate}: {e}"
                         )
 
     return None
 
 
 def _extract_and_save_slices(
-    nifti_path: Path,
+    image_path: Path,
     output_dir: Path,
     patient_id: str,
     mask_arr: Optional[np.ndarray] = None,
     slice_mode: str = "max_tumor",
     sequential_naming: bool = False,
 ) -> list[tuple[Path, int]]:
-    """Extract selected axial slices from a NIfTI volume and save as PNG.
+    """Extract selected axial slices from a volume and save as PNG.
 
-    The full 3D volume is normalised to ``[0, 255]`` using the global
-    min/max, and the selected slices are saved as 8-bit grayscale PNGs.
+    Accepts both 3D NIfTI volumes **and** 2D images (PNG, JPEG, …).
+    When the input is already a 2D image, slice selection is skipped and
+    the image is normalised and saved directly.
+
+    The full volume/image is normalised to ``[0, 255]`` using the global
+    min/max and saved as 8-bit grayscale PNG.
 
     Parameters
     ----------
-    nifti_path : Path
-        Input NIfTI file.
+    image_path : Path
+        Input image file (NIfTI or 2D format such as PNG/JPEG).
     output_dir : Path
         Target directory for PNG files.
     patient_id : str
         Patient identifier (used in filenames).
     mask_arr : ndarray or None
-        3D boolean mask for slice selection.
+        Boolean mask for slice selection (3D for NIfTI, 2D for images).
     slice_mode : str
         ``"max_tumor"``, ``"center_tumor"``, or ``"all_tumor"``.
     sequential_naming : bool
@@ -851,38 +922,60 @@ def _extract_and_save_slices(
         ``(png_path, slice_index)`` pairs sorted by slice index.
     """
     try:
-        import SimpleITK as sitk
-    except ImportError:
-        raise ImportError("NIfTI I/O requires SimpleITK.")
-    try:
         from PIL import Image
     except ImportError:
         raise ImportError("PNG I/O requires Pillow.")
 
-    img = sitk.ReadImage(str(nifti_path))
+    # ── Fast path: 2D image input (already sliced) ────────────────────
+    if _is_2d_image(image_path):
+        pil_img = Image.open(image_path).convert("L")
+        arr = np.array(pil_img, dtype=np.float64)
+
+        vmin, vmax = float(arr.min()), float(arr.max())
+        if vmax > vmin:
+            norm = (arr - vmin) / (vmax - vmin) * 255.0
+        else:
+            norm = np.zeros_like(arr)
+
+        output_dir.mkdir(parents=True, exist_ok=True)
+        if sequential_naming:
+            name = "slice_0000.png"
+        else:
+            name = f"{patient_id}.png"
+
+        png_path = output_dir / name
+        Image.fromarray(norm.astype(np.uint8), mode="L").save(png_path)
+        return [(png_path, 0)]
+
+    # ── Standard path: 3D NIfTI / MHA volume ─────────────────────────
+    try:
+        import SimpleITK as sitk
+    except ImportError:
+        raise ImportError("NIfTI I/O requires SimpleITK.")
+
+    img = sitk.ReadImage(str(image_path))
     arr = sitk.GetArrayFromImage(img).astype(np.float64)
     if arr.ndim == 4:
         arr = arr[0]
     elif arr.ndim != 3:
         if arr.ndim == 2:
             logger.warning(
-                f"Input image {nifti_path} is 2D; treating it as a single "
+                f"Input image {image_path} is 2D; treating it as a single "
                 "slice volume for compatibility with the pipeline."
             )
             arr = arr[np.newaxis, ...]  # add slice dimension
         else:
             raise ValueError(
-                f"Expected 3D or 4D NIfTI, got {arr.ndim}D from {nifti_path} for patient "
+                f"Expected 3D or 4D NIfTI, got {arr.ndim}D from {image_path} for patient "
                 f"{patient_id}"
         )
     
     if mask_arr is not None:
-        # Not strictly necessary to handle 2D masks here since the slice selection logic will fall back to the only available slice, but we can add a warning and reshape for robustness.
         if mask_arr.ndim == 2:
             mask_arr = mask_arr[np.newaxis, ...]
         elif mask_arr.ndim == 4:
             mask_arr = mask_arr[0]
-        elif arr.ndim != 3:
+        elif mask_arr.ndim != 3:
             raise ValueError(
                 f"Expected 3D mask, got {mask_arr.ndim}D for patient "
                 f"{patient_id}"
@@ -890,7 +983,6 @@ def _extract_and_save_slices(
 
     # Select slices
     if arr.shape[0] == 1:
-        # avoinding warnings/errors from slice selection logic when there's only one slice
         indices = [0]
     else:
         indices = _select_slices(arr, mask_arr, slice_mode)
@@ -931,6 +1023,10 @@ def extract_ground_truth_slices(
 ) -> list[Path]:
     """Extract 2D ground-truth slices from 3D NIfTI volumes.
 
+    Also accepts directories that already contain 2D images (PNG, JPEG,
+    …).  In that case the images are copied to *output_dir* as-is and
+    no slice extraction is performed.
+
     Uses the same slice-selection logic (mask + *slice_mode*) as
     :func:`synthesize_with_medigan` so that predictions and ground truth
     are compared at the same anatomical positions.
@@ -943,7 +1039,8 @@ def extract_ground_truth_slices(
     Parameters
     ----------
     gt_dir : Path
-        Directory with ground-truth post-contrast NIfTI volumes.
+        Directory with ground-truth images (NIfTI volumes **or** 2D
+        images such as PNG/JPEG).
     masks_dir : Path or None
         Segmentation masks directory (for slice selection).
     output_dir : Path
@@ -994,7 +1091,11 @@ def extract_ground_truth_slices(
                     from PIL import Image as _PIL
 
                     for _, idx in slice_infos:
-                        mask_slice = (mask_arr[idx] > 0).astype(np.uint8) * 255
+                        if mask_arr.ndim == 2:
+                            # 2D mask — use directly
+                            mask_slice = (mask_arr > 0).astype(np.uint8) * 255
+                        else:
+                            mask_slice = (mask_arr[idx] > 0).astype(np.uint8) * 255
                         if len(slice_infos) == 1:
                             mname = f"{patient_id}.png"
                         else:
@@ -1640,53 +1741,63 @@ def synthesize_and_evaluate_main(
 
     # --- Step 1b: Extract matching GT and mask slices ---------------------
     #
-    # Predictions are 2D PNG slices.  The ground-truth directory typically
-    # contains 3D NIfTI volumes in nested patient folders, so we must
-    # extract the corresponding 2D GT slices as PNGs before evaluation.
+    # Predictions are 2D PNG slices.  The ground-truth directory may
+    # contain either 3D NIfTI volumes (requiring slice extraction) or
+    # pre-extracted 2D images (PNG, JPEG, …) that can be used directly.
     #
-    # When synthesis was just run, we always (re-)extract.  When synthesis
-    # was skipped (--skip-synthesis / --predictions-dir), we still need
-    # matching GT slices — reuse a previous extraction if the directory
-    # already exists, otherwise extract now.
+    # When ground truth already contains 2D images we skip extraction
+    # entirely and point straight at the GT directory.  Otherwise we
+    # extract matching slices the same way the synthesis step did.
     gt_eval_dir: Path = args.ground_truth_path
     mask_eval_dir: Optional[Path] = args.masks_path
 
-    # Determine output base for GT/mask slice directories.
-    # Use --output-dir if given, otherwise place next to predictions.
-    _slice_base = args.output_dir if args.output_dir else args.predictions_dir
-    _gt_slices_candidate = _slice_base / GT_SLICES_SUBDIR
-    _mask_slices_candidate = _slice_base / MASK_SLICES_SUBDIR
+    # Check if GT already contains 2D images — no extraction needed
+    gt_already_2d = _dir_has_2d_images(args.ground_truth_path)
+    if gt_already_2d:
+        logger.info(
+            "Ground-truth directory already contains 2D images — "
+            "skipping slice extraction."
+        )
+        # masks_path may also point to 2D masks; use directly if available
+        if args.masks_path and _dir_has_2d_images(args.masks_path):
+            mask_eval_dir = args.masks_path
+    else:
+        # Determine output base for GT/mask slice directories.
+        # Use --output-dir if given, otherwise place next to predictions.
+        _slice_base = args.output_dir if args.output_dir else args.predictions_dir
+        _gt_slices_candidate = _slice_base / GT_SLICES_SUBDIR
+        _mask_slices_candidate = _slice_base / MASK_SLICES_SUBDIR
 
-    need_gt_extraction = not args._skip_synthesis  # always extract after fresh synthesis
+        need_gt_extraction = not args._skip_synthesis  # always extract after fresh synthesis
 
-    if args._skip_synthesis:
-        # Check whether a previous extraction already exists and has files
-        if _gt_slices_candidate.exists() and any(_gt_slices_candidate.glob("*.png")):
-            logger.info(
-                f"Reusing previously extracted GT slices: {_gt_slices_candidate}"
-            )
+        if args._skip_synthesis:
+            # Check whether a previous extraction already exists and has files
+            if _gt_slices_candidate.exists() and any(_gt_slices_candidate.glob("*.png")):
+                logger.info(
+                    f"Reusing previously extracted GT slices: {_gt_slices_candidate}"
+                )
+                gt_eval_dir = _gt_slices_candidate
+                if _mask_slices_candidate.exists() and any(_mask_slices_candidate.glob("*.png")):
+                    mask_eval_dir = _mask_slices_candidate
+            else:
+                # GT slices not yet extracted — we need to do it now
+                need_gt_extraction = True
+
+        if need_gt_extraction:
             gt_eval_dir = _gt_slices_candidate
-            if _mask_slices_candidate.exists() and any(_mask_slices_candidate.glob("*.png")):
-                mask_eval_dir = _mask_slices_candidate
-        else:
-            # GT slices not yet extracted — we need to do it now
-            need_gt_extraction = True
-
-    if need_gt_extraction:
-        gt_eval_dir = _gt_slices_candidate
-        mask_eval_dir = (
-            _mask_slices_candidate
-            if args.masks_dir else None
-        )
-        logger.info("\n--- Step 1b: Extracting GT slices ---")
-        extract_ground_truth_slices(
-            gt_dir=args.ground_truth_path,
-            masks_dir=args.masks_dir,
-            output_dir=gt_eval_dir,
-            slice_mode=args.slice_mode,
-            phase=DEFAULT_PHASE_POST,
-            masks_output_dir=mask_eval_dir,
-        )
+            mask_eval_dir = (
+                _mask_slices_candidate
+                if args.masks_dir else None
+            )
+            logger.info("\n--- Step 1b: Extracting GT slices ---")
+            extract_ground_truth_slices(
+                gt_dir=args.ground_truth_path,
+                masks_dir=args.masks_dir,
+                output_dir=gt_eval_dir,
+                slice_mode=args.slice_mode,
+                phase=DEFAULT_PHASE_POST,
+                masks_output_dir=mask_eval_dir,
+            )
 
     # --- Step 2: Evaluation -----------------------------------------------
     logger.info("\n--- Step 2: Evaluation ---")

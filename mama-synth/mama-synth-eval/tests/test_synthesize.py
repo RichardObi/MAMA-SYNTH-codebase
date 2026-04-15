@@ -769,7 +769,7 @@ class TestSynthesizeWithMedigan:
                     with patch(
                         "eval.synthesize._ensure_medigan_importable"
                     ):
-                        with pytest.raises(FileNotFoundError, match="No pre-contrast"):
+                        with pytest.raises(FileNotFoundError, match="No input images found"):
                             synthesize_with_medigan(
                                 input_dir=tmp / "input",
                                 output_dir=tmp / "output",
@@ -2093,3 +2093,207 @@ class TestPerTaskClfModelDir:
             assert call_kwargs["clf_model_dir_tumor_roi"] == Path(tmp / "t")
             assert call_kwargs["clf_model_dir_luminal"] is None
             assert call_kwargs["clf_model_dir_tnbc"] is None
+
+
+# ---------------------------------------------------------------------------
+# 2D image support
+# ---------------------------------------------------------------------------
+
+
+class TestDiscoverInputImages2D:
+    """Tests for 2D image fallback in _discover_input_images."""
+
+    def test_discovers_png_files(self):
+        from eval.synthesize import _discover_input_images
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            from PIL import Image as _PIL
+            for name in ["P001.png", "P002.png", "P003.png"]:
+                _PIL.new("L", (32, 32), 128).save(root / name)
+
+            images = _discover_input_images(root, phase=0)
+
+        assert len(images) == 3
+        assert all(p.suffix == ".png" for p in images)
+
+    def test_nifti_takes_priority_over_png(self):
+        """When both NIfTI and PNG exist, NIfTI should be preferred."""
+        from eval.synthesize import _discover_input_images
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _create_dummy_files(root, ["P001"], phase=0, nested=False)
+            from PIL import Image as _PIL
+            _PIL.new("L", (32, 32), 128).save(root / "stray.png")
+
+            images = _discover_input_images(root, phase=0)
+
+        assert len(images) == 1
+        assert images[0].name.endswith(".nii.gz")
+
+
+class TestExtractAndSaveSlices2D:
+    """Tests for 2D image handling in _extract_and_save_slices."""
+
+    def test_2d_png_input(self):
+        from eval.synthesize import _extract_and_save_slices
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            from PIL import Image as _PIL
+            _PIL.new("L", (48, 48), 200).save(root / "P001.png")
+
+            out_dir = root / "output"
+            results = _extract_and_save_slices(
+                root / "P001.png", out_dir, "P001",
+                sequential_naming=False,
+            )
+
+            assert len(results) == 1
+            saved_path, idx = results[0]
+            assert saved_path.exists()
+            assert idx == 0
+            assert saved_path.name == "P001.png"
+
+    def test_2d_png_sequential_naming(self):
+        from eval.synthesize import _extract_and_save_slices
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            from PIL import Image as _PIL
+            _PIL.new("L", (48, 48), 128).save(root / "P001.png")
+
+            out_dir = root / "output"
+            results = _extract_and_save_slices(
+                root / "P001.png", out_dir, "P001",
+                sequential_naming=True,
+            )
+
+            assert results[0][0].name == "slice_0000.png"
+
+
+class TestLoadMaskForPatient2D:
+    """Tests for 2D mask loading in _load_mask_for_patient."""
+
+    def test_loads_png_mask(self):
+        from eval.synthesize import _load_mask_for_patient
+
+        with tempfile.TemporaryDirectory() as tmp:
+            masks_dir = Path(tmp)
+            from PIL import Image as _PIL
+            import numpy as np
+
+            mask_data = np.zeros((48, 48), dtype=np.uint8)
+            mask_data[10:30, 10:30] = 255
+            _PIL.fromarray(mask_data, mode="L").save(masks_dir / "P001.png")
+
+            result = _load_mask_for_patient("P001", masks_dir)
+
+        assert result is not None
+        assert result.dtype == bool
+        assert result.ndim == 2
+        assert result.sum() > 0
+
+
+class TestExtractGroundTruthSlices2D:
+    """Tests for GT extraction when GT is already 2D images."""
+
+    def test_2d_gt_images_are_processed(self):
+        from eval.synthesize import extract_ground_truth_slices
+
+        with tempfile.TemporaryDirectory() as tmp:
+            gt_dir = Path(tmp) / "gt"
+            gt_dir.mkdir()
+            out_dir = Path(tmp) / "out"
+
+            from PIL import Image as _PIL
+            for name in ["P001.png", "P002.png"]:
+                _PIL.new("L", (32, 32), 100).save(gt_dir / name)
+
+            saved = extract_ground_truth_slices(
+                gt_dir=gt_dir,
+                masks_dir=None,
+                output_dir=out_dir,
+            )
+
+            assert len(saved) == 2
+            assert out_dir.exists()
+            assert len(list(out_dir.glob("*.png"))) == 2
+
+
+class TestSynthesizeAndEvaluateMain2D:
+    """Tests for synthesize_and_evaluate_main with 2D input."""
+
+    def test_gt_2d_skips_extraction(self):
+        """When GT is already 2D images, extraction should be skipped."""
+        from unittest.mock import patch
+        from eval.synthesize import synthesize_and_evaluate_main
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            gt_dir = tmp / "gt"
+            preds = tmp / "preds"
+            gt_dir.mkdir()
+            preds.mkdir()
+
+            from PIL import Image as _PIL
+            for name in ["P001.png", "P002.png"]:
+                _PIL.new("L", (32, 32), 100).save(gt_dir / name)
+                _PIL.new("L", (32, 32), 150).save(preds / name)
+
+            out_json = tmp / "metrics.json"
+
+            with patch("eval.synthesize.run_evaluation", return_value={"aggregates": {}}) as mock_eval, \
+                 patch("eval.synthesize.extract_ground_truth_slices") as mock_extract:
+                synthesize_and_evaluate_main([
+                    "--predictions-dir", str(preds),
+                    "--ground-truth-path", str(gt_dir),
+                    "--output-file", str(out_json),
+                    "--disable-frd",
+                    "--disable-lpips",
+                    "--disable-segmentation",
+                    "--disable-classification",
+                ])
+
+            # GT extraction should NOT be called (GT is already 2D)
+            mock_extract.assert_not_called()
+            # Evaluation should use gt_dir directly
+            call_kwargs = mock_eval.call_args[1]
+            assert call_kwargs["ground_truth_dir"] == gt_dir
+
+
+class TestIs2dImage:
+    """Tests for _is_2d_image and _dir_has_2d_images helpers."""
+
+    def test_png_is_2d(self):
+        from eval.synthesize import _is_2d_image
+        assert _is_2d_image(Path("test.png"))
+        assert _is_2d_image(Path("test.PNG"))
+        assert _is_2d_image(Path("test.jpg"))
+        assert _is_2d_image(Path("test.jpeg"))
+        assert _is_2d_image(Path("test.tif"))
+        assert _is_2d_image(Path("test.bmp"))
+
+    def test_nifti_is_not_2d(self):
+        from eval.synthesize import _is_2d_image
+        assert not _is_2d_image(Path("test.nii.gz"))
+        assert not _is_2d_image(Path("test.nii"))
+        assert not _is_2d_image(Path("test.mha"))
+
+    def test_dir_has_2d_images(self):
+        from eval.synthesize import _dir_has_2d_images
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            from PIL import Image as _PIL
+            _PIL.new("L", (8, 8), 64).save(root / "test.png")
+            assert _dir_has_2d_images(root)
+
+    def test_dir_without_2d_images(self):
+        from eval.synthesize import _dir_has_2d_images
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "data.nii.gz").touch()
+            assert not _dir_has_2d_images(root)
