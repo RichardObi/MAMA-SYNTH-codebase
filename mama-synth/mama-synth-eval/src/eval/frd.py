@@ -51,6 +51,12 @@ FRD_FEATURE_CLASSES = [
 # Use default binWidth from frd-score library (25)
 FRD_DEFAULT_BIN_WIDTH = 25
 
+# Cache for the canonical feature count returned by pyradiomics for a
+# given extractor configuration.  Populated on the first *successful*
+# extraction so that subsequent failures can return a zero vector of
+# matching length instead of an arbitrary `np.zeros(1)`.
+_FEATURE_COUNT_CACHE: dict[tuple, int] = {}
+
 
 def _extract_single(
     image: NDArray[np.floating],
@@ -180,11 +186,14 @@ def extract_radiomic_features(
         was_2d=was_2d,
     )
 
+    config_key = (tuple(feature_classes), bin_width, was_2d)
+
     try:
         result = extractor.execute(sitk_image, sitk_mask)
     except Exception as e:
         logger.warning(f"Pyradiomics extraction failed: {e}. Returning zeros.")
-        return np.zeros(1, dtype=np.float64)
+        n = _FEATURE_COUNT_CACHE.get(config_key, 93)
+        return np.zeros(n, dtype=np.float64)
 
     # Collect feature values (skip diagnostics prefixed with "diagnostics_")
     features = []
@@ -196,7 +205,13 @@ def extract_radiomic_features(
         except (TypeError, ValueError):
             features.append(0.0)
 
-    return np.array(features, dtype=np.float64)
+    arr = np.array(features, dtype=np.float64)
+
+    # Cache the canonical feature count so failures return the right length.
+    if config_key not in _FEATURE_COUNT_CACHE and arr.size > 0:
+        _FEATURE_COUNT_CACHE[config_key] = arr.size
+
+    return arr
 
 
 def extract_radiomic_features_batch(

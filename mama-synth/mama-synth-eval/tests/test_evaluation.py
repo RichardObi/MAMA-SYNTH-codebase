@@ -1185,3 +1185,179 @@ class TestFRDROIConvertsToMha:
         # All paths should be .mha (converted from PNG)
         for p in gt_paths + pred_paths:
             assert p.endswith(".mha"), f"Expected .mha path, got {p}"
+
+
+# ---------------------------------------------------------------------------
+# Feature-length mismatch guards
+# ---------------------------------------------------------------------------
+
+
+class TestTumorROIFeatureLengthMismatch:
+    """_evaluate_tumor_roi must handle inconsistent feature vector lengths."""
+
+    def test_mismatched_tumor_mirror_skipped(self, tmp_path: Path) -> None:
+        """Cases where tumor and mirror features differ in length are dropped."""
+        from PIL import Image
+        from unittest.mock import patch, MagicMock
+
+        gt_dir = tmp_path / "gt"
+        pred_dir = tmp_path / "pred"
+        masks_dir = tmp_path / "masks"
+        clf_dir = tmp_path / "clf"
+        gt_dir.mkdir(); pred_dir.mkdir(); masks_dir.mkdir(); clf_dir.mkdir()
+
+        rng = np.random.RandomState(42)
+        for i in range(4):
+            name = f"case_{i:03d}.png"
+            Image.fromarray(
+                rng.randint(0, 255, (48, 48), dtype=np.uint8)
+            ).save(gt_dir / name)
+            Image.fromarray(
+                rng.randint(0, 255, (48, 48), dtype=np.uint8)
+            ).save(pred_dir / name)
+            mask = np.zeros((48, 48), dtype=np.uint8)
+            mask[10:38, 10:38] = 255
+            Image.fromarray(mask).save(masks_dir / name)
+
+        # Create a dummy pickled classifier
+        import pickle
+        from sklearn.ensemble import RandomForestClassifier
+        dummy_model = RandomForestClassifier(n_estimators=2, random_state=0)
+        dummy_model.fit(rng.rand(10, 93), np.array([0]*5 + [1]*5))
+        with open(clf_dir / "tumor_roi_classifier.pkl", "wb") as f:
+            pickle.dump(dummy_model, f)
+
+        evaluator = MamaSynthEval(
+            ground_truth_path=gt_dir,
+            predictions_path=pred_dir,
+            output_file=tmp_path / "m.json",
+            masks_path=masks_dir,
+            clf_model_dir_tumor_roi=clf_dir,
+            enable_lpips=False,
+            enable_frd=False,
+            enable_segmentation=False,
+            enable_classification=True,
+        )
+
+        call_idx = [0]
+
+        def mock_feats(img, key, mask=None):
+            call_idx[0] += 1
+            # Return different lengths for mirror vs tumor on case 0
+            if "__mirror" in key and "case_000" in key:
+                return rng.rand(50).astype(np.float64)
+            return rng.rand(93).astype(np.float64)
+
+        with patch.object(evaluator, "_extract_features_cached", side_effect=mock_feats), \
+             patch("eval.mirror_utils.create_mirrored_mask", return_value=np.ones((48, 48), dtype=bool)):
+            pairs = list(zip(
+                sorted(gt_dir.glob("*.png")),
+                sorted(pred_dir.glob("*.png")),
+            ))
+            result = evaluator._evaluate_tumor_roi(pairs)
+
+        # Should not crash — case_000 dropped, 3 remaining
+        assert "aggregates" in result
+
+    def test_inconsistent_lengths_across_cases_filtered(
+        self, tmp_path: Path
+    ) -> None:
+        """Cases with non-modal feature length are filtered before stacking."""
+        from PIL import Image
+        from unittest.mock import patch, MagicMock
+
+        gt_dir = tmp_path / "gt"
+        pred_dir = tmp_path / "pred"
+        masks_dir = tmp_path / "masks"
+        clf_dir = tmp_path / "clf"
+        gt_dir.mkdir(); pred_dir.mkdir(); masks_dir.mkdir(); clf_dir.mkdir()
+
+        rng = np.random.RandomState(99)
+        for i in range(5):
+            name = f"case_{i:03d}.png"
+            Image.fromarray(
+                rng.randint(0, 255, (48, 48), dtype=np.uint8)
+            ).save(gt_dir / name)
+            Image.fromarray(
+                rng.randint(0, 255, (48, 48), dtype=np.uint8)
+            ).save(pred_dir / name)
+            mask = np.zeros((48, 48), dtype=np.uint8)
+            mask[10:38, 10:38] = 255
+            Image.fromarray(mask).save(masks_dir / name)
+
+        # Create a dummy pickled classifier
+        import pickle
+        from sklearn.ensemble import RandomForestClassifier
+        dummy_model = RandomForestClassifier(n_estimators=2, random_state=0)
+        dummy_model.fit(rng.rand(10, 93), np.array([0]*5 + [1]*5))
+        with open(clf_dir / "tumor_roi_classifier.pkl", "wb") as f:
+            pickle.dump(dummy_model, f)
+
+        evaluator = MamaSynthEval(
+            ground_truth_path=gt_dir,
+            predictions_path=pred_dir,
+            output_file=tmp_path / "m.json",
+            masks_path=masks_dir,
+            clf_model_dir_tumor_roi=clf_dir,
+            enable_lpips=False,
+            enable_frd=False,
+            enable_segmentation=False,
+            enable_classification=True,
+        )
+
+        def mock_feats(img, key, mask=None):
+            # case_004 returns shorter features for both tumor and mirror
+            if "case_004" in key:
+                return rng.rand(80).astype(np.float64)
+            return rng.rand(93).astype(np.float64)
+
+        with patch.object(evaluator, "_extract_features_cached", side_effect=mock_feats), \
+             patch("eval.mirror_utils.create_mirrored_mask", return_value=np.ones((48, 48), dtype=bool)):
+            pairs = list(zip(
+                sorted(gt_dir.glob("*.png")),
+                sorted(pred_dir.glob("*.png")),
+            ))
+            result = evaluator._evaluate_tumor_roi(pairs)
+
+        # Should complete — case_004 dropped, 4 remaining
+        assert "aggregates" in result
+
+
+class TestExtractRadiomicFeaturesFailure:
+    """extract_radiomic_features returns correct-length zeros on failure."""
+
+    def test_failure_returns_cached_length(self) -> None:
+        from eval.frd import _FEATURE_COUNT_CACHE
+        from unittest.mock import patch, MagicMock
+
+        # Seed the cache with a known config
+        config_key = (
+            tuple(["firstorder", "glcm", "glrlm", "gldm", "glszm", "ngtdm"]),
+            25,
+            True,
+        )
+        _FEATURE_COUNT_CACHE[config_key] = 93
+
+        bad_extractor = MagicMock()
+        bad_extractor.execute.side_effect = RuntimeError("boom")
+
+        # Patch pyradiomics imports + extractor so we don't need the package
+        fake_sitk = MagicMock()
+        fake_sitk.GetImageFromArray.return_value = MagicMock()
+
+        with patch("eval.frd._get_cached_extractor", return_value=bad_extractor), \
+             patch.dict("sys.modules", {
+                 "SimpleITK": fake_sitk,
+                 "radiomics": MagicMock(),
+                 "radiomics.featureextractor": MagicMock(),
+             }), \
+             patch("eval.frd.sitk", fake_sitk, create=True):
+            from eval.frd import extract_radiomic_features
+
+            result = extract_radiomic_features(
+                np.random.rand(32, 32).astype(np.float64),
+                mask=np.ones((32, 32), dtype=bool),
+            )
+
+        assert result.shape == (93,)
+        assert np.all(result == 0.0)

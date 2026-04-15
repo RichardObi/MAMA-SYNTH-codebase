@@ -1383,6 +1383,13 @@ class MamaSynthEval:
                 )
                 if t_feats.size == 0 or m_feats.size == 0:
                     continue
+                if t_feats.shape != m_feats.shape:
+                    logger.warning(
+                        f"Feature shape mismatch for {stem}: "
+                        f"tumor={t_feats.shape}, mirror={m_feats.shape}. "
+                        "Skipping this case."
+                    )
+                    continue
                 tumor_feats.append(t_feats)
                 mirror_feats.append(m_feats)
                 valid_stems.append(stem)
@@ -1396,6 +1403,31 @@ class MamaSynthEval:
             detail[f"note_{task}"] = (
                 f"Too few valid cases ({len(tumor_feats)}) for tumor ROI "
                 "evaluation.  Check masks and image data."
+            )
+            return {"aggregates": agg, "detail": detail}
+
+        # Filter to the most common feature length so that np.stack
+        # cannot fail even if pyradiomics returned different numbers
+        # of features for different masks.
+        from collections import Counter
+
+        lengths = [f.shape[0] for f in tumor_feats]
+        modal_len = Counter(lengths).most_common(1)[0][0]
+        if not all(l == modal_len for l in lengths):
+            keep = [i for i, l in enumerate(lengths) if l == modal_len]
+            n_dropped = len(tumor_feats) - len(keep)
+            logger.warning(
+                f"Dropping {n_dropped} case(s) with non-modal feature "
+                f"length (expected {modal_len})."
+            )
+            tumor_feats = [tumor_feats[i] for i in keep]
+            mirror_feats = [mirror_feats[i] for i in keep]
+            valid_stems = [valid_stems[i] for i in keep]
+
+        if len(tumor_feats) < 2:
+            detail[f"note_{task}"] = (
+                f"Too few valid cases ({len(tumor_feats)}) after "
+                "feature-length filtering for tumor ROI evaluation."
             )
             return {"aggregates": agg, "detail": detail}
 
