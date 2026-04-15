@@ -1064,3 +1064,124 @@ class TestFeatureCaching:
             f"Expected 2 extraction calls (2 different masks), got {call_count[0]}"
         )
         np.testing.assert_array_equal(f1, f3)
+
+
+# ---------------------------------------------------------------------------
+# PNG → MHA conversion for frd-score
+# ---------------------------------------------------------------------------
+
+
+class TestEnsureMha:
+    """Tests for MamaSynthEval._ensure_mha PNG→MHA conversion."""
+
+    def test_converts_png_to_mha(self, tmp_path: Path) -> None:
+        from PIL import Image
+
+        png_path = tmp_path / "test.png"
+        Image.fromarray(
+            np.random.randint(0, 255, (32, 32), dtype=np.uint8)
+        ).save(png_path)
+
+        mha_dir = tmp_path / "mha_out"
+        mha_dir.mkdir()
+
+        result = MamaSynthEval._ensure_mha(
+            [str(png_path)], str(mha_dir), "img"
+        )
+
+        assert len(result) == 1
+        assert result[0].endswith(".mha")
+        assert Path(result[0]).exists()
+
+        # Verify the MHA is readable by SimpleITK
+        import SimpleITK as sitk
+
+        img = sitk.ReadImage(result[0])
+        arr = sitk.GetArrayFromImage(img)
+        assert arr.shape == (32, 32)
+
+    def test_nifti_paths_unchanged(self, tmp_path: Path) -> None:
+        nifti_path = str(tmp_path / "vol.nii.gz")
+
+        result = MamaSynthEval._ensure_mha(
+            [nifti_path], str(tmp_path), "img"
+        )
+
+        assert result == [nifti_path]
+
+    def test_mixed_paths(self, tmp_path: Path) -> None:
+        from PIL import Image
+
+        png_path = tmp_path / "img.png"
+        Image.fromarray(
+            np.random.randint(0, 255, (16, 16), dtype=np.uint8)
+        ).save(png_path)
+        nifti_path = str(tmp_path / "vol.nii.gz")
+
+        mha_dir = tmp_path / "mha_out"
+        mha_dir.mkdir()
+
+        result = MamaSynthEval._ensure_mha(
+            [str(png_path), nifti_path], str(mha_dir), "mix"
+        )
+
+        assert len(result) == 2
+        assert result[0].endswith(".mha")
+        assert result[1] == nifti_path
+
+
+class TestFRDROIConvertsToMha:
+    """Verify that _evaluate_roi converts PNG to MHA before calling frd-score."""
+
+    def test_frd_receives_mha_paths_when_input_is_png(
+        self, tmp_path: Path
+    ) -> None:
+        from PIL import Image
+        from unittest.mock import patch
+
+        gt_dir = tmp_path / "gt"
+        pred_dir = tmp_path / "pred"
+        masks_dir = tmp_path / "masks"
+        gt_dir.mkdir()
+        pred_dir.mkdir()
+        masks_dir.mkdir()
+
+        rng = np.random.RandomState(99)
+        for i in range(3):
+            name = f"case_{i:03d}.png"
+            Image.fromarray(
+                rng.randint(0, 255, (48, 48), dtype=np.uint8)
+            ).save(gt_dir / name)
+            Image.fromarray(
+                rng.randint(0, 255, (48, 48), dtype=np.uint8)
+            ).save(pred_dir / name)
+            mask_data = np.zeros((48, 48), dtype=np.uint8)
+            mask_data[10:30, 10:30] = 255
+            Image.fromarray(mask_data).save(masks_dir / name)
+
+        output_file = tmp_path / "metrics.json"
+        evaluator = MamaSynthEval(
+            ground_truth_path=gt_dir,
+            predictions_path=pred_dir,
+            output_file=output_file,
+            masks_path=masks_dir,
+            enable_lpips=False,
+            enable_frd=True,
+            enable_segmentation=False,
+            enable_classification=False,
+        )
+
+        captured_args: list = []
+
+        def spy_frd(*args, **kwargs):
+            captured_args.extend(args)
+            return 42.0
+
+        with patch("frd_score.compute_frd", side_effect=spy_frd):
+            evaluator.evaluate()
+
+        assert len(captured_args) >= 1
+        gt_paths, pred_paths = captured_args[0]
+        # All paths should be .mha (converted from PNG)
+        for p in gt_paths + pred_paths:
+            assert p.endswith(".mha"), f"Expected .mha path, got {p}"

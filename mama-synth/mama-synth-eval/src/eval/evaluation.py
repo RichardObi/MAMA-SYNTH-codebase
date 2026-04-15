@@ -626,10 +626,43 @@ class MamaSynthEval:
             try:
                 from frd_score import compute_frd as frd_compute
 
-                frd_val = frd_compute(
-                    [frd_gt_paths, frd_pred_paths],
-                    paths_masks=[frd_mask_paths, frd_mask_paths],
+                # frd-score reads images with sitk.ReadImage() inside a
+                # multiprocessing Pool.  Some SimpleITK builds lack the
+                # PNG ImageIO plugin, causing RuntimeError.  Convert any
+                # PNG files to .mha (ITK-native, always supported) in a
+                # temporary directory before calling the library.
+                import tempfile
+
+                _has_png = any(
+                    p.endswith(".png") for p in
+                    frd_gt_paths + frd_pred_paths + frd_mask_paths
                 )
+
+                if _has_png:
+                    _tmpdir = tempfile.mkdtemp(prefix="frd_mha_")
+                    try:
+                        frd_gt_paths = self._ensure_mha(
+                            frd_gt_paths, _tmpdir, "gt"
+                        )
+                        frd_pred_paths = self._ensure_mha(
+                            frd_pred_paths, _tmpdir, "pred"
+                        )
+                        frd_mask_paths = self._ensure_mha(
+                            frd_mask_paths, _tmpdir, "mask"
+                        )
+                        frd_val = frd_compute(
+                            [frd_gt_paths, frd_pred_paths],
+                            paths_masks=[frd_mask_paths, frd_mask_paths],
+                        )
+                    finally:
+                        import shutil
+                        shutil.rmtree(_tmpdir, ignore_errors=True)
+                else:
+                    frd_val = frd_compute(
+                        [frd_gt_paths, frd_pred_paths],
+                        paths_masks=[frd_mask_paths, frd_mask_paths],
+                    )
+
                 agg[METRIC_FRD_ROI] = frd_val
                 detail["frd"] = frd_val
             except ImportError:
@@ -1586,6 +1619,39 @@ class MamaSynthEval:
         when shapes already match.
         """
         return MamaSynthEval._resize_array_to_target(pred, gt.shape)
+
+    @staticmethod
+    def _ensure_mha(
+        paths: list[str],
+        tmpdir: str,
+        prefix: str,
+    ) -> list[str]:
+        """Convert PNG files to ``.mha`` in *tmpdir* for frd-score.
+
+        Some SimpleITK builds lack the PNG ImageIO plugin, so
+        ``frd-score``'s internal ``sitk.ReadImage()`` fails on PNG
+        files.  This helper converts every PNG in *paths* to ITK-native
+        ``.mha`` format (always supported) in a temporary directory.
+        Non-PNG files are kept as-is.
+
+        Returns a new list of paths where each PNG has been replaced
+        with its ``.mha`` counterpart.
+        """
+        from PIL import Image as _PILImg
+
+        out: list[str] = []
+        for i, p in enumerate(paths):
+            if p.endswith(".png"):
+                arr = np.array(
+                    _PILImg.open(p).convert("L"), dtype=np.float32,
+                )
+                mha_path = Path(tmpdir) / f"{prefix}_{i:04d}.mha"
+                sitk_img = sitk.GetImageFromArray(arr)
+                sitk.WriteImage(sitk_img, str(mha_path))
+                out.append(str(mha_path))
+            else:
+                out.append(p)
+        return out
 
     @staticmethod
     def _load_image(path: Path) -> NDArray[np.floating]:
