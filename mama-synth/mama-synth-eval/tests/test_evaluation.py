@@ -465,3 +465,103 @@ class TestEvaluationWithResizeMismatch:
         # Should not raise ValueError about shape mismatch
         results = evaluator.evaluate()
         assert "aggregates" in results
+
+
+# ---------------------------------------------------------------------------
+# _resize_array_to_target (general resize helper)
+# ---------------------------------------------------------------------------
+
+
+class TestResizeArrayToTarget:
+    """Tests for the general-purpose _resize_array_to_target helper."""
+
+    def test_noop_when_shapes_match(self):
+        arr = np.random.rand(64, 64).astype(np.float64)
+        result = MamaSynthEval._resize_array_to_target(arr, (64, 64))
+        np.testing.assert_array_equal(result, arr)
+
+    def test_resizes_float_with_bicubic(self):
+        arr = np.random.rand(512, 512).astype(np.float64)
+        result = MamaSynthEval._resize_array_to_target(arr, (448, 448))
+        assert result.shape == (448, 448)
+        assert result.dtype == np.float64
+
+    def test_resizes_bool_mask_with_nearest(self):
+        """Boolean masks use NEAREST interpolation to stay binary."""
+        mask = np.zeros((64, 64), dtype=np.bool_)
+        mask[20:40, 20:40] = True
+        result = MamaSynthEval._resize_array_to_target(mask, (32, 32))
+        assert result.shape == (32, 32)
+        assert result.dtype == np.bool_
+        # The resized mask should still contain True values
+        assert np.any(result)
+
+    def test_resizes_uint8_mask_with_nearest(self):
+        """Integer arrays use NEAREST interpolation."""
+        arr = np.zeros((64, 64), dtype=np.uint8)
+        arr[10:30, 10:30] = 255
+        result = MamaSynthEval._resize_array_to_target(arr, (32, 32))
+        assert result.shape == (32, 32)
+        assert result.dtype == np.uint8
+        assert np.any(result == 255)
+
+    def test_preserves_float32_dtype(self):
+        arr = np.ones((64, 64), dtype=np.float32)
+        result = MamaSynthEval._resize_array_to_target(arr, (32, 32))
+        assert result.dtype == np.float32
+
+    def test_resize_pred_to_gt_delegates(self):
+        """_resize_pred_to_gt still works as a thin wrapper."""
+        gt = np.random.rand(48, 48).astype(np.float64)
+        pred = np.random.rand(64, 64).astype(np.float64)
+        result = MamaSynthEval._resize_pred_to_gt(pred, gt)
+        assert result.shape == (48, 48)
+
+
+class TestSegmentationWithResizeMismatch:
+    """Integration: segmentation works when pred/gt mask sizes differ."""
+
+    def test_segmentation_metrics_with_mismatched_sizes(self, tmp_path):
+        """_evaluate_segmentation resizes pred to match GT mask before segmenting."""
+        from PIL import Image
+
+        gt_dir = tmp_path / "gt"
+        pred_dir = tmp_path / "pred"
+        masks_dir = tmp_path / "masks"
+        gt_dir.mkdir()
+        pred_dir.mkdir()
+        masks_dir.mkdir()
+
+        # GT and masks at 48×48, pred at 64×64
+        rng = np.random.RandomState(42)
+        for name in ("case001.png", "case002.png"):
+            gt_img = Image.fromarray(
+                rng.randint(0, 255, (48, 48), dtype=np.uint8)
+            )
+            gt_img.save(gt_dir / name)
+
+            pred_img = Image.fromarray(
+                rng.randint(0, 255, (64, 64), dtype=np.uint8)
+            )
+            pred_img.save(pred_dir / name)
+
+            # Mask at GT resolution
+            mask_data = np.zeros((48, 48), dtype=np.float32)
+            mask_data[15:35, 15:35] = 1.0
+            mask_img = Image.fromarray((mask_data * 255).astype(np.uint8))
+            mask_img.save(masks_dir / name)
+
+        output_file = tmp_path / "metrics.json"
+        evaluator = MamaSynthEval(
+            ground_truth_path=gt_dir,
+            predictions_path=pred_dir,
+            output_file=output_file,
+            masks_path=masks_dir,
+            enable_lpips=False,
+            enable_frd=False,
+            enable_segmentation=True,
+            enable_classification=False,
+        )
+        # Should not raise ValueError about shape mismatch
+        results = evaluator.evaluate()
+        assert "aggregates" in results

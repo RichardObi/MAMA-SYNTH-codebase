@@ -195,21 +195,37 @@ python -m eval \
     --seg-model-path /path/to/nnunet-model \
     --clf-model-dir /path/to/classifiers \
     --cache-dir /path/to/feature-cache
+
+# Per-task classifier directories (override --clf-model-dir for specific tasks)
+python -m eval \
+    --ground-truth-path /path/to/ground-truth \
+    --predictions-path /path/to/predictions \
+    --masks-path /path/to/tumor-masks \
+    --labels-path /path/to/labels.csv \
+    --output-file metrics.json \
+    --clf-model-dir-contrast /path/to/contrast-models \
+    --clf-model-dir-tumor-roi /path/to/tumor-roi-models \
+    --clf-model-dir-luminal /path/to/luminal-models \
+    --clf-model-dir-tnbc /path/to/tnbc-models
 ```
 
 #### CLI Options
 
 | Flag | Default | Description |
 |---|---|---|
-| `-g, --ground-truth-path` | `/opt/app/ground-truth/` | Directory with reference post-contrast images |
+| `-g, --ground-truth-path` | `/opt/ml/input/data/ground_truth/` | Directory with reference post-contrast images |
 | `-i, --predictions-path` | `/input/` | Directory with generated post-contrast images |
 | `-o, --output-file` | `/output/metrics.json` | Output JSON file path |
 | `-m, --masks-path` | `None` | Tumor segmentation masks directory (enables ROI & SEG) |
 | `-l, --labels-path` | `None` | JSON/CSV file with molecular subtype labels (enables CLF) |
 | `--roi-margin-mm` | `10.0` | Dilation margin (mm) around tumor mask for ROI |
 | `--seg-model-path` | `None` | Pre-trained nnUNet model directory for segmentation |
-| `--clf-model-dir` | `None` | Directory with pre-trained `.pkl` classifier models |
-| `--ensemble` | `false` | Average probabilities across all models in `--clf-model-dir` |
+| `--clf-model-dir` | `None` | Legacy fallback: single directory with pre-trained classifier models for all tasks. Per-task directories (below) take precedence when provided. |
+| `--clf-model-dir-contrast` | `None` | Directory with pre-trained contrast classifier models (`contrast_classifier.pkl` / `contrast_classifier_cnn.pt`) |
+| `--clf-model-dir-tumor-roi` | `None` | Directory with pre-trained tumor-ROI classifier models (`tumor_roi_classifier.pkl`) |
+| `--clf-model-dir-luminal` | `None` | Directory with pre-trained luminal classifier models. Luminal classification is only evaluated when this (or `--clf-model-dir`) is provided. |
+| `--clf-model-dir-tnbc` | `None` | Directory with pre-trained TNBC classifier models. TNBC classification is only evaluated when this (or `--clf-model-dir`) is provided. |
+| `--ensemble` | `false` | Average probabilities across all models in classifier directory |
 | `--dual-phase` | `false` | Concatenate pre-contrast features for classification |
 | `--precontrast-path` | `None` | Pre-contrast images directory for `--dual-phase` |
 | `--cache-dir` | `None` | Feature cache directory (speeds up repeated FRD runs) |
@@ -269,7 +285,12 @@ evaluator = MamaSynthEval(
     enable_segmentation=True,
     enable_classification=True,
     seg_model_path="path/to/nnunet-model",  # optional
-    clf_model_dir="path/to/classifiers",    # optional
+    clf_model_dir="path/to/classifiers",    # optional (legacy fallback)
+    # Per-task classifier directories (take precedence over clf_model_dir):
+    clf_model_dir_contrast="path/to/contrast-classifiers",    # optional
+    clf_model_dir_tumor_roi="path/to/tumor-roi-classifiers",  # optional
+    clf_model_dir_luminal="path/to/luminal-classifiers",      # optional
+    clf_model_dir_tnbc="path/to/tnbc-classifiers",            # optional
     cache_dir="path/to/feature-cache",      # optional
 )
 results = evaluator.evaluate()
@@ -817,6 +838,17 @@ mamasynth-synthesize-and-evaluate \
     --masks-path /path/to/masks \
     --labels-path /path/to/labels.csv \
     --clf-model-dir /path/to/classifiers
+
+# Per-task classifier directories (override --clf-model-dir for specific tasks)
+mamasynth-synthesize-and-evaluate \
+    --data-dir /path/to/mama-mia-dataset \
+    --output-dir ./synthesized_images \
+    --output-file metrics.json \
+    --labels-path /path/to/labels.csv \
+    --clf-model-dir-contrast /path/to/contrast-models \
+    --clf-model-dir-tumor-roi /path/to/tumor-roi-models \
+    --clf-model-dir-luminal /path/to/luminal-models \
+    --clf-model-dir-tnbc /path/to/tnbc-models
 ```
 
 ### Using Your Own Model
@@ -824,38 +856,87 @@ mamasynth-synthesize-and-evaluate \
 Participants can skip the built-in synthesis and point directly at their own model outputs:
 
 ```bash
-# Just evaluate your own predictions
+# Just evaluate your own predictions (single classifier directory)
 mamasynth-synthesize-and-evaluate \
     --predictions-dir /path/to/your-predictions \
     --ground-truth-path /path/to/ground-truth \
     --masks-path /path/to/masks \
     --labels-path /path/to/labels.csv \
+    --clf-model-dir /path/to/classifiers \
+    --output-file metrics.json
+
+# Or with per-task classifier directories
+mamasynth-synthesize-and-evaluate \
+    --predictions-dir /path/to/your-predictions \
+    --ground-truth-path /path/to/ground-truth \
+    --masks-path /path/to/masks \
+    --labels-path /path/to/labels.csv \
+    --clf-model-dir-contrast /path/to/contrast-models \
+    --clf-model-dir-luminal /path/to/luminal-models \
+    --clf-model-dir-tnbc /path/to/tnbc-models \
     --output-file metrics.json
 ```
 
-### Synthesis CLI Options
+### Synthesis-Only CLI Options (`mamasynth-synthesize`)
 
 | Flag | Default | Description |
 |---|---|---|
-| `--data-dir` | `None` | MAMA-MIA dataset root (auto-resolves images/GT paths) |
+| `--data-dir` | `None` | MAMA-MIA dataset root (auto-resolves `images/` and `segmentations/` paths) |
 | `--input-dir` | `None` | Directory with pre-contrast images (overrides `--data-dir`) |
-| `--output-dir` | `./synthesized_output` | Where to save generated PNG images |
+| `--output-dir` | *required* | Where to save generated PNG images |
 | `--slice-mode` | `max_tumor` | Slice selection strategy: `max_tumor` (largest tumour area), `center_tumor` (tumour centroid), `all_tumor` (every tumour-containing slice) |
-| `--masks-dir` | `None` | Segmentation masks directory (auto-resolved from `--data-dir`/segmentations if not set) |
+| `--masks-dir` | `None` | Segmentation masks directory (auto-resolved from `<data-dir>/segmentations` if not set) |
 | `--model` | `medigan` | Synthesis model name |
 | `--model-id` | `00023_PIX2PIXHD_BREAST_DCEMRI` | medigan model ID |
 | `--phase` | `0` | DCE-MRI phase of input images (0=pre-contrast) |
 | `--gpu-id` | `0` | GPU device — bare int (`0`→`cuda:0`, `-1`→CPU) or full string (`cuda:0`, `cpu`) |
 | `--image-size` | `512` | Spatial resolution for the model |
 | `--keep-work-dir` | `false` | Keep intermediate staging directories (PNG slices) for debugging |
-| `--predictions-dir` | `None` | Skip synthesis, evaluate existing predictions |
-| `--ground-truth-path` | `None` | Ground-truth directory for evaluation |
-| `--output-file` | `metrics.json` | Evaluation output JSON path |
-| `--masks-path` | `None` | Tumor masks directory |
-| `--labels-path` | `None` | Molecular subtype labels (JSON/CSV) |
-| `--clf-model-dir` | `None` | Pre-trained classifier directory |
+| `-v, --verbose` | `false` | Verbose logging |
+
+### Synthesize-and-Evaluate CLI Options (`mamasynth-synthesize-and-evaluate`)
+
+**Synthesis options:**
+
+| Flag | Default | Description |
+|---|---|---|
+| `--data-dir` | `None` | MAMA-MIA dataset root (auto-resolves images, GT, masks paths) |
+| `--input-dir` | `None` | Directory with pre-contrast images (overrides `--data-dir`) |
+| `--output-dir` | `None` | Where to save generated PNG images. Also used as `--predictions-dir` if the latter is not set. |
+| `--slice-mode` | `max_tumor` | Slice selection strategy: `max_tumor`, `center_tumor`, `all_tumor` |
+| `--masks-dir` | `None` | Segmentation masks directory for slice selection during synthesis. Falls back to `--masks-path` when not set. Auto-resolved from `<data-dir>/segmentations`. |
+| `--model` | `medigan` | Synthesis model name |
+| `--model-id` | `00023_PIX2PIXHD_BREAST_DCEMRI` | medigan model ID |
+| `--phase` | `0` | DCE-MRI phase of input images (0=pre-contrast) |
+| `--gpu-id` | `0` | GPU device — bare int (`0`→`cuda:0`, `-1`→CPU) or full string (`cuda:0`, `cpu`) |
+| `--image-size` | `512` | Spatial resolution for the model |
+| `--keep-work-dir` | `false` | Keep intermediate staging directories for debugging |
+| `--skip-synthesis` | `false` | Skip synthesis step — only run evaluation. Requires `--predictions-dir`. |
+
+**Evaluation options:**
+
+| Flag | Default | Description |
+|---|---|---|
+| `--predictions-dir` | `None` | Directory with pre-generated predictions. If set, synthesis is skipped and these are evaluated directly. |
+| `-g, --ground-truth-path` | `None` | Ground-truth post-contrast images (default: `<data-dir>/images`) |
+| `-o, --output-file` | `metrics.json` | Evaluation output JSON path |
+| `-m, --masks-path` | `None` | Tumor masks directory (default: `<data-dir>/segmentations`) |
+| `-l, --labels-path` | `None` | Molecular subtype labels (JSON/CSV) |
+| `--clf-model-dir` | `None` | Legacy fallback: single directory with pre-trained classifier models for all tasks. Per-task directories (below) take precedence. |
+| `--clf-model-dir-contrast` | `None` | Directory with pre-trained contrast classifier models (`contrast_classifier.pkl` / `contrast_classifier_cnn.pt`) |
+| `--clf-model-dir-tumor-roi` | `None` | Directory with pre-trained tumor-ROI classifier models (`tumor_roi_classifier.pkl`) |
+| `--clf-model-dir-luminal` | `None` | Directory with pre-trained luminal classifier models |
+| `--clf-model-dir-tnbc` | `None` | Directory with pre-trained TNBC classifier models |
 | `--seg-model-path` | `None` | Pre-trained nnUNet model directory |
-| `--skip-synthesis` | `false` | Skip synthesis step in combined command |
+| `--ensemble` | `false` | Average probabilities across all models in classifier directory |
+| `--dual-phase` | `false` | Concatenate pre-contrast features for classification |
+| `--precontrast-path` | `None` | Pre-contrast images directory for `--dual-phase` |
+| `--cache-dir` | `None` | Feature cache directory |
+| `--disable-lpips` | `false` | Skip LPIPS computation |
+| `--disable-frd` | `false` | Skip FRD computation |
+| `--disable-segmentation` | `false` | Skip segmentation evaluation |
+| `--disable-classification` | `false` | Skip classification evaluation |
+| `-v, --verbose` | `false` | Verbose logging |
 
 ## Docker
 
@@ -931,12 +1012,13 @@ mama-synth-eval
 │   ├── training_visualization.py # Confusion matrix, ROC, PR, dashboards
 │   ├── segmentation.py          # Tumor segmentation (ThresholdSegmenter, NNUNetSegmenter)
 │   ├── roi_utils.py             # Tumor ROI extraction & mask dilation
+│   ├── mirror_utils.py          # Mirrored tumor mask generation for tumor-ROI classification
 │   ├── ranking.py               # Borda-style rank aggregation
 │   ├── visualization.py         # Result visualization (tables, charts, overlays)
 │   ├── synthesize.py            # Synthesis pipeline (medigan wrapper + CLI)
 │   ├── webapp.py                # Streamlit web interface
 │   └── generate_test_data.py    # Artificial test data generator
-├── tests/                       # 300+ tests (unit + integration + E2E)
+├── tests/                       # 520+ tests (unit + integration + E2E)
 │   ├── conftest.py              # Shared fixtures
 │   ├── test_evaluation.py       # Evaluation & normalizer tests
 │   ├── test_metrics.py          # Metric tests
@@ -949,9 +1031,12 @@ mama-synth-eval
 │   ├── test_train_classifier.py # Classifier training tests
 │   ├── test_train_cnn_classifier.py # CNN classifier training tests
 │   ├── test_v070_features.py    # v0.7.0 feature tests (dual-phase, ensemble, etc.)
+│   ├── test_v080_features.py    # v0.8.0 feature tests (CSV splits, CNN caching, device)
 │   ├── test_v090_features.py    # v0.9.0 feature tests (run dirs, contrast, caching)
 │   ├── test_synthesize.py       # Synthesis pipeline tests
 │   ├── test_slice_extraction.py # 2D slice extraction tests
+│   ├── test_mirror_utils.py     # Mirror utility tests
+│   ├── test_tumor_roi_integration.py # Tumor ROI integration tests
 │   └── test_training_visualization.py # Training visualisation tests
 ├── PDF_ANALYSIS.md              # Contradictions & uncertainties analysis
 ├── Dockerfile                   # Grand Challenge container

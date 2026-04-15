@@ -581,6 +581,11 @@ class MamaSynthEval:
             pred_image = self._load_image_cached(pred_path).astype(np.float64)
             gt_mask = masks[stem]
 
+            # Resize pred to match GT mask resolution if needed
+            pred_image = self._resize_array_to_target(
+                pred_image, gt_mask.shape
+            )
+
             # Apply segmentation model to synthetic image
             pred_mask = seg_model.predict(pred_image)
 
@@ -744,6 +749,10 @@ class MamaSynthEval:
                                             sitk.ReadImage(str(mp), sitk.sitkUInt8)
                                         ).astype(bool)
                                     break
+                        if mask_arr is not None and mask_arr.shape != img.shape:
+                            mask_arr = self._resize_array_to_target(
+                                mask_arr, img.shape
+                            )
                         cnn_masks.append(mask_arr)
 
                 y_score = ensemble.predict_proba(
@@ -809,6 +818,10 @@ class MamaSynthEval:
                                             sitk.ReadImage(str(mp), sitk.sitkUInt8)
                                         ).astype(bool)
                                     break
+                        if mask_arr_single is not None and mask_arr_single.shape != img.shape:
+                            mask_arr_single = self._resize_array_to_target(
+                                mask_arr_single, img.shape
+                            )
                         cnn_msks.append(mask_arr_single)
                         cnn_y.append(
                             labels[stem].get(task, 0)
@@ -971,6 +984,11 @@ class MamaSynthEval:
 
             # Load the synthetic image
             pred_image = self._load_image_cached(pred_path).astype(np.float64)
+
+            # Resize pred to match mask resolution if needed
+            pred_image = self._resize_array_to_target(
+                pred_image, mask_arr.shape
+            )
 
             # Create mirrored mask
             mirrored = create_mirrored_mask(pred_image, mask_arr)
@@ -1163,6 +1181,51 @@ class MamaSynthEval:
         }
 
     @staticmethod
+    def _resize_array_to_target(
+        arr: NDArray,
+        target_shape: tuple[int, ...],
+    ) -> NDArray:
+        """Resize *arr* to *target_shape* (H, W).
+
+        Uses Pillow BICUBIC for floating-point arrays and NEAREST for
+        boolean / integer arrays (masks).  Returns *arr* unchanged when
+        shapes already match.
+        """
+        if arr.shape == target_shape:
+            return arr
+        try:
+            from PIL import Image as _PILImg
+
+            # PIL size is (W, H)
+            target_size = (target_shape[1], target_shape[0])
+
+            is_bool = arr.dtype == np.bool_
+            if is_bool:
+                # Masks: convert to uint8, resize with NEAREST, convert back
+                pil_img = _PILImg.fromarray(arr.astype(np.uint8) * 255)
+                pil_resized = pil_img.resize(target_size, _PILImg.NEAREST)
+                resized = np.array(pil_resized, dtype=np.uint8) > 127
+            elif np.issubdtype(arr.dtype, np.integer):
+                pil_img = _PILImg.fromarray(arr)
+                pil_resized = pil_img.resize(target_size, _PILImg.NEAREST)
+                resized = np.array(pil_resized, dtype=arr.dtype)
+            else:
+                pil_img = _PILImg.fromarray(arr.astype(np.float64))
+                pil_resized = pil_img.resize(target_size, _PILImg.BICUBIC)
+                resized = np.array(pil_resized, dtype=arr.dtype)
+
+            logger.debug(
+                f"Resized array {arr.shape} -> {resized.shape} "
+                f"(dtype={arr.dtype})"
+            )
+            return resized
+        except ImportError:
+            raise ValueError(
+                f"Shape mismatch: {arr.shape} vs target {target_shape} "
+                f"and Pillow is not available for resizing."
+            )
+
+    @staticmethod
     def _resize_pred_to_gt(
         pred: NDArray[np.floating],
         gt: NDArray[np.floating],
@@ -1175,27 +1238,7 @@ class MamaSynthEval:
         Uses Pillow BICUBIC interpolation.  Returns *pred* unchanged
         when shapes already match.
         """
-        if pred.shape == gt.shape:
-            return pred
-        try:
-            from PIL import Image as _PILImg
-
-            # gt.shape is (H, W); PIL size is (W, H)
-            target_size = (gt.shape[1], gt.shape[0])
-            pil_img = _PILImg.fromarray(pred.astype(np.float64))
-            pil_resized = pil_img.resize(target_size, _PILImg.BICUBIC)
-            resized = np.array(pil_resized, dtype=pred.dtype)
-            logger.debug(
-                f"Resized prediction {pred.shape} -> {resized.shape} "
-                f"to match ground truth"
-            )
-            return resized
-        except ImportError:
-            raise ValueError(
-                f"Shape mismatch: prediction {pred.shape} vs "
-                f"ground truth {gt.shape} and Pillow is not available "
-                f"for resizing."
-            )
+        return MamaSynthEval._resize_array_to_target(pred, gt.shape)
 
     @staticmethod
     def _load_image(path: Path) -> NDArray[np.floating]:
