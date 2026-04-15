@@ -413,6 +413,56 @@ def compute_hd95(
 # Perceptual metric (LPIPS)
 # ---------------------------------------------------------------------------
 
+# Module-level cache for the LPIPS model so it is loaded only once per
+# process.  Re-creating the model on every call was the root cause of
+# steadily growing memory that eventually triggered the OOM-killer in
+# long-running tmux sessions.
+_LPIPS_MODEL_CACHE: dict[str, object] = {}
+
+
+def _get_lpips_model(net: str = "alex"):
+    """Return a cached LPIPS evaluation model.
+
+    Tries ``torchmetrics`` first (actively maintained, reliable memory
+    behaviour), falling back to the ``lpips`` pip package.
+    """
+    if net in _LPIPS_MODEL_CACHE:
+        return _LPIPS_MODEL_CACHE[net], "torchmetrics" if hasattr(
+            _LPIPS_MODEL_CACHE[net], "compute"
+        ) else "lpips"
+
+    # --- Prefer torchmetrics -------------------------------------------------
+    try:
+        from torchmetrics.image.lpip import (
+            LearnedPerceptualImagePatchSimilarity,
+        )
+
+        model = LearnedPerceptualImagePatchSimilarity(net_type=net)
+        model.eval()
+        _LPIPS_MODEL_CACHE[net] = model
+        logger.debug("LPIPS: using torchmetrics backend (net=%s)", net)
+        return model, "torchmetrics"
+    except (ImportError, Exception):
+        pass
+
+    # --- Fall back to lpips package ------------------------------------------
+    try:
+        import lpips as lpips_mod
+
+        model = lpips_mod.LPIPS(net=net, verbose=False)
+        model.eval()
+        _LPIPS_MODEL_CACHE[net] = model
+        logger.debug("LPIPS: using lpips package backend (net=%s)", net)
+        return model, "lpips"
+    except ImportError:
+        pass
+
+    raise ImportError(
+        "LPIPS computation requires either 'torchmetrics' (recommended) or "
+        "'lpips' package.  Install with:  pip install torchmetrics  or  "
+        "pip install lpips"
+    )
+
 
 def compute_lpips(
     prediction: NDArray[np.floating],
@@ -424,7 +474,11 @@ def compute_lpips(
     LPIPS measures perceptual distance between images using deep features.
     Lower values indicate higher perceptual similarity.
 
-    Requires the ``lpips`` and ``torch`` packages (optional dependencies).
+    Prefers ``torchmetrics`` when available (actively maintained, stable
+    memory usage).  Falls back to the ``lpips`` pip package.  The
+    underlying model is **cached at module level** so it is loaded only
+    once per process — this avoids the memory leak that previously caused
+    OOM-kills during long evaluations.
 
     Args:
         prediction: Predicted image array (2D: H×W or 3D: slices×H×W).
@@ -435,16 +489,9 @@ def compute_lpips(
         Mean LPIPS value across slices. Lower is better.
 
     Raises:
-        ImportError: If torch or lpips packages are not installed.
+        ImportError: If neither torchmetrics nor lpips package is installed.
     """
-    try:
-        import torch
-        import lpips as lpips_mod
-    except ImportError as exc:
-        raise ImportError(
-            "LPIPS computation requires 'torch' and 'lpips' packages. "
-            "Install them with: pip install torch lpips"
-        ) from exc
+    import torch
 
     _validate_inputs(prediction, ground_truth)
 
@@ -458,9 +505,8 @@ def compute_lpips(
     prediction_norm = _normalize(prediction)
     ground_truth_norm = _normalize(ground_truth)
 
-    # Create LPIPS model (cached on module level for efficiency)
-    loss_fn = lpips_mod.LPIPS(net=net, verbose=False)
-    loss_fn.eval()
+    # Get the cached model
+    loss_fn, backend = _get_lpips_model(net)
 
     if prediction.ndim == 2:
         slices_pred = [prediction_norm]
@@ -480,7 +526,13 @@ def compute_lpips(
             t_gt = torch.from_numpy(s_gt).float().unsqueeze(0).unsqueeze(0)
             t_gt = t_gt.expand(-1, 3, -1, -1)
 
-            val = loss_fn(t_pred, t_gt)
+            if backend == "torchmetrics":
+                loss_fn.reset()
+                loss_fn.update(t_pred, t_gt)
+                val = loss_fn.compute()
+            else:
+                val = loss_fn(t_pred, t_gt)
+
             lpips_values.append(float(val.item()))
 
     return float(np.mean(lpips_values))

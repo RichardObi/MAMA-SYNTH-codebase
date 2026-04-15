@@ -565,3 +565,69 @@ class TestSegmentationWithResizeMismatch:
         # Should not raise ValueError about shape mismatch
         results = evaluator.evaluate()
         assert "aggregates" in results
+
+class TestFRDROIPassesMasks:
+    """Verify that _evaluate_roi passes dilated masks to compute_frd."""
+
+    def test_frd_receives_roi_masks(self, tmp_path: Path) -> None:
+        """compute_frd should receive masks_real and masks_synthetic kwargs."""
+        from PIL import Image
+        from unittest.mock import patch
+
+        gt_dir = tmp_path / "gt"
+        pred_dir = tmp_path / "pred"
+        masks_dir = tmp_path / "masks"
+        gt_dir.mkdir()
+        pred_dir.mkdir()
+        masks_dir.mkdir()
+
+        rng = np.random.RandomState(42)
+        # Create 3 image pairs (FRD needs >= 2 samples)
+        for i in range(3):
+            name = f"case_{i:03d}.png"
+            arr = rng.randint(0, 255, (48, 48), dtype=np.uint8)
+            Image.fromarray(arr).save(gt_dir / name)
+            Image.fromarray(rng.randint(0, 255, (48, 48), dtype=np.uint8)).save(
+                pred_dir / name
+            )
+            # Mask with a small foreground region
+            mask_data = np.zeros((48, 48), dtype=np.uint8)
+            mask_data[15:35, 15:35] = 255
+            Image.fromarray(mask_data).save(masks_dir / name)
+
+        output_file = tmp_path / "metrics.json"
+        evaluator = MamaSynthEval(
+            ground_truth_path=gt_dir,
+            predictions_path=pred_dir,
+            output_file=output_file,
+            masks_path=masks_dir,
+            enable_lpips=False,
+            enable_frd=True,
+            enable_segmentation=False,
+            enable_classification=False,
+        )
+
+        captured_kwargs: dict = {}
+
+        def spy_frd(*args, **kwargs):
+            captured_kwargs.update(kwargs)
+            # Return a dummy value to avoid slow pyradiomics execution
+            return 42.0
+
+        with patch("eval.frd.compute_frd", side_effect=spy_frd):
+            results = evaluator.evaluate()
+
+        # Verify masks_real and masks_synthetic were passed
+        assert "masks_real" in captured_kwargs, (
+            "compute_frd must receive masks_real kwarg"
+        )
+        assert "masks_synthetic" in captured_kwargs, (
+            "compute_frd must receive masks_synthetic kwarg"
+        )
+        assert captured_kwargs["masks_real"] is not None
+        assert captured_kwargs["masks_synthetic"] is not None
+        assert len(captured_kwargs["masks_real"]) == 3
+        assert len(captured_kwargs["masks_synthetic"]) == 3
+        # Each mask should be a boolean array
+        for m in captured_kwargs["masks_real"]:
+            assert m.dtype == bool, f"Expected bool mask, got {m.dtype}"

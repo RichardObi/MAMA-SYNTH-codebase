@@ -486,6 +486,7 @@ class MamaSynthEval:
         ssim_values: list[float] = []
         real_rois: list[NDArray] = []
         synth_rois: list[NDArray] = []
+        roi_masks: list[NDArray] = []
 
         for gt_path, pred_path in tqdm(pairs, desc="ROI metrics", leave=False):
             stem = self._get_stem(gt_path)
@@ -498,7 +499,7 @@ class MamaSynthEval:
             pred = self._resize_pred_to_gt(pred, gt)
             mask = masks[stem]
 
-            real_roi, synth_roi, _ = extract_roi_pair(
+            real_roi, synth_roi, roi_mask = extract_roi_pair(
                 gt, pred, mask, margin_mm=self.roi_margin_mm
             )
 
@@ -512,6 +513,7 @@ class MamaSynthEval:
 
             real_rois.append(real_roi)
             synth_rois.append(synth_roi)
+            roi_masks.append(roi_mask)
 
         if not ssim_values:
             return {}
@@ -526,7 +528,12 @@ class MamaSynthEval:
             try:
                 from eval.frd import compute_frd as _frd
 
-                frd_val = _frd(real_rois, synth_rois)
+                frd_val = _frd(
+                    real_rois,
+                    synth_rois,
+                    masks_real=roi_masks,
+                    masks_synthetic=roi_masks,
+                )
                 agg[METRIC_FRD_ROI] = frd_val
                 detail["frd"] = frd_val
             except ImportError:

@@ -306,3 +306,117 @@ class TestInputValidation:
             compute_ssim(pred, gt)
         with pytest.raises(ValueError, match="Shape mismatch"):
             compute_ncc(pred, gt)
+
+
+
+# ===================================================================
+# LPIPS model caching and backend selection
+# ===================================================================
+
+
+class TestLPIPSCaching:
+    """Tests for the LPIPS model caching and backend selection."""
+
+    def test_get_lpips_model_returns_same_object(self) -> None:
+        """_get_lpips_model should return the same cached object on repeat calls."""
+        import types
+        import unittest.mock
+        from eval.metrics import _LPIPS_MODEL_CACHE, _get_lpips_model
+
+        _LPIPS_MODEL_CACHE.clear()
+
+        fake_model = types.SimpleNamespace(eval=lambda: None)
+
+        fake_lpips = types.SimpleNamespace(
+            LPIPS=lambda net, verbose: fake_model,
+        )
+        with unittest.mock.patch.dict("sys.modules", {
+            "torchmetrics": None,
+            "torchmetrics.image": None,
+            "torchmetrics.image.lpip": None,
+            "lpips": fake_lpips,
+        }):
+            model1, backend1 = _get_lpips_model("alex")
+            model2, backend2 = _get_lpips_model("alex")
+            assert model1 is model2, "Model should be cached and reused"
+            assert backend1 == backend2
+
+        _LPIPS_MODEL_CACHE.clear()
+
+    def test_different_nets_get_separate_cache_entries(self) -> None:
+        """Different net types should have separate cache entries."""
+        import types
+        import unittest.mock
+        from eval.metrics import _LPIPS_MODEL_CACHE, _get_lpips_model
+
+        _LPIPS_MODEL_CACHE.clear()
+
+        call_count = 0
+
+        def make_model(net, verbose=False):
+            nonlocal call_count
+            call_count += 1
+            return types.SimpleNamespace(eval=lambda: None, _net=net)
+
+        fake_lpips = types.SimpleNamespace(LPIPS=make_model)
+
+        with unittest.mock.patch.dict("sys.modules", {
+            "torchmetrics": None,
+            "torchmetrics.image": None,
+            "torchmetrics.image.lpip": None,
+            "lpips": fake_lpips,
+        }):
+            m1, _ = _get_lpips_model("alex")
+            m2, _ = _get_lpips_model("vgg")
+            assert m1 is not m2
+            assert call_count == 2
+
+        _LPIPS_MODEL_CACHE.clear()
+
+    def test_import_error_when_no_backend_available(self) -> None:
+        """Should raise ImportError when neither torchmetrics nor lpips is available."""
+        import unittest.mock
+        import pytest
+        from eval.metrics import _LPIPS_MODEL_CACHE, _get_lpips_model
+
+        _LPIPS_MODEL_CACHE.clear()
+
+        with unittest.mock.patch.dict("sys.modules", {
+            "torchmetrics": None,
+            "torchmetrics.image": None,
+            "torchmetrics.image.lpip": None,
+            "lpips": None,
+        }):
+            with pytest.raises(ImportError, match="torchmetrics"):
+                _get_lpips_model("alex")
+
+        _LPIPS_MODEL_CACHE.clear()
+
+    def test_prefers_torchmetrics_over_lpips(self) -> None:
+        """When both are available, torchmetrics should be preferred."""
+        import types
+        import unittest.mock
+        from eval.metrics import _LPIPS_MODEL_CACHE, _get_lpips_model
+
+        _LPIPS_MODEL_CACHE.clear()
+
+        fake_tm_model = types.SimpleNamespace(
+            eval=lambda: None,
+            compute=lambda: 0.1,
+            reset=lambda: None,
+            update=lambda *a: None,
+        )
+        fake_tm_module = types.SimpleNamespace(
+            LearnedPerceptualImagePatchSimilarity=lambda net_type: fake_tm_model,
+        )
+
+        with unittest.mock.patch.dict("sys.modules", {
+            "torchmetrics": types.SimpleNamespace(image=types.SimpleNamespace(lpip=fake_tm_module)),
+            "torchmetrics.image": types.SimpleNamespace(lpip=fake_tm_module),
+            "torchmetrics.image.lpip": fake_tm_module,
+        }):
+            model, backend = _get_lpips_model("alex")
+            assert backend == "torchmetrics"
+            assert model is fake_tm_model
+
+        _LPIPS_MODEL_CACHE.clear()
