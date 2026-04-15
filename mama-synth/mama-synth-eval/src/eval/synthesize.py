@@ -864,12 +864,36 @@ def _extract_and_save_slices(
     if arr.ndim == 4:
         arr = arr[0]
     elif arr.ndim != 3:
-        raise ValueError(
-            f"Expected 3D or 4D NIfTI, got {arr.ndim}D from {nifti_path}"
+        if arr.ndim == 2:
+            logger.warning(
+                f"Input image {nifti_path} is 2D; treating it as a single "
+                "slice volume for compatibility with the pipeline."
+            )
+            arr = arr[np.newaxis, ...]  # add slice dimension
+        else:
+            raise ValueError(
+                f"Expected 3D or 4D NIfTI, got {arr.ndim}D from {nifti_path} for patient "
+                f"{patient_id}"
         )
+    
+    if mask_arr is not None:
+        # Not strictly necessary to handle 2D masks here since the slice selection logic will fall back to the only available slice, but we can add a warning and reshape for robustness.
+        if mask_arr.ndim == 2:
+            mask_arr = mask_arr[np.newaxis, ...]
+        elif mask_arr.ndim == 4:
+            mask_arr = mask_arr[0]
+        elif arr.ndim != 3:
+            raise ValueError(
+                f"Expected 3D mask, got {mask_arr.ndim}D for patient "
+                f"{patient_id}"
+            )
 
     # Select slices
-    indices = _select_slices(arr, mask_arr, slice_mode)
+    if arr.shape[0] == 1:
+        # avoinding warnings/errors from slice selection logic when there's only one slice
+        indices = [0]
+    else:
+        indices = _select_slices(arr, mask_arr, slice_mode)
 
     # Normalise to [0, 255] based on full volume range
     vmin, vmax = float(arr.min()), float(arr.max())

@@ -420,3 +420,62 @@ class TestLPIPSCaching:
             assert model is fake_tm_model
 
         _LPIPS_MODEL_CACHE.clear()
+
+
+class TestSSIMMask:
+    """Tests that SSIM mask parameter restricts computation to masked region."""
+
+    def test_mask_excludes_background(self) -> None:
+        """SSIM with mask should ignore zero-padded background."""
+        rng = np.random.RandomState(99)
+        # Create ROI-like crop: signal in center, zero background
+        gt = np.zeros((32, 32), dtype=np.float64)
+        pred = np.zeros((32, 32), dtype=np.float64)
+        mask = np.zeros((32, 32), dtype=bool)
+
+        # Only center 16x16 has signal
+        gt[8:24, 8:24] = rng.rand(16, 16) * 100 + 50
+        pred[8:24, 8:24] = gt[8:24, 8:24] + rng.randn(16, 16) * 5
+        mask[8:24, 8:24] = True
+
+        ssim_no_mask = compute_ssim(pred, gt)
+        ssim_with_mask = compute_ssim(pred, gt, mask=mask)
+
+        # Without mask, the large zero background inflates similarity.
+        # With mask, SSIM reflects only the actual signal region.
+        # They should be different values.
+        assert ssim_no_mask != pytest.approx(ssim_with_mask, abs=0.01), (
+            "SSIM with mask should differ from SSIM without mask "
+            "when background is zero-padded"
+        )
+
+    def test_mask_identical_images(self) -> None:
+        """Identical images should give SSIM=1.0 even with mask."""
+        img = np.random.RandomState(77).rand(20, 20).astype(np.float64) * 100
+        mask = np.zeros((20, 20), dtype=bool)
+        mask[5:15, 5:15] = True
+        assert compute_ssim(img, img, mask=mask) == pytest.approx(1.0)
+
+    def test_mask_data_range_from_masked_region(self) -> None:
+        """When data_range is None, it should be computed from masked pixels."""
+        # gt has values 50-150 in masked region, 0 in background
+        gt = np.zeros((20, 20), dtype=np.float64)
+        pred = np.zeros((20, 20), dtype=np.float64)
+        mask = np.zeros((20, 20), dtype=bool)
+
+        gt[5:15, 5:15] = 100.0
+        pred[5:15, 5:15] = 100.0
+        mask[5:15, 5:15] = True
+
+        # With mask: data_range should be 0 (constant region) -> SSIM = 1.0
+        ssim_val = compute_ssim(pred, gt, mask=mask)
+        assert ssim_val == pytest.approx(1.0)
+
+    def test_mask_none_is_backward_compatible(self) -> None:
+        """Passing mask=None should behave identically to no mask."""
+        rng = np.random.RandomState(123)
+        img1 = rng.rand(15, 15).astype(np.float64)
+        img2 = rng.rand(15, 15).astype(np.float64)
+        assert compute_ssim(img1, img2) == pytest.approx(
+            compute_ssim(img1, img2, mask=None)
+        )

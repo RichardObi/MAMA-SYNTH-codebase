@@ -567,10 +567,10 @@ class TestSegmentationWithResizeMismatch:
         assert "aggregates" in results
 
 class TestFRDROIPassesMasks:
-    """Verify that _evaluate_roi passes dilated masks to compute_frd."""
+    """Verify that _evaluate_roi calls official frd_score.compute_frd with masks."""
 
-    def test_frd_receives_roi_masks(self, tmp_path: Path) -> None:
-        """compute_frd should receive masks_real and masks_synthetic kwargs."""
+    def test_frd_receives_file_paths_and_masks(self, tmp_path: Path) -> None:
+        """frd_score.compute_frd should receive file-path lists + masks."""
         from PIL import Image
         from unittest.mock import patch
 
@@ -607,27 +607,460 @@ class TestFRDROIPassesMasks:
             enable_classification=False,
         )
 
+        captured_args: list = []
         captured_kwargs: dict = {}
 
         def spy_frd(*args, **kwargs):
+            captured_args.extend(args)
             captured_kwargs.update(kwargs)
-            # Return a dummy value to avoid slow pyradiomics execution
             return 42.0
 
-        with patch("eval.frd.compute_frd", side_effect=spy_frd):
+        with patch("frd_score.compute_frd", side_effect=spy_frd):
             results = evaluator.evaluate()
 
-        # Verify masks_real and masks_synthetic were passed
-        assert "masks_real" in captured_kwargs, (
-            "compute_frd must receive masks_real kwarg"
+        # frd_score.compute_frd receives [gt_paths, pred_paths]
+        assert len(captured_args) >= 1, "compute_frd must receive paths argument"
+        paths_arg = captured_args[0]
+        assert isinstance(paths_arg, list) and len(paths_arg) == 2
+        gt_paths, pred_paths = paths_arg
+        assert len(gt_paths) == 3
+        assert len(pred_paths) == 3
+        # Each should be a string file path
+        for p in gt_paths + pred_paths:
+            assert isinstance(p, str), f"Expected str path, got {type(p)}"
+
+        # paths_masks should be [mask_paths, mask_paths]
+        assert "paths_masks" in captured_kwargs, (
+            "compute_frd must receive paths_masks kwarg"
         )
-        assert "masks_synthetic" in captured_kwargs, (
-            "compute_frd must receive masks_synthetic kwarg"
+        mask_lists = captured_kwargs["paths_masks"]
+        assert isinstance(mask_lists, list) and len(mask_lists) == 2
+        assert len(mask_lists[0]) == 3
+        assert len(mask_lists[1]) == 3
+        # Both mask lists should reference the same files (same masks for GT & pred)
+        assert mask_lists[0] == mask_lists[1]
+        for p in mask_lists[0]:
+            assert isinstance(p, str), f"Expected str mask path, got {type(p)}"
+
+class TestContrastClassification:
+    """Tests for the _evaluate_contrast method."""
+
+    def test_contrast_called_when_model_dir_provided(self, tmp_path: Path) -> None:
+        """Contrast evaluation should run when --clf-model-dir-contrast is set."""
+        from PIL import Image
+        from unittest.mock import patch, MagicMock
+
+        gt_dir = tmp_path / "gt"
+        pred_dir = tmp_path / "pred"
+        precon_dir = tmp_path / "precontrast"
+        clf_dir = tmp_path / "clf_contrast"
+        gt_dir.mkdir(); pred_dir.mkdir(); precon_dir.mkdir(); clf_dir.mkdir()
+
+        rng = np.random.RandomState(55)
+        for i in range(4):
+            name = f"case_{i:03d}.png"
+            for d in (gt_dir, pred_dir, precon_dir):
+                Image.fromarray(
+                    rng.randint(0, 255, (32, 32), dtype=np.uint8)
+                ).save(d / name)
+
+        # Create a dummy pkl model
+        import pickle
+        from sklearn.ensemble import RandomForestClassifier
+        dummy_model = RandomForestClassifier(n_estimators=2, random_state=42)
+        X = rng.rand(10, 93)
+        y = np.array([0]*5 + [1]*5)
+        dummy_model.fit(X, y)
+        with open(clf_dir / "contrast_classifier.pkl", "wb") as f:
+            pickle.dump(dummy_model, f)
+
+        output_file = tmp_path / "metrics.json"
+        evaluator = MamaSynthEval(
+            ground_truth_path=gt_dir,
+            predictions_path=pred_dir,
+            output_file=output_file,
+            enable_lpips=False,
+            enable_frd=False,
+            enable_segmentation=False,
+            enable_classification=True,
+            clf_model_dir_contrast=clf_dir,
+            precontrast_path=precon_dir,
         )
-        assert captured_kwargs["masks_real"] is not None
-        assert captured_kwargs["masks_synthetic"] is not None
-        assert len(captured_kwargs["masks_real"]) == 3
-        assert len(captured_kwargs["masks_synthetic"]) == 3
-        # Each mask should be a boolean array
-        for m in captured_kwargs["masks_real"]:
-            assert m.dtype == bool, f"Expected bool mask, got {m.dtype}"
+
+        # Mock extract_radiomic_features since pyradiomics may not be installed
+        fake_feats = rng.rand(93).astype(np.float64)
+        with patch(
+            "eval.evaluation.extract_radiomic_features",
+            return_value=fake_feats,
+            create=True,
+        ), patch(
+            "eval.frd.extract_radiomic_features",
+            return_value=fake_feats,
+            create=True,
+        ):
+            results = evaluator.evaluate()
+
+        agg = results.get("aggregates", {})
+        # AUROC contrast should be present
+        assert "auroc_contrast" in agg, (
+            f"Expected auroc_contrast in aggregates, got keys: {list(agg.keys())}"
+        )
+        # Should be a float between 0 and 1
+        assert 0.0 <= agg["auroc_contrast"] <= 1.0
+
+    def test_contrast_skipped_without_precontrast_path(self, tmp_path: Path) -> None:
+        """Contrast should produce a note when --precontrast-path is missing."""
+        from PIL import Image
+
+        gt_dir = tmp_path / "gt"
+        pred_dir = tmp_path / "pred"
+        clf_dir = tmp_path / "clf_contrast"
+        gt_dir.mkdir(); pred_dir.mkdir(); clf_dir.mkdir()
+
+        rng = np.random.RandomState(56)
+        for i in range(2):
+            name = f"case_{i:03d}.png"
+            for d in (gt_dir, pred_dir):
+                Image.fromarray(
+                    rng.randint(0, 255, (32, 32), dtype=np.uint8)
+                ).save(d / name)
+
+        # Create dummy model
+        import pickle
+        from sklearn.ensemble import RandomForestClassifier
+        dummy_model = RandomForestClassifier(n_estimators=2, random_state=42)
+        dummy_model.fit(rng.rand(10, 5), np.array([0]*5 + [1]*5))
+        with open(clf_dir / "contrast_classifier.pkl", "wb") as f:
+            pickle.dump(dummy_model, f)
+
+        output_file = tmp_path / "metrics.json"
+        evaluator = MamaSynthEval(
+            ground_truth_path=gt_dir,
+            predictions_path=pred_dir,
+            output_file=output_file,
+            enable_lpips=False,
+            enable_frd=False,
+            enable_segmentation=False,
+            enable_classification=True,
+            clf_model_dir_contrast=clf_dir,
+            # No precontrast_path!
+        )
+        results = evaluator.evaluate()
+        agg = results.get("aggregates", {})
+        # Should NOT have contrast AUROC without pre-contrast images
+        assert "auroc_contrast" not in agg
+
+    def test_contrast_independent_of_labels_path(self, tmp_path: Path) -> None:
+        """Contrast evaluation should NOT require --labels-path."""
+        from PIL import Image
+        from unittest.mock import patch
+
+        gt_dir = tmp_path / "gt"
+        pred_dir = tmp_path / "pred"
+        precon_dir = tmp_path / "precontrast"
+        clf_dir = tmp_path / "clf_contrast"
+        gt_dir.mkdir(); pred_dir.mkdir(); precon_dir.mkdir(); clf_dir.mkdir()
+
+        rng = np.random.RandomState(57)
+        for i in range(4):
+            name = f"case_{i:03d}.png"
+            for d in (gt_dir, pred_dir, precon_dir):
+                Image.fromarray(
+                    rng.randint(0, 255, (32, 32), dtype=np.uint8)
+                ).save(d / name)
+
+        import pickle
+        from sklearn.ensemble import RandomForestClassifier
+        dummy_model = RandomForestClassifier(n_estimators=2, random_state=42)
+        X = rng.rand(10, 93)
+        y = np.array([0]*5 + [1]*5)
+        dummy_model.fit(X, y)
+        with open(clf_dir / "contrast_classifier.pkl", "wb") as f:
+            pickle.dump(dummy_model, f)
+
+        output_file = tmp_path / "metrics.json"
+        evaluator = MamaSynthEval(
+            ground_truth_path=gt_dir,
+            predictions_path=pred_dir,
+            output_file=output_file,
+            enable_lpips=False,
+            enable_frd=False,
+            enable_segmentation=False,
+            enable_classification=True,
+            clf_model_dir_contrast=clf_dir,
+            precontrast_path=precon_dir,
+            labels_path=None,  # Explicitly no labels
+        )
+
+        # Mock extract_radiomic_features since pyradiomics may not be installed
+        fake_feats = rng.rand(93).astype(np.float64)
+        with patch(
+            "eval.evaluation.extract_radiomic_features",
+            return_value=fake_feats,
+            create=True,
+        ), patch(
+            "eval.frd.extract_radiomic_features",
+            return_value=fake_feats,
+            create=True,
+        ):
+            results = evaluator.evaluate()
+
+        agg = results.get("aggregates", {})
+        assert "auroc_contrast" in agg, (
+            "Contrast classification should work without labels_path"
+        )
+
+
+class TestCSVLabelParser:
+    """Tests that CSV label parser preserves extra columns."""
+
+    def test_csv_includes_extra_columns(self, tmp_path: Path) -> None:
+        """Extra columns beyond tnbc/luminal should be preserved."""
+        csv_path = tmp_path / "labels.csv"
+        csv_path.write_text(
+            "case_id,tnbc,luminal,contrast\n"
+            "case_001,0,1,1\n"
+            "case_002,1,0,0\n"
+        )
+        evaluator = MamaSynthEval(
+            ground_truth_path=tmp_path,
+            predictions_path=tmp_path,
+            output_file=tmp_path / "out.json",
+            labels_path=csv_path,
+        )
+        labels = evaluator._load_labels()
+        assert labels["case_001"]["contrast"] == 1
+        assert labels["case_002"]["contrast"] == 0
+        # Standard columns still work
+        assert labels["case_001"]["tnbc"] == 0
+        assert labels["case_001"]["luminal"] == 1
+
+
+class TestSSIMROIUseMask:
+    """Tests that _evaluate_roi passes mask to compute_ssim."""
+
+    def test_ssim_receives_mask(self, tmp_path: Path) -> None:
+        """compute_ssim in ROI eval should receive the roi_mask argument."""
+        from PIL import Image
+        from unittest.mock import patch
+
+        gt_dir = tmp_path / "gt"
+        pred_dir = tmp_path / "pred"
+        masks_dir = tmp_path / "masks"
+        gt_dir.mkdir(); pred_dir.mkdir(); masks_dir.mkdir()
+
+        rng = np.random.RandomState(88)
+        for i in range(2):
+            name = f"case_{i:03d}.png"
+            Image.fromarray(
+                rng.randint(0, 255, (48, 48), dtype=np.uint8)
+            ).save(gt_dir / name)
+            Image.fromarray(
+                rng.randint(0, 255, (48, 48), dtype=np.uint8)
+            ).save(pred_dir / name)
+            mask_data = np.zeros((48, 48), dtype=np.uint8)
+            mask_data[15:35, 15:35] = 255
+            Image.fromarray(mask_data).save(masks_dir / name)
+
+        output_file = tmp_path / "metrics.json"
+        evaluator = MamaSynthEval(
+            ground_truth_path=gt_dir,
+            predictions_path=pred_dir,
+            output_file=output_file,
+            masks_path=masks_dir,
+            enable_lpips=False,
+            enable_frd=False,
+            enable_segmentation=False,
+            enable_classification=False,
+        )
+
+        ssim_calls = []
+        original_ssim = __import__("eval.metrics", fromlist=["compute_ssim"]).compute_ssim
+
+        def spy_ssim(*args, **kwargs):
+            ssim_calls.append(kwargs)
+            return original_ssim(*args, **kwargs)
+
+        with patch("eval.evaluation.compute_ssim", side_effect=spy_ssim):
+            evaluator.evaluate()
+
+        # Filter to only calls that include 'mask' (ROI path).
+        # Legacy pairwise path calls compute_ssim without mask.
+        roi_calls = [kw for kw in ssim_calls if "mask" in kw]
+        assert len(roi_calls) >= 2, (
+            f"Expected >= 2 ROI SSIM calls with mask, got {len(roi_calls)} "
+            f"out of {len(ssim_calls)} total calls"
+        )
+        for call_kwargs in roi_calls:
+            assert call_kwargs["mask"] is not None
+
+
+# ------------------------------------------------------------------
+# FRD z-score standardisation
+# ------------------------------------------------------------------
+
+class TestFRDStandardization:
+    """Verify that FRD with z-score standardisation returns reasonable values."""
+
+    def test_frd_identical_distributions_near_zero(self) -> None:
+        """Identical image sets should yield FRD ~ 0 (well below 1e6)."""
+        pytest.importorskip("radiomics")
+        from eval.frd import compute_frd
+
+        rng = np.random.RandomState(42)
+        imgs = [rng.rand(64, 64).astype(np.float64) * 1000 for _ in range(4)]
+        frd_val = compute_frd(imgs, imgs)
+        # With standardisation, identical distributions -> FRD ~ 0
+        assert frd_val < 1.0, f"FRD for identical images should be ~0, got {frd_val}"
+
+    def test_frd_different_distributions_moderate(self) -> None:
+        """Different distributions should yield a moderate FRD (not 1e14)."""
+        pytest.importorskip("radiomics")
+        from eval.frd import compute_frd
+
+        rng = np.random.RandomState(42)
+        real = [rng.rand(64, 64).astype(np.float64) * 500 for _ in range(5)]
+        synth = [(rng.rand(64, 64).astype(np.float64) * 500) + 200 for _ in range(5)]
+        frd_val = compute_frd(real, synth)
+        # After standardisation the FRD should be moderate, not astronomical
+        assert frd_val < 1e6, (
+            f"FRD between different distributions should be moderate, got {frd_val}"
+        )
+
+    def test_compute_frd_from_features_standardized(self) -> None:
+        """compute_frd_from_features should also apply z-score standardization."""
+        from eval.frd import compute_frd_from_features
+
+        rng = np.random.RandomState(99)
+        # Create features with wildly different scales (mimicking pyradiomics)
+        real = rng.randn(20, 93).astype(np.float64)
+        real[:, 0] *= 1e8  # Energy-scale feature
+        real[:, -1] *= 1e-2  # Kurtosis-scale feature
+
+        synth = rng.randn(20, 93).astype(np.float64)
+        synth[:, 0] *= 1e8
+        synth[:, -1] *= 1e-2
+
+        frd_val = compute_frd_from_features(real, synth)
+        assert frd_val < 1e6, f"Expected moderate FRD after standardization, got {frd_val}"
+
+
+# ------------------------------------------------------------------
+# Tumor ROI classification without labels_path
+# ------------------------------------------------------------------
+
+class TestTumorROIStandalone:
+    """Tumor ROI classification must run without molecular-subtype labels."""
+
+    def test_tumor_roi_called_without_labels(self, tmp_path: Path) -> None:
+        """_evaluate_tumor_roi should be invoked even when labels_path is None."""
+        from unittest.mock import patch
+        from PIL import Image
+
+        gt_dir = tmp_path / "gt"
+        pred_dir = tmp_path / "pred"
+        masks_dir = tmp_path / "masks"
+        gt_dir.mkdir(); pred_dir.mkdir(); masks_dir.mkdir()
+
+        rng = np.random.RandomState(77)
+        for i in range(3):
+            name = f"case_{i:03d}.png"
+            Image.fromarray(
+                rng.randint(0, 255, (48, 48), dtype=np.uint8)
+            ).save(gt_dir / name)
+            Image.fromarray(
+                rng.randint(0, 255, (48, 48), dtype=np.uint8)
+            ).save(pred_dir / name)
+            mask_data = np.zeros((48, 48), dtype=np.uint8)
+            mask_data[10:38, 10:38] = 255
+            Image.fromarray(mask_data).save(masks_dir / name)
+
+        output_file = tmp_path / "metrics.json"
+        evaluator = MamaSynthEval(
+            ground_truth_path=gt_dir,
+            predictions_path=pred_dir,
+            output_file=output_file,
+            masks_path=masks_dir,
+            enable_lpips=False,
+            enable_frd=False,
+            enable_segmentation=False,
+            enable_classification=True,
+            # No labels_path!
+        )
+
+        tumor_roi_called = []
+
+        def spy(*args, **kwargs):
+            tumor_roi_called.append(True)
+            return {"aggregates": {}, "detail": {"note_tumor_roi": "spy"}}
+
+        with patch.object(evaluator, "_evaluate_tumor_roi", side_effect=spy):
+            evaluator.evaluate()
+
+        assert len(tumor_roi_called) >= 1, (
+            "_evaluate_tumor_roi should be called even without labels_path"
+        )
+
+
+# ------------------------------------------------------------------
+# Radiomic feature caching
+# ------------------------------------------------------------------
+
+class TestFeatureCaching:
+    """Verify that _extract_features_cached avoids duplicate extraction."""
+
+    def test_cache_avoids_redundant_extraction(self) -> None:
+        """Calling _extract_features_cached twice with same key should
+        only invoke extract_radiomic_features once."""
+        from unittest.mock import patch
+
+        evaluator = MamaSynthEval.__new__(MamaSynthEval)
+        evaluator._feature_cache = {}  # enable cache
+
+        fake_feats = np.arange(93, dtype=np.float64)
+        call_count = [0]
+
+        def mock_extract(image, mask=None):
+            call_count[0] += 1
+            return fake_feats.copy()
+
+        with patch("eval.frd.extract_radiomic_features", side_effect=mock_extract):
+            img = np.random.rand(48, 48).astype(np.float64)
+            f1 = evaluator._extract_features_cached(img, "key1")
+            f2 = evaluator._extract_features_cached(img, "key1")
+
+        assert call_count[0] == 1, (
+            f"Expected 1 extraction call with caching, got {call_count[0]}"
+        )
+        np.testing.assert_array_equal(f1, f2)
+
+    def test_different_masks_different_cache_keys(self) -> None:
+        """Same image but different masks should cache separately."""
+        from unittest.mock import patch
+
+        evaluator = MamaSynthEval.__new__(MamaSynthEval)
+        evaluator._feature_cache = {}
+
+        call_count = [0]
+
+        def mock_extract(image, mask=None):
+            call_count[0] += 1
+            if mask is not None and mask.any():
+                return np.ones(93, dtype=np.float64)
+            return np.zeros(93, dtype=np.float64)
+
+        with patch("eval.frd.extract_radiomic_features", side_effect=mock_extract):
+            img = np.random.rand(48, 48).astype(np.float64)
+            mask_a = np.zeros((48, 48), dtype=bool)
+            mask_a[10:30, 10:30] = True
+            mask_b = np.zeros((48, 48), dtype=bool)
+            mask_b[20:40, 20:40] = True
+
+            f1 = evaluator._extract_features_cached(img, "img1", mask=mask_a)
+            f2 = evaluator._extract_features_cached(img, "img1", mask=mask_b)
+            f3 = evaluator._extract_features_cached(img, "img1", mask=mask_a)
+
+        assert call_count[0] == 2, (
+            f"Expected 2 extraction calls (2 different masks), got {call_count[0]}"
+        )
+        np.testing.assert_array_equal(f1, f3)

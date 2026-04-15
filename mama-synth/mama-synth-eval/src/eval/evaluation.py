@@ -83,11 +83,12 @@ logger = logging.getLogger(__name__)
 # Challenge metric names (Grand Challenge jsonpath keys)
 # ---------------------------------------------------------------------------
 
-# The 8 official challenge metrics
+# The 9 official challenge metrics
 METRIC_MSE_FULL = "mse_full_image"
 METRIC_LPIPS_FULL = "lpips_full_image"
 METRIC_SSIM_ROI = "ssim_roi"
 METRIC_FRD_ROI = "frd_roi"
+METRIC_AUROC_CONTRAST = "auroc_contrast"
 METRIC_AUROC_LUMINAL = "auroc_luminal"
 METRIC_AUROC_TNBC = "auroc_tnbc"
 METRIC_AUROC_TUMOR_ROI = "auroc_tumor_roi"
@@ -267,6 +268,10 @@ class MamaSynthEval:
         # Per-evaluation image cache to avoid redundant NIfTI loads.
         # Enabled only during evaluate() and cleared afterwards.
         self._image_cache: Optional[dict[str, NDArray]] = None
+        # Per-evaluation radiomic feature cache – avoids recomputing
+        # pyradiomics features for the same image(+mask) across tasks
+        # (e.g. classification + contrast + tumor_roi).
+        self._feature_cache: Optional[dict[str, NDArray]] = None
 
     def _clf_model_dir_for_task(self, task: str) -> Optional[Path]:
         """Return the classifier model directory for *task*.
@@ -281,6 +286,47 @@ class MamaSynthEval:
             "tnbc": self.clf_model_dir_tnbc,
         }
         return _dirs.get(task, self.clf_model_dir)
+
+    def _extract_features_cached(
+        self,
+        image: NDArray,
+        image_key: str,
+        mask: Optional[NDArray] = None,
+    ) -> NDArray:
+        """Extract radiomic features, using an in-memory cache.
+
+        Parameters
+        ----------
+        image : NDArray
+            Image array to extract features from.
+        image_key : str
+            A stable identifier for this image (e.g. file path string).
+        mask : NDArray | None
+            Optional boolean mask for ROI-based extraction.
+
+        Returns
+        -------
+        NDArray
+            1-D feature vector.
+        """
+        import hashlib
+
+        from eval.frd import extract_radiomic_features
+
+        mask_part = ""
+        if mask is not None:
+            mask_part = hashlib.sha256(mask.tobytes()).hexdigest()[:12]
+        cache_key = f"{image_key}|{mask_part}"
+
+        if self._feature_cache is not None and cache_key in self._feature_cache:
+            return self._feature_cache[cache_key]
+
+        feats = extract_radiomic_features(image, mask=mask)
+
+        if self._feature_cache is not None:
+            self._feature_cache[cache_key] = feats
+
+        return feats
 
     # ------------------------------------------------------------------
     # Main entry point
@@ -341,6 +387,8 @@ class MamaSynthEval:
 
         # Enable per-evaluation image cache so NIfTI files are decoded once.
         self._image_cache = {}
+        # Enable per-evaluation radiomic feature cache.
+        self._feature_cache = {}
 
         # --- Fit dataset-level normaliser on all GT images ---
         gt_images_raw = [
@@ -366,11 +414,28 @@ class MamaSynthEval:
             roi_results = self._evaluate_roi(pairs, masks)
             aggregates.update(roi_results.get("aggregates", {}))
 
-        # ---- Task 3: Classification (AUROC luminal + AUROC TNBC) ----
+        # ---- Task 3a: Contrast classification (AUROC contrast) ----
+        # Contrast classification is independent of molecular-subtype labels:
+        # it only requires a pre-trained contrast classifier and the
+        # pre-contrast source images.
+        contrast_results: dict[str, Any] = {}
+        if self.enable_classification and self.clf_model_dir_contrast:
+            contrast_results = self._evaluate_contrast(pairs)
+            aggregates.update(contrast_results.get("aggregates", {}))
+
+        # ---- Task 3b: Classification (AUROC luminal + AUROC TNBC) ----
         clf_results: dict[str, Any] = {}
         if self.enable_classification and self.labels_path:
             clf_results = self._evaluate_classification(pairs)
             aggregates.update(clf_results.get("aggregates", {}))
+
+        # ---- Task 3c: Tumor ROI classification ----
+        # Tumor ROI classification does NOT need molecular-subtype labels.
+        # It creates its own binary labels (tumor=1, mirror=0) from masks.
+        tumor_roi_results: dict[str, Any] = {}
+        if self.enable_classification and self.masks_path:
+            tumor_roi_results = self._evaluate_tumor_roi(pairs)
+            aggregates.update(tumor_roi_results.get("aggregates", {}))
 
         # ---- Task 4: Segmentation (Dice + HD95) ----
         seg_results: dict[str, Any] = {}
@@ -401,15 +466,24 @@ class MamaSynthEval:
             results["roi"] = roi_results["detail"]
         if seg_results.get("detail"):
             results["segmentation"] = seg_results["detail"]
+        # Merge contrast detail into classification block
+        merged_clf_detail: dict[str, Any] = {}
+        if contrast_results.get("detail"):
+            merged_clf_detail.update(contrast_results["detail"])
         if clf_results.get("detail"):
-            results["classification"] = clf_results["detail"]
+            merged_clf_detail.update(clf_results["detail"])
+        if tumor_roi_results.get("detail"):
+            merged_clf_detail.update(tumor_roi_results["detail"])
+        if merged_clf_detail:
+            results["classification"] = merged_clf_detail
         if missing_stems:
             results["missing_predictions"] = missing_stems
 
         self._save_results(results)
 
-        # Release per-evaluation image cache to free memory.
+        # Release per-evaluation caches to free memory.
         self._image_cache = None
+        self._feature_cache = None
 
         return results
 
@@ -479,14 +553,27 @@ class MamaSynthEval:
     ) -> dict[str, Any]:
         """Compute tumor-ROI SSIM and FRD.
 
+        SSIM is computed on BBox-cropped ROIs.  FRD is computed using the
+        official ``frd-score`` package (https://github.com/RichardObi/frd-score)
+        which passes full images + masks to pyradiomics for feature
+        extraction internally, matching the published metric exactly.
+
         Returns dict with 'aggregates' and 'detail' sub-keys.
         """
         from eval.roi_utils import extract_roi_pair
 
         ssim_values: list[float] = []
-        real_rois: list[NDArray] = []
-        synth_rois: list[NDArray] = []
-        roi_masks: list[NDArray] = []
+
+        # Collect file paths for the official frd-score API
+        # (masks are looked up from self.masks_path by stem).
+        frd_gt_paths: list[str] = []
+        frd_pred_paths: list[str] = []
+        frd_mask_paths: list[str] = []
+
+        mask_file_mapping: dict[str, Path] = {}
+        if self.masks_path and self.masks_path.exists():
+            for mf in self._get_image_files(self.masks_path):
+                mask_file_mapping[self._get_stem(mf)] = mf
 
         for gt_path, pred_path in tqdm(pairs, desc="ROI metrics", leave=False):
             stem = self._get_stem(gt_path)
@@ -499,21 +586,31 @@ class MamaSynthEval:
             pred = self._resize_pred_to_gt(pred, gt)
             mask = masks[stem]
 
+            # Ensure mask matches image resolution
+            if mask.shape != gt.shape:
+                mask = self._resize_array_to_target(mask, gt.shape)
+
             real_roi, synth_roi, roi_mask = extract_roi_pair(
                 gt, pred, mask, margin_mm=self.roi_margin_mm
             )
 
-            # Compute SSIM within the ROI
-            data_range = float(np.max(real_roi) - np.min(real_roi))
+            # Compute SSIM within the ROI (masked region only)
+            data_range = float(
+                np.max(real_roi[roi_mask]) - np.min(real_roi[roi_mask])
+            )
             if data_range > 0:
-                ssim_val = compute_ssim(synth_roi, real_roi, data_range=data_range)
+                ssim_val = compute_ssim(
+                    synth_roi, real_roi, data_range=data_range, mask=roi_mask
+                )
             else:
                 ssim_val = 1.0  # identical constant images
             ssim_values.append(ssim_val)
 
-            real_rois.append(real_roi)
-            synth_rois.append(synth_roi)
-            roi_masks.append(roi_mask)
+            # Collect file paths for FRD
+            if stem in mask_file_mapping:
+                frd_gt_paths.append(str(gt_path))
+                frd_pred_paths.append(str(pred_path))
+                frd_mask_paths.append(str(mask_file_mapping[stem]))
 
         if not ssim_values:
             return {}
@@ -524,20 +621,21 @@ class MamaSynthEval:
         agg[METRIC_SSIM_ROI] = self._aggregate(ssim_values)
         detail["ssim"] = self._aggregate(ssim_values)
 
-        if self.enable_frd and len(real_rois) >= 2:
+        if self.enable_frd and len(frd_gt_paths) >= 2:
             try:
-                from eval.frd import compute_frd as _frd
+                from frd_score import compute_frd as frd_compute
 
-                frd_val = _frd(
-                    real_rois,
-                    synth_rois,
-                    masks_real=roi_masks,
-                    masks_synthetic=roi_masks,
+                frd_val = frd_compute(
+                    [frd_gt_paths, frd_pred_paths],
+                    paths_masks=[frd_mask_paths, frd_mask_paths],
                 )
                 agg[METRIC_FRD_ROI] = frd_val
                 detail["frd"] = frd_val
             except ImportError:
-                logger.warning("FRD unavailable (pyradiomics not installed), skipping.")
+                logger.warning(
+                    "FRD unavailable (frd-score not installed). "
+                    "Install with: pip install frd-score"
+                )
 
         return {"aggregates": agg, "detail": detail}
 
@@ -642,7 +740,6 @@ class MamaSynthEval:
                 RadiomicsClassifier,
                 evaluate_classification,
             )
-            from eval.frd import extract_radiomic_features
         except ImportError:
             logger.warning("Classification dependencies unavailable, skipping.")
             return {}
@@ -664,7 +761,9 @@ class MamaSynthEval:
                 continue
 
             pred_image = self._load_image_cached(pred_path).astype(np.float64)
-            feats = extract_radiomic_features(pred_image)
+            feats = self._extract_features_cached(
+                pred_image, str(pred_path),
+            )
 
             # Dual-phase: also extract features from pre-contrast and concatenate
             if self.dual_phase and self.precontrast_path:
@@ -676,7 +775,9 @@ class MamaSynthEval:
                             pc_image = self._load_image_cached(pc_path).astype(
                                 np.float64
                             )
-                            precon_feats = extract_radiomic_features(pc_image)
+                            precon_feats = self._extract_features_cached(
+                                pc_image, str(pc_path),
+                            )
                         except Exception as e:
                             logger.warning(
                                 f"Dual-phase: failed to load pre-contrast "
@@ -694,6 +795,25 @@ class MamaSynthEval:
             luminal_true.append(labels[stem].get("luminal", 0))
             valid_stems.append(stem)
 
+        if len(features_list) < 2:
+            return {}
+
+        # Guard against ragged feature vectors (e.g. pyradiomics failure
+        # returning a 1-element fallback while normal vectors are ~93-D).
+        expected_dim = max(f.shape[0] for f in features_list)
+        keep_idx = [
+            i for i, f in enumerate(features_list)
+            if f.shape[0] == expected_dim
+        ]
+        if len(keep_idx) < len(features_list):
+            logger.warning(
+                f"Dropped {len(features_list) - len(keep_idx)} cases with "
+                f"unexpected feature dimension (expected {expected_dim})."
+            )
+            features_list = [features_list[i] for i in keep_idx]
+            tnbc_true = [tnbc_true[i] for i in keep_idx]
+            luminal_true = [luminal_true[i] for i in keep_idx]
+            valid_stems = [valid_stems[i] for i in keep_idx]
         if len(features_list) < 2:
             return {}
 
@@ -884,25 +1004,241 @@ class MamaSynthEval:
                     f"or --clf-model-dir."
                 )
 
-        # --------------------------------------------------------------
-        # Tumor ROI classification (separate feature extraction)
-        # --------------------------------------------------------------
-        # Unlike tnbc/luminal, tumor_roi requires mask-based feature
-        # extraction: for each case we extract features from the tumor
-        # ROI (label=1) and from a contralateral mirrored ROI (label=0),
-        # then run the trained classifier.
-        # --------------------------------------------------------------
-        self._evaluate_tumor_roi(pairs, labels, agg, detail)
+        # NOTE: tumor_roi classification is handled as a separate
+        # standalone block in evaluate() because it does not depend on
+        # molecular-subtype labels.
+
+        return {"aggregates": agg, "detail": detail}
+
+    # ------------------------------------------------------------------
+    # Task 3a: Contrast classification (AUROC contrast)
+    # ------------------------------------------------------------------
+
+    def _evaluate_contrast(
+        self,
+        pairs: list[tuple[Path, Path]],
+    ) -> dict[str, Any]:
+        """Evaluate pre- vs post-contrast phase classification.
+
+        A pre-trained contrast classifier is applied to both the
+        *pre-contrast source images* (label=0) and the *synthetic
+        post-contrast images* (label=1).  If synthesis is successful,
+        the synthetic images should look clearly post-contrast and the
+        classifier should easily distinguish them from pre-contrast
+        sources, yielding a high AUROC.
+
+        Requires:
+        * ``--clf-model-dir-contrast`` pointing to a directory with
+          ``contrast_classifier.pkl`` (and/or ``contrast_classifier_cnn.pt``).
+        * ``--precontrast-path`` pointing to the pre-contrast source
+          images (same stems as predictions).
+
+        Returns dict with 'aggregates' and 'detail' sub-keys.
+        """
+        task = "contrast"
+        metric_key = METRIC_AUROC_CONTRAST
+
+        _task_dir = self._clf_model_dir_for_task(task)
+        if _task_dir is None or not _task_dir.exists():
+            return {
+                "detail": {
+                    f"note_{task}": (
+                        "No pre-trained contrast classifier found. "
+                        "Provide model via --clf-model-dir-contrast."
+                    )
+                }
+            }
+
+        if self.precontrast_path is None or not self.precontrast_path.exists():
+            return {
+                "detail": {
+                    f"note_{task}": (
+                        "Contrast classification requires pre-contrast "
+                        "source images (--precontrast-path)."
+                    )
+                }
+            }
+
+        try:
+            from eval.classification import (
+                CNNClassifier,
+                RadiomicsClassifier,
+                evaluate_classification,
+            )
+        except ImportError:
+            logger.warning(
+                "Contrast classification dependencies unavailable, skipping."
+            )
+            return {}
+
+        # Discover model files
+        cnn_model_path = None
+        pkl_model_path = None
+        cnn_candidate = _task_dir / f"{task}_classifier_cnn.pt"
+        pkl_candidate = _task_dir / f"{task}_classifier.pkl"
+        if cnn_candidate.exists():
+            cnn_model_path = cnn_candidate
+        if pkl_candidate.exists():
+            pkl_model_path = pkl_candidate
+
+        if cnn_model_path is None and pkl_model_path is None:
+            return {
+                "detail": {
+                    f"note_{task}": (
+                        f"No model files found in {_task_dir}. "
+                        f"Expected {task}_classifier.pkl or "
+                        f"{task}_classifier_cnn.pt."
+                    )
+                }
+            }
+
+        # ----------------------------------------------------------
+        # Collect features/images for pre-contrast (label=0) and
+        # synthetic post-contrast (label=1).
+        # ----------------------------------------------------------
+        synth_feats: list[NDArray] = []
+        precon_feats: list[NDArray] = []
+        valid_stems: list[str] = []
+
+        for _, pred_path in tqdm(
+            pairs, desc="Contrast CLF features", leave=False
+        ):
+            stem = self._get_stem(pred_path)
+
+            # Find matching pre-contrast image
+            pc_image_arr: Optional[NDArray] = None
+            for ext in (".png", ".nii.gz", ".nii", ".mha"):
+                pc_path = self.precontrast_path / f"{stem}{ext}"
+                if pc_path.exists():
+                    try:
+                        pc_image_arr = self._load_image_cached(
+                            pc_path
+                        ).astype(np.float64)
+                    except Exception as exc:
+                        logger.warning(
+                            f"Failed to load pre-contrast for {stem}: {exc}"
+                        )
+                    break
+
+            if pc_image_arr is None:
+                continue
+
+            pred_image = self._load_image_cached(pred_path).astype(np.float64)
+
+            try:
+                s_feats = self._extract_features_cached(
+                    pred_image, str(pred_path),
+                )
+                p_feats = self._extract_features_cached(
+                    pc_image_arr, str(pc_path),
+                )
+                if s_feats.size <= 1 or p_feats.size <= 1:
+                    continue
+                if s_feats.shape[0] != p_feats.shape[0]:
+                    continue
+                synth_feats.append(s_feats)
+                precon_feats.append(p_feats)
+                valid_stems.append(stem)
+            except Exception as exc:
+                logger.warning(
+                    f"Contrast feature extraction failed for {stem}: {exc}"
+                )
+                continue
+
+        if len(synth_feats) < 2:
+            return {
+                "detail": {
+                    f"note_{task}": (
+                        f"Too few valid cases ({len(synth_feats)}) for "
+                        "contrast classification.  Check --precontrast-path."
+                    )
+                }
+            }
+
+        agg: dict[str, Any] = {}
+        detail: dict[str, Any] = {f"n_cases_{task}": len(valid_stems)}
+
+        # Build combined feature matrix: synth=1, precontrast=0
+        all_feats = np.vstack(
+            [np.stack(synth_feats), np.stack(precon_feats)]
+        )
+        all_feats = np.nan_to_num(
+            all_feats, nan=0.0, posinf=0.0, neginf=0.0
+        )
+        y_true = np.concatenate([
+            np.ones(len(synth_feats), dtype=np.int64),
+            np.zeros(len(precon_feats), dtype=np.int64),
+        ])
+
+        # ----------------------------------------------------------
+        # Radiomics model (default path)
+        # ----------------------------------------------------------
+        if pkl_model_path:
+            try:
+                clf = RadiomicsClassifier(
+                    task=task, model_path=pkl_model_path,
+                )
+                y_score = clf.predict_proba(all_feats)
+                clf_result = evaluate_classification(y_true, y_score)
+                agg[metric_key] = clf_result["auroc"]
+                detail[f"auroc_{task}"] = clf_result["auroc"]
+                detail[f"balanced_accuracy_{task}"] = (
+                    clf_result["balanced_accuracy"]
+                )
+                detail[f"classifier_type_{task}"] = "radiomics"
+                logger.info(
+                    f"Contrast AUROC = {clf_result['auroc']:.4f} "
+                    f"({len(valid_stems)} pairs)"
+                )
+            except Exception as exc:
+                logger.error(f"Contrast radiomics classifier failed: {exc}")
+
+        # ----------------------------------------------------------
+        # CNN model (override if available and radiomics didn't run)
+        # ----------------------------------------------------------
+        if cnn_model_path and metric_key not in agg:
+            try:
+                cnn_clf = CNNClassifier(
+                    task=task, model_path=cnn_model_path,
+                )
+                # Collect raw images: synth first, then pre-contrast
+                cnn_images: list[NDArray] = []
+                for _, pred_path in pairs:
+                    stem = self._get_stem(pred_path)
+                    if stem not in valid_stems:
+                        continue
+                    cnn_images.append(
+                        self._load_image_cached(pred_path).astype(np.float64)
+                    )
+                for stem in valid_stems:
+                    for ext in (".png", ".nii.gz", ".nii", ".mha"):
+                        pc_p = self.precontrast_path / f"{stem}{ext}"
+                        if pc_p.exists():
+                            cnn_images.append(
+                                self._load_image_cached(pc_p).astype(
+                                    np.float64
+                                )
+                            )
+                            break
+                y_score = cnn_clf.predict_proba_from_images(
+                    cnn_images, masks=None,
+                )
+                clf_result = evaluate_classification(y_true, y_score)
+                agg[metric_key] = clf_result["auroc"]
+                detail[f"auroc_{task}"] = clf_result["auroc"]
+                detail[f"balanced_accuracy_{task}"] = (
+                    clf_result["balanced_accuracy"]
+                )
+                detail[f"classifier_type_{task}"] = "cnn"
+            except Exception as exc:
+                logger.error(f"Contrast CNN classifier failed: {exc}")
 
         return {"aggregates": agg, "detail": detail}
 
     def _evaluate_tumor_roi(
         self,
         pairs: list[tuple[Path, Path]],
-        labels: dict[str, dict[str, int]],
-        agg: dict[str, Any],
-        detail: dict[str, Any],
-    ) -> None:
+    ) -> dict[str, Any]:
         """Evaluate tumor-ROI vs contralateral-mirrored-ROI classification.
 
         For each synthetic prediction that has a corresponding mask:
@@ -912,10 +1248,12 @@ class MamaSynthEval:
           3. Run the pre-trained ``tumor_roi`` classifier on both
              feature vectors and collect predicted probabilities.
 
-        Populates *agg* and *detail* in-place.
+        Returns dict with 'aggregates' and 'detail' sub-keys.
         """
         task = "tumor_roi"
         metric_key = METRIC_AUROC_TUMOR_ROI
+        agg: dict[str, Any] = {}
+        detail: dict[str, Any] = {}
 
         # Check for a pre-trained tumor_roi model
         _task_dir = self._clf_model_dir_for_task(task)
@@ -931,26 +1269,25 @@ class MamaSynthEval:
                 "Provide model via --clf-model-dir-tumor-roi "
                 "or --clf-model-dir."
             )
-            return
+            return {"aggregates": agg, "detail": detail}
 
         if self.masks_path is None or not self.masks_path.exists():
             detail[f"note_{task}"] = (
                 "Tumor ROI evaluation requires masks (--masks-path)."
             )
-            return
+            return {"aggregates": agg, "detail": detail}
 
         try:
             from eval.classification import (
                 RadiomicsClassifier,
                 evaluate_classification,
             )
-            from eval.frd import extract_radiomic_features
             from eval.mirror_utils import create_mirrored_mask
         except ImportError:
             logger.warning(
                 "Tumor ROI evaluation dependencies unavailable, skipping."
             )
-            return
+            return {"aggregates": agg, "detail": detail}
 
         clf = RadiomicsClassifier(task=task, model_path=pkl_model_path)
 
@@ -1004,11 +1341,11 @@ class MamaSynthEval:
 
             # Extract features from tumor ROI and mirrored ROI
             try:
-                t_feats = extract_radiomic_features(
-                    pred_image, mask=mask_arr
+                t_feats = self._extract_features_cached(
+                    pred_image, str(pred_path), mask=mask_arr,
                 )
-                m_feats = extract_radiomic_features(
-                    pred_image, mask=mirrored
+                m_feats = self._extract_features_cached(
+                    pred_image, f"{pred_path}__mirror", mask=mirrored,
                 )
                 if t_feats.size == 0 or m_feats.size == 0:
                     continue
@@ -1026,7 +1363,7 @@ class MamaSynthEval:
                 f"Too few valid cases ({len(tumor_feats)}) for tumor ROI "
                 "evaluation.  Check masks and image data."
             )
-            return
+            return {"aggregates": agg, "detail": detail}
 
         # Build combined feature matrix: tumor=1, mirror=0
         all_feats = np.vstack(
@@ -1047,6 +1384,8 @@ class MamaSynthEval:
         detail[f"balanced_accuracy_{task}"] = clf_result["balanced_accuracy"]
         detail[f"n_cases_{task}"] = len(valid_stems)
         detail[f"classifier_type_{task}"] = "radiomics"
+
+        return {"aggregates": agg, "detail": detail}
 
     # ------------------------------------------------------------------
     # Per-case metrics (backward compatibility + GC results list)
@@ -1331,10 +1670,18 @@ class MamaSynthEval:
                 reader = csv.DictReader(f)
                 for row in reader:
                     cid = row.get("case_id", "")
-                    labels[cid] = {
+                    entry: dict[str, int] = {
                         "tnbc": int(row.get("tnbc", 0)),
                         "luminal": int(row.get("luminal", 0)),
                     }
+                    # Preserve additional label columns (e.g. "contrast")
+                    for key in row:
+                        if key not in ("case_id", "tnbc", "luminal") and row[key] is not None:
+                            try:
+                                entry[key] = int(row[key])
+                            except (ValueError, TypeError):
+                                pass
+                    labels[cid] = entry
             return labels
 
         with open(path) as f:

@@ -232,7 +232,8 @@ def extract_radiomic_features_batch(
     # Identify which images need extraction (vs cached)
     to_extract: list[int] = []
     for i, img in enumerate(images):
-        cached = _load_from_cache(img, cache_dir)
+        m = masks[i] if masks is not None else None
+        cached = _load_from_cache(img, cache_dir, mask=m)
         if cached is not None:
             features_list[i] = cached
         else:
@@ -255,7 +256,8 @@ def extract_radiomic_features_batch(
                 bin_width=bin_width,
             )
             features_list[idx] = feats
-            _save_to_cache(images[idx], feats, cache_dir)
+            _save_to_cache(images[idx], feats, cache_dir,
+                           mask=masks[idx] if masks is not None else None)
 
     return np.stack(features_list)
 
@@ -293,17 +295,22 @@ def _extract_parallel(
 # ---------------------------------------------------------------------------
 
 
-def _image_hash(image: NDArray) -> str:
-    """Compute a stable SHA-256 hash of an image array."""
-    return hashlib.sha256(image.tobytes()).hexdigest()[:16]
+def _image_hash(image: NDArray, mask: Optional[NDArray] = None) -> str:
+    """Compute a stable SHA-256 hash of an image (and optional mask)."""
+    h = hashlib.sha256(image.tobytes())
+    if mask is not None:
+        h.update(mask.tobytes())
+    return h.hexdigest()[:16]
 
 
 def _load_from_cache(
-    image: NDArray, cache_dir: Optional[Path]
+    image: NDArray,
+    cache_dir: Optional[Path],
+    mask: Optional[NDArray] = None,
 ) -> Optional[NDArray]:
     if cache_dir is None:
         return None
-    h = _image_hash(image)
+    h = _image_hash(image, mask=mask)
     fpath = cache_dir / f"frd_feat_{h}.npz"
     if fpath.exists():
         data = np.load(fpath)
@@ -312,12 +319,15 @@ def _load_from_cache(
 
 
 def _save_to_cache(
-    image: NDArray, features: NDArray, cache_dir: Optional[Path]
+    image: NDArray,
+    features: NDArray,
+    cache_dir: Optional[Path],
+    mask: Optional[NDArray] = None,
 ) -> None:
     if cache_dir is None:
         return
     cache_dir.mkdir(parents=True, exist_ok=True)
-    h = _image_hash(image)
+    h = _image_hash(image, mask=mask)
     fpath = cache_dir / f"frd_feat_{h}.npz"
     np.savez_compressed(fpath, features=features)
 
@@ -431,6 +441,20 @@ def compute_frd(
     real_matrix = np.nan_to_num(real_matrix, nan=0.0, posinf=0.0, neginf=0.0)
     synth_matrix = np.nan_to_num(synth_matrix, nan=0.0, posinf=0.0, neginf=0.0)
 
+    # ---- Per-feature z-score standardisation ----
+    # Radiomic features span wildly different scales (e.g. Energy ~1e8 vs
+    # Kurtosis ~1-10).  Without normalisation the Fréchet distance is
+    # dominated by high-magnitude features, producing extreme values.
+    # We compute mean/std from the combined pool so that both distributions
+    # are on the same scale.
+    combined = np.vstack([real_matrix, synth_matrix])
+    feat_mean = np.mean(combined, axis=0)
+    feat_std = np.std(combined, axis=0)
+    feat_std[feat_std == 0] = 1.0  # avoid division by zero for constant features
+
+    real_matrix = (real_matrix - feat_mean) / feat_std
+    synth_matrix = (synth_matrix - feat_mean) / feat_std
+
     # Compute statistics
     mu_real = np.mean(real_matrix, axis=0)
     mu_synth = np.mean(synth_matrix, axis=0)
@@ -481,6 +505,15 @@ def compute_frd_from_features(
     synthetic_features = np.nan_to_num(
         synthetic_features, nan=0.0, posinf=0.0, neginf=0.0
     )
+
+    # Per-feature z-score standardisation (same as compute_frd)
+    combined = np.vstack([real_features, synthetic_features])
+    feat_mean = np.mean(combined, axis=0)
+    feat_std = np.std(combined, axis=0)
+    feat_std[feat_std == 0] = 1.0
+
+    real_features = (real_features - feat_mean) / feat_std
+    synthetic_features = (synthetic_features - feat_mean) / feat_std
 
     mu1 = np.mean(real_features, axis=0)
     mu2 = np.mean(synthetic_features, axis=0)

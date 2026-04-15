@@ -182,6 +182,7 @@ def compute_ssim(
     win_size: int = 7,
     k1: float = 0.01,
     k2: float = 0.03,
+    mask: Optional[NDArray[np.bool_]] = None,
 ) -> float:
     """Compute Structural Similarity Index between prediction and ground truth.
 
@@ -189,14 +190,20 @@ def compute_ssim(
     rather than local window-based computation. For 3D volumes, SSIM is
     computed slice-by-slice and averaged.
 
+    When *mask* is provided, statistics are computed only over the masked
+    (``True``) voxels so that zero-padded background regions do not
+    bias the result.
+
     Args:
         prediction: Predicted image array (2D or 3D).
         ground_truth: Ground truth image array (2D or 3D).
         data_range: The data range of the input images. If None, computed as
-                   max(ground_truth) - min(ground_truth).
+                   max(ground_truth) - min(ground_truth) (over mask if given).
         win_size: Kept for API compatibility (unused in this global implementation).
         k1: Constant for luminance comparison (default: 0.01).
         k2: Constant for contrast comparison (default: 0.03).
+        mask: Optional boolean mask.  When provided, only pixels where
+              ``mask == True`` contribute to the SSIM computation.
 
     Returns:
         SSIM value in range [-1, 1], where 1 means identical images.
@@ -204,10 +211,13 @@ def compute_ssim(
     _validate_inputs(prediction, ground_truth)
 
     if data_range is None:
-        data_range = float(np.max(ground_truth) - np.min(ground_truth))
+        ref = ground_truth[mask] if mask is not None else ground_truth
+        data_range = float(np.max(ref) - np.min(ref))
 
     # Handle edge case where data_range is 0
     if data_range == 0:
+        if mask is not None:
+            return 1.0 if np.allclose(prediction[mask], ground_truth[mask]) else 0.0
         return 1.0 if np.allclose(prediction, ground_truth) else 0.0
 
     c1 = (k1 * data_range) ** 2
@@ -217,13 +227,14 @@ def compute_ssim(
     if prediction.ndim == 3:
         ssim_values = []
         for i in range(prediction.shape[0]):
+            m_i = mask[i] if mask is not None else None
             ssim_val = _compute_ssim_2d(
-                prediction[i], ground_truth[i], c1, c2, win_size
+                prediction[i], ground_truth[i], c1, c2, win_size, mask=m_i
             )
             ssim_values.append(ssim_val)
         return float(np.mean(ssim_values))
     elif prediction.ndim == 2:
-        return _compute_ssim_2d(prediction, ground_truth, c1, c2, win_size)
+        return _compute_ssim_2d(prediction, ground_truth, c1, c2, win_size, mask=mask)
     else:
         raise ValueError(f"SSIM only supports 2D or 3D arrays, got {prediction.ndim}D")
 
@@ -234,6 +245,7 @@ def _compute_ssim_2d(
     c1: float,
     c2: float,
     win_size: int,
+    mask: Optional[NDArray[np.bool_]] = None,
 ) -> float:
     """Compute global SSIM for 2D images.
 
@@ -241,23 +253,36 @@ def _compute_ssim_2d(
     rather than local window-based computation. The win_size parameter is
     accepted for API compatibility but not used in this implementation.
 
+    When *mask* is provided, statistics are computed only from the
+    ``True`` pixels so that zero-padded background does not dilute the
+    result.
+
     Args:
         prediction: 2D predicted image array.
         ground_truth: 2D ground truth image array.
         c1: Constant for luminance comparison.
         c2: Constant for contrast comparison.
         win_size: Size of local window (unused in this global implementation).
+        mask: Optional 2D boolean mask restricting which pixels contribute.
 
     Returns:
         Global SSIM value for the image.
     """
     # Using global statistics for a simplified, robust implementation
     _ = win_size  # Explicitly mark as unused
-    mu_pred = np.mean(prediction)
-    mu_gt = np.mean(ground_truth)
-    sigma_pred = np.std(prediction)
-    sigma_gt = np.std(ground_truth)
-    sigma_pred_gt = np.mean((prediction - mu_pred) * (ground_truth - mu_gt))
+
+    if mask is not None and np.any(mask):
+        pred_vals = prediction[mask]
+        gt_vals = ground_truth[mask]
+    else:
+        pred_vals = prediction.ravel()
+        gt_vals = ground_truth.ravel()
+
+    mu_pred = np.mean(pred_vals)
+    mu_gt = np.mean(gt_vals)
+    sigma_pred = np.std(pred_vals)
+    sigma_gt = np.std(gt_vals)
+    sigma_pred_gt = np.mean((pred_vals - mu_pred) * (gt_vals - mu_gt))
 
     numerator = (2 * mu_pred * mu_gt + c1) * (2 * sigma_pred_gt + c2)
     denominator = (mu_pred ** 2 + mu_gt ** 2 + c1) * (sigma_pred ** 2 + sigma_gt ** 2 + c2)

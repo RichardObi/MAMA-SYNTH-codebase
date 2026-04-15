@@ -11,7 +11,8 @@ tqdm>=4.60.0
 # Pillow>=9.0.0
 
 # Optional: FRD (Fréchet Radiomics Distance)
-# pyradiomics>=3.0.0
+frd-score>=1.0.0
+# pyradiomics>=3.0.0  (transitive via frd-score; still needed for classifier feature extraction)
 
 # Optional: LPIPS (perceptual similarity)
 # torch>=1.9.0

@@ -326,10 +326,9 @@ class TestEvaluateTumorROI:
             output_file=tmp_path / "metrics.json",
         )
 
-        agg: dict = {}
-        detail: dict = {}
-        # No model dir → should add a note, not crash
-        evaluator._evaluate_tumor_roi([], {}, agg, detail)
+        # No model dir -> should add a note, not crash
+        result = evaluator._evaluate_tumor_roi([])
+        detail = result.get("detail", {})
         assert "note_tumor_roi" in detail
 
     def test_evaluate_tumor_roi_no_masks_graceful(
@@ -355,9 +354,8 @@ class TestEvaluateTumorROI:
             clf_model_dir=model_dir,
         )
 
-        agg: dict = {}
-        detail: dict = {}
-        evaluator._evaluate_tumor_roi([], {}, agg, detail)
+        result = evaluator._evaluate_tumor_roi([])
+        detail = result.get("detail", {})
         assert "note_tumor_roi" in detail
 
 
