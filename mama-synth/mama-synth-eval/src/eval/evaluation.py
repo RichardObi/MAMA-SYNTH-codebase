@@ -397,6 +397,7 @@ class MamaSynthEval:
         ):
             gt = self._normalizer.transform(gt_raw)
             pred = self._normalizer.transform(self._load_image_cached(pred_path))
+            pred = self._resize_pred_to_gt(pred, gt)
 
             mse_values.append(float(np.mean((pred - gt) ** 2)))
             real_images.append(gt)
@@ -453,6 +454,7 @@ class MamaSynthEval:
 
             gt = self._normalizer.transform(self._load_image_cached(gt_path))
             pred = self._normalizer.transform(self._load_image_cached(pred_path))
+            pred = self._resize_pred_to_gt(pred, gt)
             mask = masks[stem]
 
             real_roi, synth_roi, _ = extract_roi_pair(
@@ -1096,12 +1098,7 @@ class MamaSynthEval:
         """
         gt_image = self._load_image_cached(gt_path).astype(np.float64)
         pred_image = self._load_image_cached(pred_path).astype(np.float64)
-
-        if gt_image.shape != pred_image.shape:
-            raise ValueError(
-                f"Shape mismatch: ground truth {gt_image.shape} vs "
-                f"prediction {pred_image.shape}"
-            )
+        pred_image = self._resize_pred_to_gt(pred_image, gt_image)
 
         # Apply dataset-level z-score normalization (challenge protocol)
         if self._normalizer._fitted:
@@ -1118,6 +1115,41 @@ class MamaSynthEval:
             "ssim": compute_ssim(pred_image, gt_image, data_range=data_range),
             "ncc": compute_ncc(pred_image, gt_image),
         }
+
+    @staticmethod
+    def _resize_pred_to_gt(
+        pred: NDArray[np.floating],
+        gt: NDArray[np.floating],
+    ) -> NDArray[np.floating]:
+        """Resize *pred* to match *gt* shape when they differ.
+
+        This handles the common case where the synthesis model outputs
+        images at a fixed resolution (e.g. 512×512) while ground-truth
+        slices are at the native NIfTI resolution (e.g. 448×448).
+        Uses Pillow BICUBIC interpolation.  Returns *pred* unchanged
+        when shapes already match.
+        """
+        if pred.shape == gt.shape:
+            return pred
+        try:
+            from PIL import Image as _PILImg
+
+            # gt.shape is (H, W); PIL size is (W, H)
+            target_size = (gt.shape[1], gt.shape[0])
+            pil_img = _PILImg.fromarray(pred.astype(np.float64))
+            pil_resized = pil_img.resize(target_size, _PILImg.BICUBIC)
+            resized = np.array(pil_resized, dtype=pred.dtype)
+            logger.debug(
+                f"Resized prediction {pred.shape} -> {resized.shape} "
+                f"to match ground truth"
+            )
+            return resized
+        except ImportError:
+            raise ValueError(
+                f"Shape mismatch: prediction {pred.shape} vs "
+                f"ground truth {gt.shape} and Pillow is not available "
+                f"for resizing."
+            )
 
     @staticmethod
     def _load_image(path: Path) -> NDArray[np.floating]:

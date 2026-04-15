@@ -389,3 +389,79 @@ class TestLoadLabelsCSV:
         labels = evaluator._load_labels()
         assert labels["case001"]["tnbc"] == 1
         assert labels["case002"]["luminal"] == 1
+
+
+# ---------------------------------------------------------------------------
+# _resize_pred_to_gt
+# ---------------------------------------------------------------------------
+
+
+class TestResizePredToGt:
+    """Tests for the evaluation-time resolution mismatch handler."""
+
+    def test_noop_when_shapes_match(self):
+        """No resize when pred and gt have the same shape."""
+        gt = np.random.rand(64, 64).astype(np.float64)
+        pred = np.random.rand(64, 64).astype(np.float64)
+        result = MamaSynthEval._resize_pred_to_gt(pred, gt)
+        np.testing.assert_array_equal(result, pred)
+
+    def test_resizes_512_to_448(self):
+        """Pred at 512×512 is resized to match gt at 448×448."""
+        gt = np.random.rand(448, 448).astype(np.float64)
+        pred = np.random.rand(512, 512).astype(np.float64)
+        result = MamaSynthEval._resize_pred_to_gt(pred, gt)
+        assert result.shape == (448, 448)
+        assert result.dtype == pred.dtype
+
+    def test_resizes_nonsquare(self):
+        """Handles non-square dimensions correctly."""
+        gt = np.random.rand(100, 200).astype(np.float64)
+        pred = np.random.rand(50, 100).astype(np.float64)
+        result = MamaSynthEval._resize_pred_to_gt(pred, gt)
+        assert result.shape == (100, 200)
+
+    def test_preserves_dtype(self):
+        """Output dtype matches input pred dtype."""
+        gt = np.zeros((32, 32), dtype=np.float64)
+        pred = np.ones((64, 64), dtype=np.float32)
+        result = MamaSynthEval._resize_pred_to_gt(pred, gt)
+        assert result.dtype == np.float32
+
+
+class TestEvaluationWithResizeMismatch:
+    """Integration test: evaluation succeeds when pred/gt sizes differ."""
+
+    def test_full_image_metrics_with_mismatched_sizes(self, tmp_path):
+        """_evaluate_full_image works when pred is larger than gt."""
+        from PIL import Image
+
+        gt_dir = tmp_path / "gt"
+        pred_dir = tmp_path / "pred"
+        gt_dir.mkdir()
+        pred_dir.mkdir()
+
+        # GT at 48×48, pred at 64×64
+        for name in ("case001.png", "case002.png"):
+            gt_img = Image.fromarray(
+                np.random.randint(0, 255, (48, 48), dtype=np.uint8)
+            )
+            gt_img.save(gt_dir / name)
+            pred_img = Image.fromarray(
+                np.random.randint(0, 255, (64, 64), dtype=np.uint8)
+            )
+            pred_img.save(pred_dir / name)
+
+        output_file = tmp_path / "metrics.json"
+        evaluator = MamaSynthEval(
+            ground_truth_path=gt_dir,
+            predictions_path=pred_dir,
+            output_file=output_file,
+            enable_lpips=False,
+            enable_frd=False,
+            enable_segmentation=False,
+            enable_classification=False,
+        )
+        # Should not raise ValueError about shape mismatch
+        results = evaluator.evaluate()
+        assert "aggregates" in results
