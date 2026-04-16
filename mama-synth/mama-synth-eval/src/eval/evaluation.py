@@ -261,7 +261,7 @@ class MamaSynthEval:
         self.ensemble = ensemble
         self.dual_phase = dual_phase
         self.precontrast_path = (
-            Path(precontrast_path) if precontrast_path else None
+            Path(precontrast_path).resolve() if precontrast_path else None
         )
         # Will be fitted during evaluate()
         self._normalizer = DatasetNormalizer()
@@ -286,6 +286,102 @@ class MamaSynthEval:
             "tnbc": self.clf_model_dir_tnbc,
         }
         return _dirs.get(task, self.clf_model_dir)
+
+    # ------------------------------------------------------------------
+    # Pre-contrast auto-detection
+    # ------------------------------------------------------------------
+
+    def _auto_detect_precontrast(self) -> None:
+        """Try to find pre-contrast images in the ground-truth directory.
+
+        MAMA-MIA naming convention stores all phases in a single folder::
+
+            ISPY2_378885_0000.nii.gz   (phase 0 = pre-contrast)
+            ISPY2_378885_0001.nii.gz   (phase 1 = first post-contrast)
+            …
+
+        When ``precontrast_path`` was not explicitly provided, this method
+        checks whether the ground-truth directory contains ``*_0000.*``
+        files.  If at least one is found, ``self.precontrast_path`` is set
+        to the ground-truth directory so that ``_evaluate_contrast`` can
+        derive matching pre-contrast stems automatically.
+        """
+        if self.precontrast_path is not None:
+            return
+
+        gt_dir = self.ground_truth_path
+        if not gt_dir.exists():
+            return
+
+        # Check for files matching the _0000 phase convention
+        for ext in (".nii.gz", ".nii", ".mha", ".png"):
+            candidates = list(gt_dir.glob(f"*_0000{ext}"))
+            if candidates:
+                logger.info(
+                    f"Auto-detected {len(candidates)} pre-contrast image(s) "
+                    f"(*_0000{ext}) in ground-truth directory — using "
+                    f"{gt_dir} as precontrast_path."
+                )
+                self.precontrast_path = gt_dir
+                return
+
+        logger.warning(
+            "No pre-contrast images (*_0000.*) found in the ground-truth "
+            "directory.  Contrast classification requires pre-contrast "
+            "source images.  Provide --precontrast-path explicitly or "
+            "ensure files follow the MAMA-MIA naming convention "
+            "({PatientID}_0000.{ext})."
+        )
+
+    @staticmethod
+    def _find_precontrast_image(
+        stem: str,
+        precontrast_dir: Path,
+    ) -> Optional[Path]:
+        """Locate the pre-contrast image for a given (post-contrast) stem.
+
+        Tries three strategies in order:
+
+        1. **Direct match** — ``{stem}.{ext}`` in *precontrast_dir*
+           (works when a dedicated pre-contrast directory is provided).
+        2. **Phase-suffix replacement** — if the stem ends with
+           ``_NNNN`` (4 digits, e.g. ``_0001``), replace the suffix
+           with ``_0000`` and look for that file.
+        3. **Phase-suffix append** — try ``{stem}_0000.{ext}`` when
+           the stem has no detectable phase suffix (e.g. 2D PNG stems
+           that had the suffix stripped during slice extraction).
+
+        Returns the first existing path found, or ``None``.
+        """
+        import re
+
+        _EXTS = (".png", ".nii.gz", ".nii", ".mha")
+
+        # Strategy 1: direct match
+        for ext in _EXTS:
+            candidate = precontrast_dir / f"{stem}{ext}"
+            if candidate.exists():
+                return candidate
+
+        # Strategy 2: replace trailing _NNNN phase suffix with _0000
+        m = re.match(r"^(.+)_(\d{4})$", stem)
+        if m:
+            base, phase = m.group(1), m.group(2)
+            if phase != "0000":
+                precon_stem = f"{base}_0000"
+                for ext in _EXTS:
+                    candidate = precontrast_dir / f"{precon_stem}{ext}"
+                    if candidate.exists():
+                        return candidate
+
+        # Strategy 3: append _0000 (stem has no phase suffix)
+        if not m:
+            for ext in _EXTS:
+                candidate = precontrast_dir / f"{stem}_0000{ext}"
+                if candidate.exists():
+                    return candidate
+
+        return None
 
     def _extract_features_cached(
         self,
@@ -802,22 +898,22 @@ class MamaSynthEval:
             # Dual-phase: also extract features from pre-contrast and concatenate
             if self.dual_phase and self.precontrast_path:
                 precon_feats = None
-                for ext in (".nii.gz", ".nii", ".mha"):
-                    pc_path = self.precontrast_path / f"{stem}{ext}"
-                    if pc_path.exists():
-                        try:
-                            pc_image = self._load_image_cached(pc_path).astype(
-                                np.float64
-                            )
-                            precon_feats = self._extract_features_cached(
-                                pc_image, str(pc_path),
-                            )
-                        except Exception as e:
-                            logger.warning(
-                                f"Dual-phase: failed to load pre-contrast "
-                                f"for {stem}: {e}"
-                            )
-                        break
+                pc_path = self._find_precontrast_image(
+                    stem, self.precontrast_path
+                )
+                if pc_path is not None:
+                    try:
+                        pc_image = self._load_image_cached(pc_path).astype(
+                            np.float64
+                        )
+                        precon_feats = self._extract_features_cached(
+                            pc_image, str(pc_path),
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"Dual-phase: failed to load pre-contrast "
+                            f"for {stem}: {e}"
+                        )
                 if precon_feats is not None:
                     feats = np.concatenate([feats, precon_feats])
                 else:
@@ -1064,8 +1160,10 @@ class MamaSynthEval:
         Requires:
         * ``--clf-model-dir-contrast`` pointing to a directory with
           ``contrast_classifier.pkl`` (and/or ``contrast_classifier_cnn.pt``).
-        * ``--precontrast-path`` pointing to the pre-contrast source
-          images (same stems as predictions).
+        * Pre-contrast source images — either via ``--precontrast-path``
+          or auto-detected from the ground-truth folder when files
+          follow the MAMA-MIA naming convention
+          (``{PatientID}_0000.{ext}``).
 
         Returns dict with 'aggregates' and 'detail' sub-keys.
         """
@@ -1082,6 +1180,9 @@ class MamaSynthEval:
                     )
                 }
             }
+
+        # Auto-detect pre-contrast images from the GT folder if not set.
+        self._auto_detect_precontrast()
 
         if self.precontrast_path is None or not self.precontrast_path.exists():
             return {
@@ -1141,18 +1242,18 @@ class MamaSynthEval:
 
             # Find matching pre-contrast image
             pc_image_arr: Optional[NDArray] = None
-            for ext in (".png", ".nii.gz", ".nii", ".mha"):
-                pc_path = self.precontrast_path / f"{stem}{ext}"
-                if pc_path.exists():
-                    try:
-                        pc_image_arr = self._load_image_cached(
-                            pc_path
-                        ).astype(np.float64)
-                    except Exception as exc:
-                        logger.warning(
-                            f"Failed to load pre-contrast for {stem}: {exc}"
-                        )
-                    break
+            pc_path = self._find_precontrast_image(
+                stem, self.precontrast_path
+            )
+            if pc_path is not None:
+                try:
+                    pc_image_arr = self._load_image_cached(
+                        pc_path
+                    ).astype(np.float64)
+                except Exception as exc:
+                    logger.warning(
+                        f"Failed to load pre-contrast for {stem}: {exc}"
+                    )
 
             if pc_image_arr is None:
                 continue
@@ -1245,15 +1346,15 @@ class MamaSynthEval:
                         self._load_image_cached(pred_path).astype(np.float64)
                     )
                 for stem in valid_stems:
-                    for ext in (".png", ".nii.gz", ".nii", ".mha"):
-                        pc_p = self.precontrast_path / f"{stem}{ext}"
-                        if pc_p.exists():
-                            cnn_images.append(
-                                self._load_image_cached(pc_p).astype(
-                                    np.float64
-                                )
+                    pc_p = self._find_precontrast_image(
+                        stem, self.precontrast_path
+                    )
+                    if pc_p is not None:
+                        cnn_images.append(
+                            self._load_image_cached(pc_p).astype(
+                                np.float64
                             )
-                            break
+                        )
                 y_score = cnn_clf.predict_proba_from_images(
                     cnn_images, masks=None,
                 )

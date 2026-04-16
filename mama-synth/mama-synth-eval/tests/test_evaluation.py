@@ -1361,3 +1361,213 @@ class TestExtractRadiomicFeaturesFailure:
 
         assert result.shape == (93,)
         assert np.all(result == 0.0)
+
+
+# ======================================================================
+# Pre-contrast auto-detection & stem derivation
+# ======================================================================
+
+class TestFindPrecontrastImage:
+    """Tests for MamaSynthEval._find_precontrast_image()."""
+
+    def test_direct_match(self, tmp_path: Path) -> None:
+        """Direct stem match (dedicated pre-contrast dir)."""
+        pc_dir = tmp_path / "precon"
+        pc_dir.mkdir()
+        (pc_dir / "CASE_001.png").touch()
+
+        result = MamaSynthEval._find_precontrast_image("CASE_001", pc_dir)
+        assert result is not None
+        assert result.name == "CASE_001.png"
+
+    def test_phase_suffix_replacement(self, tmp_path: Path) -> None:
+        """Stem ending in _0001 should be replaced with _0000."""
+        gt_dir = tmp_path / "gt"
+        gt_dir.mkdir()
+        (gt_dir / "ISPY2_378885_0000.nii.gz").touch()
+
+        result = MamaSynthEval._find_precontrast_image(
+            "ISPY2_378885_0001", gt_dir
+        )
+        assert result is not None
+        assert result.name == "ISPY2_378885_0000.nii.gz"
+
+    def test_phase_suffix_append(self, tmp_path: Path) -> None:
+        """Stem without phase suffix should try appending _0000."""
+        gt_dir = tmp_path / "gt"
+        gt_dir.mkdir()
+        (gt_dir / "CASE_001_0000.png").touch()
+
+        result = MamaSynthEval._find_precontrast_image("CASE_001", gt_dir)
+        assert result is not None
+        assert result.name == "CASE_001_0000.png"
+
+    def test_no_match_returns_none(self, tmp_path: Path) -> None:
+        """Should return None when no pre-contrast file exists."""
+        d = tmp_path / "empty"
+        d.mkdir()
+        result = MamaSynthEval._find_precontrast_image("CASE_001", d)
+        assert result is None
+
+    def test_already_phase_0000_direct(self, tmp_path: Path) -> None:
+        """Stem _0000 should be found via direct match, not replacement."""
+        d = tmp_path / "precon"
+        d.mkdir()
+        (d / "PAT_0000.nii.gz").touch()
+
+        result = MamaSynthEval._find_precontrast_image("PAT_0000", d)
+        assert result is not None
+        assert result.name == "PAT_0000.nii.gz"
+
+    def test_multi_digit_phase_suffix(self, tmp_path: Path) -> None:
+        """Stems like _0003 should also find _0000."""
+        d = tmp_path / "data"
+        d.mkdir()
+        (d / "DUKE_055_0000.mha").touch()
+
+        result = MamaSynthEval._find_precontrast_image("DUKE_055_0003", d)
+        assert result is not None
+        assert result.name == "DUKE_055_0000.mha"
+
+
+class TestAutoDetectPrecontrast:
+    """Tests for MamaSynthEval._auto_detect_precontrast()."""
+
+    def test_auto_detect_from_gt(self, tmp_path: Path) -> None:
+        """Pre-contrast path should be set to GT dir when _0000 files exist."""
+        gt_dir = tmp_path / "gt"
+        pred_dir = tmp_path / "pred"
+        gt_dir.mkdir()
+        pred_dir.mkdir()
+        (gt_dir / "ISPY2_001_0000.nii.gz").touch()
+        (gt_dir / "ISPY2_001_0001.nii.gz").touch()
+        (pred_dir / "dummy.png").touch()
+
+        evaluator = MamaSynthEval(
+            ground_truth_path=gt_dir,
+            predictions_path=pred_dir,
+            output_file=tmp_path / "out.json",
+            precontrast_path=None,
+        )
+        assert evaluator.precontrast_path is None
+
+        evaluator._auto_detect_precontrast()
+        assert evaluator.precontrast_path is not None
+        assert evaluator.precontrast_path == gt_dir.resolve()
+
+    def test_no_auto_detect_without_0000_files(self, tmp_path: Path) -> None:
+        """precontrast_path should remain None if no _0000 files present."""
+        gt_dir = tmp_path / "gt"
+        pred_dir = tmp_path / "pred"
+        gt_dir.mkdir()
+        pred_dir.mkdir()
+        (gt_dir / "CASE_001.png").touch()
+        (pred_dir / "dummy.png").touch()
+
+        evaluator = MamaSynthEval(
+            ground_truth_path=gt_dir,
+            predictions_path=pred_dir,
+            output_file=tmp_path / "out.json",
+            precontrast_path=None,
+        )
+        evaluator._auto_detect_precontrast()
+        assert evaluator.precontrast_path is None
+
+    def test_explicit_precontrast_not_overridden(self, tmp_path: Path) -> None:
+        """Explicit precontrast_path should not be overridden by auto-detect."""
+        gt_dir = tmp_path / "gt"
+        pred_dir = tmp_path / "pred"
+        explicit_dir = tmp_path / "explicit"
+        gt_dir.mkdir()
+        pred_dir.mkdir()
+        explicit_dir.mkdir()
+        (gt_dir / "ISPY2_001_0000.nii.gz").touch()
+        (pred_dir / "dummy.png").touch()
+
+        evaluator = MamaSynthEval(
+            ground_truth_path=gt_dir,
+            predictions_path=pred_dir,
+            output_file=tmp_path / "out.json",
+            precontrast_path=explicit_dir,
+        )
+
+        evaluator._auto_detect_precontrast()
+        assert evaluator.precontrast_path == explicit_dir.resolve()
+
+
+class TestContrastAutoDetectIntegration:
+    """Integration: _evaluate_contrast uses auto-detect + phase suffix."""
+
+    def test_contrast_auto_detect_same_folder(self, tmp_path: Path) -> None:
+        """Contrast AUROC should be computed when pre/post are in same folder."""
+        from PIL import Image
+        from unittest.mock import patch
+
+        gt_dir = tmp_path / "gt"
+        pred_dir = tmp_path / "pred"
+        clf_dir = tmp_path / "clf_contrast"
+        gt_dir.mkdir()
+        pred_dir.mkdir()
+        clf_dir.mkdir()
+
+        rng = np.random.RandomState(70)
+        for i in range(4):
+            pid = f"PAT_{i:03d}"
+            # Post-contrast GT and predictions share stem with _0001
+            gt_name = f"{pid}_0001.nii.gz"
+            pred_name = f"{pid}_0001.nii.gz"
+            # Pre-contrast in same GT folder
+            precon_name = f"{pid}_0000.nii.gz"
+
+            # Write minimal NIfTI using SimpleITK
+            arr = rng.randint(0, 255, (32, 32), dtype=np.uint8).astype(
+                np.float64
+            )
+            import SimpleITK as sitk
+
+            img = sitk.GetImageFromArray(arr)
+            sitk.WriteImage(img, str(gt_dir / gt_name))
+            sitk.WriteImage(img, str(pred_dir / pred_name))
+            sitk.WriteImage(img, str(gt_dir / precon_name))
+
+        # Create dummy pkl model (93 features)
+        import pickle
+        from sklearn.ensemble import RandomForestClassifier
+
+        dummy_model = RandomForestClassifier(n_estimators=2, random_state=42)
+        X = rng.rand(10, 93)
+        y = np.array([0] * 5 + [1] * 5)
+        dummy_model.fit(X, y)
+        with open(clf_dir / "contrast_classifier.pkl", "wb") as f:
+            pickle.dump(dummy_model, f)
+
+        output_file = tmp_path / "metrics.json"
+        evaluator = MamaSynthEval(
+            ground_truth_path=gt_dir,
+            predictions_path=pred_dir,
+            output_file=output_file,
+            enable_lpips=False,
+            enable_frd=False,
+            enable_segmentation=False,
+            enable_classification=True,
+            clf_model_dir_contrast=clf_dir,
+            # NO precontrast_path — should auto-detect from gt_dir
+        )
+
+        fake_feats = rng.rand(93).astype(np.float64)
+        with patch(
+            "eval.evaluation.extract_radiomic_features",
+            return_value=fake_feats,
+            create=True,
+        ), patch(
+            "eval.frd.extract_radiomic_features",
+            return_value=fake_feats,
+            create=True,
+        ):
+            results = evaluator.evaluate()
+
+        agg = results.get("aggregates", {})
+        assert "auroc_contrast" in agg, (
+            f"Expected auroc_contrast via auto-detection, got: {list(agg.keys())}"
+        )
+        assert 0.0 <= agg["auroc_contrast"] <= 1.0

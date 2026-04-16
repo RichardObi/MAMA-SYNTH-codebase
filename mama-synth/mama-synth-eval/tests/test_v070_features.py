@@ -269,7 +269,7 @@ class TestDualPhaseMainCLI:
                 precontrast_path=precon_dir,
             )
             assert evaluator.dual_phase is True
-            assert evaluator.precontrast_path == precon_dir
+            assert evaluator.precontrast_path == precon_dir.resolve()
 
 
 # ===================================================================

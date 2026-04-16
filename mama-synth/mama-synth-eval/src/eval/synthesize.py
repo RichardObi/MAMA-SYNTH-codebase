@@ -1129,6 +1129,7 @@ def run_evaluation(
     output_file: Path,
     masks_dir: Optional[Path] = None,
     labels_path: Optional[Path] = None,
+    precontrast_path: Optional[Path] = None,
     clf_model_dir: Optional[Path] = None,
     clf_model_dir_contrast: Optional[Path] = None,
     clf_model_dir_tumor_roi: Optional[Path] = None,
@@ -1154,6 +1155,11 @@ def run_evaluation(
         Output JSON file path.
     masks_dir, labels_path, seg_model_path, cache_dir :
         Optional paths for ROI / segmentation evaluation.
+    precontrast_path : Path or None
+        Directory with pre-contrast source images.  When ``None``,
+        the evaluator will attempt to auto-detect pre-contrast images
+        from *ground_truth_dir* using the MAMA-MIA naming convention
+        (``{PatientID}_0000.{ext}``).
     clf_model_dir : Path or None
         Legacy fallback directory for all classifier tasks.
     clf_model_dir_contrast, clf_model_dir_tumor_roi : Path or None
@@ -1179,6 +1185,9 @@ def run_evaluation(
         output_file=str(output_file),
         masks_path=str(masks_dir) if masks_dir else None,
         labels_path=str(labels_path) if labels_path else None,
+        precontrast_path=(
+            str(precontrast_path) if precontrast_path else None
+        ),
         clf_model_dir=str(clf_model_dir) if clf_model_dir else None,
         clf_model_dir_contrast=(
             str(clf_model_dir_contrast) if clf_model_dir_contrast else None
@@ -1558,6 +1567,18 @@ def parse_synthesize_and_evaluate_args(
         help="Labels file (JSON or CSV) for classification evaluation.",
     )
     evl.add_argument(
+        "--precontrast-path",
+        type=Path,
+        default=None,
+        help=(
+            "Directory with pre-contrast source images.  When not set, "
+            "the evaluator will try to auto-detect pre-contrast images "
+            "from the ground-truth folder using the MAMA-MIA naming "
+            "convention ({PatientID}_0000.{ext}).  Only required if "
+            "pre-contrast images are stored in a separate directory."
+        ),
+    )
+    evl.add_argument(
         "--clf-model-dir",
         type=Path,
         default=None,
@@ -1811,6 +1832,7 @@ def synthesize_and_evaluate_main(
         output_file=args.output_file,
         masks_dir=mask_eval_dir,
         labels_path=args.labels_path,
+        precontrast_path=getattr(args, "precontrast_path", None),
         clf_model_dir=args.clf_model_dir,
         clf_model_dir_contrast=args.clf_model_dir_contrast,
         clf_model_dir_tumor_roi=args.clf_model_dir_tumor_roi,
@@ -1836,6 +1858,16 @@ def synthesize_and_evaluate_main(
                     f"(±{value.get('std', 0):.4f})"
                 )
             elif isinstance(value, (int, float)):
+                logger.info(f"  {key}: {value:.4f}")
+            else:
+                logger.info(f"  {key}: {value}")
+
+    # Print classification detail (notes, AUROC, balanced accuracy, etc.)
+    clf_detail = results.get("classification", {})
+    if clf_detail:
+        logger.info("\n--- Classification Results ---")
+        for key, value in sorted(clf_detail.items()):
+            if isinstance(value, (int, float)):
                 logger.info(f"  {key}: {value:.4f}")
             else:
                 logger.info(f"  {key}: {value}")

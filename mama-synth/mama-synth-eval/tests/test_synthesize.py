@@ -2297,3 +2297,122 @@ class TestIs2dImage:
             root = Path(tmp)
             (root / "data.nii.gz").touch()
             assert not _dir_has_2d_images(root)
+
+
+class TestPrecontrastPathArg:
+    """Tests for --precontrast-path in parse_synthesize_and_evaluate_args."""
+
+    def test_precontrast_path_default_none(self, tmp_path):
+        from eval.synthesize import parse_synthesize_and_evaluate_args
+
+        args = parse_synthesize_and_evaluate_args([
+            "--predictions-dir", str(tmp_path),
+            "--ground-truth-path", str(tmp_path),
+            "--skip-synthesis",
+        ])
+        assert getattr(args, "precontrast_path", None) is None
+
+    def test_precontrast_path_explicit(self, tmp_path):
+        from eval.synthesize import parse_synthesize_and_evaluate_args
+
+        pc_dir = tmp_path / "precon"
+        pc_dir.mkdir()
+
+        args = parse_synthesize_and_evaluate_args([
+            "--predictions-dir", str(tmp_path),
+            "--ground-truth-path", str(tmp_path),
+            "--skip-synthesis",
+            "--precontrast-path", str(pc_dir),
+        ])
+        assert args.precontrast_path == pc_dir
+
+
+class TestRunEvaluationPrecontrastPassthrough:
+    """Ensure run_evaluation passes precontrast_path to MamaSynthEval."""
+
+    def test_precontrast_forwarded(self, tmp_path):
+        from unittest.mock import patch, MagicMock
+
+        gt_dir = tmp_path / "gt"
+        pred_dir = tmp_path / "pred"
+        out_file = tmp_path / "metrics.json"
+        pc_dir = tmp_path / "precon"
+        gt_dir.mkdir()
+        pred_dir.mkdir()
+        pc_dir.mkdir()
+
+        mock_eval_cls = MagicMock()
+        mock_instance = MagicMock()
+        mock_instance.evaluate.return_value = {"aggregates": {}}
+        mock_eval_cls.return_value = mock_instance
+
+        with patch("eval.synthesize.MamaSynthEval", mock_eval_cls, create=True), \
+             patch("eval.evaluation.MamaSynthEval", mock_eval_cls, create=True):
+            from eval.synthesize import run_evaluation
+
+            run_evaluation(
+                predictions_dir=pred_dir,
+                ground_truth_dir=gt_dir,
+                output_file=out_file,
+                precontrast_path=pc_dir,
+            )
+
+        call_kwargs = mock_eval_cls.call_args
+        assert call_kwargs is not None
+        assert str(pc_dir) in str(call_kwargs)
+
+
+class TestClassificationResultsLogging:
+    """Test that classification results are logged by synthesize_and_evaluate_main."""
+
+    def test_classification_detail_logged(self, tmp_path, caplog):
+        """Classification detail entries should appear in console output."""
+        import logging
+        from unittest.mock import patch, MagicMock
+
+        gt_dir = tmp_path / "gt"
+        pred_dir = tmp_path / "pred"
+        gt_dir.mkdir()
+        pred_dir.mkdir()
+
+        fake_results = {
+            "aggregates": {"mse_full_image": {"mean": 0.01, "std": 0.001}},
+            "classification": {
+                "auroc_contrast": 0.85,
+                "note_tumor_roi": "Skipped",
+            },
+        }
+
+        with patch("eval.synthesize.parse_synthesize_and_evaluate_args") as mock_parse, \
+             patch("eval.synthesize.run_evaluation", return_value=fake_results), \
+             patch("eval.synthesize._dir_has_2d_images", return_value=True), \
+             patch("eval.synthesize.synthesize_with_medigan"):
+            mock_args = MagicMock()
+            mock_args.verbose = False
+            mock_args._skip_synthesis = True
+            mock_args.predictions_dir = pred_dir
+            mock_args.ground_truth_path = gt_dir
+            mock_args.output_file = tmp_path / "metrics.json"
+            mock_args.masks_path = None
+            mock_args.labels_path = None
+            mock_args.precontrast_path = None
+            mock_args.clf_model_dir = None
+            mock_args.clf_model_dir_contrast = None
+            mock_args.clf_model_dir_tumor_roi = None
+            mock_args.clf_model_dir_luminal = None
+            mock_args.clf_model_dir_tnbc = None
+            mock_args.seg_model_path = None
+            mock_args.cache_dir = None
+            mock_args.disable_lpips = False
+            mock_args.disable_frd = False
+            mock_args.disable_segmentation = False
+            mock_args.disable_classification = False
+            mock_parse.return_value = mock_args
+
+            with caplog.at_level(logging.INFO, logger="eval.synthesize"):
+                from eval.synthesize import synthesize_and_evaluate_main
+                synthesize_and_evaluate_main()
+
+        log_text = caplog.text
+        assert "Classification Results" in log_text
+        assert "auroc_contrast" in log_text
