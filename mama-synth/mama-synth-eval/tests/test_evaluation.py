@@ -1571,3 +1571,257 @@ class TestContrastAutoDetectIntegration:
             f"Expected auroc_contrast via auto-detection, got: {list(agg.keys())}"
         )
         assert 0.0 <= agg["auroc_contrast"] <= 1.0
+
+
+# ------------------------------------------------------------------
+# Ensemble classification
+# ------------------------------------------------------------------
+
+
+class TestEnsembleContrast:
+    """Ensemble mode for _evaluate_contrast using multiple radiomics models."""
+
+    def test_contrast_ensemble_discovers_multiple_models(
+        self, tmp_path: Path
+    ) -> None:
+        """With ensemble=True, _evaluate_contrast should discover all pkl
+        models in the classifier directory and produce an AUROC."""
+        from PIL import Image
+        from unittest.mock import patch
+        import pickle
+        from sklearn.ensemble import RandomForestClassifier
+        from sklearn.linear_model import LogisticRegression
+
+        gt_dir = tmp_path / "gt"
+        pred_dir = tmp_path / "pred"
+        precon_dir = tmp_path / "precontrast"
+        clf_dir = tmp_path / "clf_contrast"
+        gt_dir.mkdir(); pred_dir.mkdir(); precon_dir.mkdir(); clf_dir.mkdir()
+
+        rng = np.random.RandomState(88)
+        n_features = 93
+        for i in range(6):
+            name = f"case_{i:03d}.png"
+            for d in (gt_dir, pred_dir, precon_dir):
+                Image.fromarray(
+                    rng.randint(0, 255, (32, 32), dtype=np.uint8)
+                ).save(d / name)
+
+        # Create two different pkl models (simulating --save-all-models)
+        X = rng.rand(20, n_features)
+        y = np.array([0] * 10 + [1] * 10)
+        for name, cls in [
+            ("contrast_classifier_rf_0.pkl", RandomForestClassifier),
+            ("contrast_classifier_lr_0.pkl", LogisticRegression),
+        ]:
+            model = cls(random_state=42)
+            model.fit(X, y)
+            with open(clf_dir / name, "wb") as f:
+                pickle.dump(model, f)
+
+        output_file = tmp_path / "metrics.json"
+        evaluator = MamaSynthEval(
+            ground_truth_path=gt_dir,
+            predictions_path=pred_dir,
+            output_file=output_file,
+            enable_lpips=False,
+            enable_frd=False,
+            enable_segmentation=False,
+            enable_classification=True,
+            clf_model_dir_contrast=clf_dir,
+            precontrast_path=precon_dir,
+            ensemble=True,
+        )
+
+        fake_feats = rng.rand(n_features).astype(np.float64)
+        with patch(
+            "eval.evaluation.extract_radiomic_features",
+            return_value=fake_feats,
+            create=True,
+        ), patch(
+            "eval.frd.extract_radiomic_features",
+            return_value=fake_feats,
+            create=True,
+        ):
+            results = evaluator.evaluate()
+
+        agg = results.get("aggregates", {})
+        assert "auroc_contrast" in agg, (
+            f"Expected auroc_contrast with ensemble, got keys: {list(agg.keys())}"
+        )
+        assert 0.0 <= agg["auroc_contrast"] <= 1.0
+
+    def test_contrast_ensemble_false_uses_single_model(
+        self, tmp_path: Path
+    ) -> None:
+        """With ensemble=False (default), _evaluate_contrast should use
+        only the single contrast_classifier.pkl (not discover extras)."""
+        from PIL import Image
+        from unittest.mock import patch
+        import pickle
+        from sklearn.ensemble import RandomForestClassifier
+
+        gt_dir = tmp_path / "gt"
+        pred_dir = tmp_path / "pred"
+        precon_dir = tmp_path / "precontrast"
+        clf_dir = tmp_path / "clf_contrast"
+        gt_dir.mkdir(); pred_dir.mkdir(); precon_dir.mkdir(); clf_dir.mkdir()
+
+        rng = np.random.RandomState(89)
+        n_features = 93
+        for i in range(4):
+            name = f"case_{i:03d}.png"
+            for d in (gt_dir, pred_dir, precon_dir):
+                Image.fromarray(
+                    rng.randint(0, 255, (32, 32), dtype=np.uint8)
+                ).save(d / name)
+
+        X = rng.rand(10, n_features)
+        y = np.array([0] * 5 + [1] * 5)
+        model = RandomForestClassifier(n_estimators=2, random_state=42)
+        model.fit(X, y)
+        with open(clf_dir / "contrast_classifier.pkl", "wb") as f:
+            pickle.dump(model, f)
+
+        output_file = tmp_path / "metrics.json"
+        evaluator = MamaSynthEval(
+            ground_truth_path=gt_dir,
+            predictions_path=pred_dir,
+            output_file=output_file,
+            enable_lpips=False,
+            enable_frd=False,
+            enable_segmentation=False,
+            enable_classification=True,
+            clf_model_dir_contrast=clf_dir,
+            precontrast_path=precon_dir,
+            ensemble=False,
+        )
+
+        fake_feats = rng.rand(n_features).astype(np.float64)
+        with patch(
+            "eval.evaluation.extract_radiomic_features",
+            return_value=fake_feats,
+            create=True,
+        ), patch(
+            "eval.frd.extract_radiomic_features",
+            return_value=fake_feats,
+            create=True,
+        ):
+            results = evaluator.evaluate()
+
+        agg = results.get("aggregates", {})
+        assert "auroc_contrast" in agg
+        # Should report single-model type
+        clf_detail = results.get("classification", {})
+        clf_type = clf_detail.get("classifier_type_contrast", "")
+        assert clf_type == "radiomics", (
+            f"Expected 'radiomics' classifier type, got '{clf_type}'"
+        )
+
+
+class TestEnsembleTumorROI:
+    """Ensemble mode for _evaluate_tumor_roi."""
+
+    def test_tumor_roi_ensemble_discovers_multiple_models(
+        self, tmp_path: Path
+    ) -> None:
+        """With ensemble=True, _evaluate_tumor_roi should discover all pkl
+        models and produce an AUROC."""
+        from PIL import Image
+        from unittest.mock import patch
+        import pickle
+        from sklearn.ensemble import RandomForestClassifier
+        from sklearn.linear_model import LogisticRegression
+
+        gt_dir = tmp_path / "gt"
+        pred_dir = tmp_path / "pred"
+        masks_dir = tmp_path / "masks"
+        clf_dir = tmp_path / "clf_tumor_roi"
+        gt_dir.mkdir(); pred_dir.mkdir(); masks_dir.mkdir(); clf_dir.mkdir()
+
+        rng = np.random.RandomState(90)
+        n_features = 93
+        for i in range(4):
+            name = f"case_{i:03d}.png"
+            Image.fromarray(
+                rng.randint(0, 255, (48, 48), dtype=np.uint8)
+            ).save(gt_dir / name)
+            Image.fromarray(
+                rng.randint(0, 255, (48, 48), dtype=np.uint8)
+            ).save(pred_dir / name)
+            mask_data = np.zeros((48, 48), dtype=np.uint8)
+            mask_data[10:38, 10:20] = 255  # left-side tumor
+            Image.fromarray(mask_data).save(masks_dir / name)
+
+        # Create two different pkl models
+        X = rng.rand(20, n_features)
+        y = np.array([0] * 10 + [1] * 10)
+        for name, cls in [
+            ("tumor_roi_classifier_rf_0.pkl", RandomForestClassifier),
+            ("tumor_roi_classifier_lr_0.pkl", LogisticRegression),
+        ]:
+            model = cls(random_state=42)
+            model.fit(X, y)
+            with open(clf_dir / name, "wb") as f:
+                pickle.dump(model, f)
+
+        output_file = tmp_path / "metrics.json"
+        evaluator = MamaSynthEval(
+            ground_truth_path=gt_dir,
+            predictions_path=pred_dir,
+            output_file=output_file,
+            masks_path=masks_dir,
+            enable_lpips=False,
+            enable_frd=False,
+            enable_segmentation=False,
+            enable_classification=True,
+            clf_model_dir_tumor_roi=clf_dir,
+            ensemble=True,
+        )
+
+        fake_feats = rng.rand(n_features).astype(np.float64)
+        with patch(
+            "eval.evaluation.extract_radiomic_features",
+            return_value=fake_feats,
+            create=True,
+        ), patch(
+            "eval.frd.extract_radiomic_features",
+            return_value=fake_feats,
+            create=True,
+        ), patch(
+            "eval.mirror_utils.create_mirrored_mask",
+            side_effect=lambda img, mask: np.fliplr(mask),
+            create=True,
+        ):
+            results = evaluator.evaluate()
+
+        agg = results.get("aggregates", {})
+        assert "auroc_tumor_roi" in agg, (
+            f"Expected auroc_tumor_roi with ensemble, got keys: {list(agg.keys())}"
+        )
+        assert 0.0 <= agg["auroc_tumor_roi"] <= 1.0
+
+
+class TestEnsembleCLIArg:
+    """Test that --ensemble CLI argument is parsed correctly."""
+
+    def test_ensemble_flag_parsed(self) -> None:
+        """--ensemble should set args.ensemble = True."""
+        from eval.synthesize import parse_synthesize_and_evaluate_args
+
+        args = parse_synthesize_and_evaluate_args([
+            "--predictions-dir", "/tmp/pred",
+            "--ground-truth-path", "/tmp/gt",
+            "--ensemble",
+        ])
+        assert args.ensemble is True
+
+    def test_no_ensemble_flag_default_false(self) -> None:
+        """Without --ensemble, args.ensemble should default to False."""
+        from eval.synthesize import parse_synthesize_and_evaluate_args
+
+        args = parse_synthesize_and_evaluate_args([
+            "--predictions-dir", "/tmp/pred",
+            "--ground-truth-path", "/tmp/gt",
+        ])
+        assert args.ensemble is False

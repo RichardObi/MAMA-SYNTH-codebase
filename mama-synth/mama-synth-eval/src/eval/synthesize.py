@@ -1142,6 +1142,7 @@ def run_evaluation(
     disable_frd: bool = False,
     disable_segmentation: bool = False,
     disable_classification: bool = False,
+    ensemble: bool = False,
     verbose: bool = False,
 ) -> dict[str, Any]:
     """Run the full MAMA-SYNTH evaluation pipeline.
@@ -1170,6 +1171,10 @@ def run_evaluation(
         are only evaluated when a model directory is provided.
     disable_lpips, disable_frd, disable_segmentation, disable_classification :
         Flags to skip specific metric groups.
+    ensemble : bool
+        When True, use ``EnsembleClassifier`` (averages predictions
+        from all discovered models) instead of a single model for
+        every classification task.
     verbose : bool
         Enable DEBUG logging.
 
@@ -1208,6 +1213,7 @@ def run_evaluation(
         enable_frd=not disable_frd,
         enable_segmentation=not disable_segmentation,
         enable_classification=not disable_classification,
+        ensemble=ensemble,
     )
 
     results = evaluator.evaluate()
@@ -1661,6 +1667,16 @@ def parse_synthesize_and_evaluate_args(
         action="store_true",
         help="Skip classification evaluation.",
     )
+    evl.add_argument(
+        "--ensemble",
+        action="store_true",
+        help=(
+            "Use ensemble classification: discover all trained models "
+            "(radiomics + CNN) in the classifier directories and average "
+            "their predictions for every classification task. "
+            "Requires models trained with --save-all-models."
+        ),
+    )
 
     # Logging
     parser.add_argument(
@@ -1880,6 +1896,7 @@ def synthesize_and_evaluate_main(
         disable_frd=args.disable_frd,
         disable_segmentation=args.disable_segmentation,
         disable_classification=args.disable_classification,
+        ensemble=getattr(args, "ensemble", False),
         verbose=args.verbose,
     )
 

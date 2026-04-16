@@ -1197,6 +1197,7 @@ class MamaSynthEval:
         try:
             from eval.classification import (
                 CNNClassifier,
+                EnsembleClassifier,
                 RadiomicsClassifier,
                 evaluate_classification,
             )
@@ -1217,15 +1218,21 @@ class MamaSynthEval:
             pkl_model_path = pkl_candidate
 
         if cnn_model_path is None and pkl_model_path is None:
-            return {
-                "detail": {
-                    f"note_{task}": (
-                        f"No model files found in {_task_dir}. "
-                        f"Expected {task}_classifier.pkl or "
-                        f"{task}_classifier_cnn.pt."
-                    )
+            # In ensemble mode, check for *any* matching pkl/pt files.
+            has_any = (
+                list(_task_dir.glob(f"{task}_classifier*.pkl"))
+                or list(_task_dir.glob(f"{task}_classifier*.pt"))
+            )
+            if not has_any:
+                return {
+                    "detail": {
+                        f"note_{task}": (
+                            f"No model files found in {_task_dir}. "
+                            f"Expected {task}_classifier.pkl or "
+                            f"{task}_classifier_cnn.pt."
+                        )
+                    }
                 }
-            }
 
         # ----------------------------------------------------------
         # Collect features/images for pre-contrast (label=0) and
@@ -1305,8 +1312,61 @@ class MamaSynthEval:
             np.zeros(len(precon_feats), dtype=np.int64),
         ])
 
+        # Helper: collect CNN images for ensemble / standalone CNN.
+        def _collect_cnn_images() -> list[NDArray]:
+            cnn_imgs: list[NDArray] = []
+            for _, pred_p in pairs:
+                s = self._get_stem(pred_p)
+                if s not in valid_stems:
+                    continue
+                cnn_imgs.append(
+                    self._load_image_cached(pred_p).astype(np.float64)
+                )
+            for s in valid_stems:
+                pc_p = self._find_precontrast_image(
+                    s, self.precontrast_path
+                )
+                if pc_p is not None:
+                    cnn_imgs.append(
+                        self._load_image_cached(pc_p).astype(np.float64)
+                    )
+            return cnn_imgs
+
         # ----------------------------------------------------------
-        # Radiomics model (default path)
+        # Ensemble mode: discover all models and average probabilities
+        # ----------------------------------------------------------
+        if self.ensemble and _task_dir.exists():
+            ensemble = EnsembleClassifier.discover_models(
+                task=task, model_dir=_task_dir,
+            )
+            if ensemble.n_models > 0:
+                logger.info(
+                    f"Ensemble inference for '{task}': "
+                    f"{ensemble.description()}"
+                )
+                cnn_images: Optional[list[NDArray]] = None
+                if ensemble.has_cnn:
+                    cnn_images = _collect_cnn_images()
+                y_score = ensemble.predict_proba(
+                    features=all_feats if ensemble.has_radiomics else None,
+                    images=cnn_images,
+                    masks=None,
+                )
+                clf_result = evaluate_classification(y_true, y_score)
+                agg[metric_key] = clf_result["auroc"]
+                detail[f"auroc_{task}"] = clf_result["auroc"]
+                detail[f"balanced_accuracy_{task}"] = (
+                    clf_result["balanced_accuracy"]
+                )
+                detail[f"classifier_type_{task}"] = ensemble.description()
+                logger.info(
+                    f"Contrast AUROC = {clf_result['auroc']:.4f} "
+                    f"({len(valid_stems)} pairs, {ensemble.description()})"
+                )
+                return {"aggregates": agg, "detail": detail}
+
+        # ----------------------------------------------------------
+        # Single-model: Radiomics (default path)
         # ----------------------------------------------------------
         if pkl_model_path:
             try:
@@ -1336,27 +1396,9 @@ class MamaSynthEval:
                 cnn_clf = CNNClassifier(
                     task=task, model_path=cnn_model_path,
                 )
-                # Collect raw images: synth first, then pre-contrast
-                cnn_images: list[NDArray] = []
-                for _, pred_path in pairs:
-                    stem = self._get_stem(pred_path)
-                    if stem not in valid_stems:
-                        continue
-                    cnn_images.append(
-                        self._load_image_cached(pred_path).astype(np.float64)
-                    )
-                for stem in valid_stems:
-                    pc_p = self._find_precontrast_image(
-                        stem, self.precontrast_path
-                    )
-                    if pc_p is not None:
-                        cnn_images.append(
-                            self._load_image_cached(pc_p).astype(
-                                np.float64
-                            )
-                        )
+                cnn_images_single = _collect_cnn_images()
                 y_score = cnn_clf.predict_proba_from_images(
-                    cnn_images, masks=None,
+                    cnn_images_single, masks=None,
                 )
                 clf_result = evaluate_classification(y_true, y_score)
                 agg[metric_key] = clf_result["auroc"]
@@ -1398,7 +1440,10 @@ class MamaSynthEval:
             if pkl_candidate.exists():
                 pkl_model_path = pkl_candidate
 
-        if pkl_model_path is None:
+        if pkl_model_path is None and not (
+            self.ensemble and _task_dir and _task_dir.exists()
+            and list(_task_dir.glob(f"{task}_classifier*.pkl"))
+        ):
             detail[f"note_{task}"] = (
                 f"No pre-trained {task} classifier found. "
                 "Provide model via --clf-model-dir-tumor-roi "
@@ -1414,6 +1459,7 @@ class MamaSynthEval:
 
         try:
             from eval.classification import (
+                EnsembleClassifier,
                 RadiomicsClassifier,
                 evaluate_classification,
             )
@@ -1423,8 +1469,6 @@ class MamaSynthEval:
                 "Tumor ROI evaluation dependencies unavailable, skipping."
             )
             return {"aggregates": agg, "detail": detail}
-
-        clf = RadiomicsClassifier(task=task, model_path=pkl_model_path)
 
         tumor_feats: list[NDArray] = []
         mirror_feats: list[NDArray] = []
@@ -1544,6 +1588,43 @@ class MamaSynthEval:
             np.zeros(len(mirror_feats), dtype=np.int64),
         ])
 
+        # ----------------------------------------------------------
+        # Ensemble mode
+        # ----------------------------------------------------------
+        if self.ensemble and _task_dir and _task_dir.exists():
+            ensemble = EnsembleClassifier.discover_models(
+                task=task, model_dir=_task_dir,
+            )
+            if ensemble.n_models > 0:
+                logger.info(
+                    f"Ensemble inference for '{task}': "
+                    f"{ensemble.description()}"
+                )
+                y_score = ensemble.predict_proba(
+                    features=all_feats if ensemble.has_radiomics else None,
+                )
+                clf_result = evaluate_classification(y_true, y_score)
+                agg[metric_key] = clf_result["auroc"]
+                detail[f"auroc_{task}"] = clf_result["auroc"]
+                detail[f"balanced_accuracy_{task}"] = (
+                    clf_result["balanced_accuracy"]
+                )
+                detail[f"n_cases_{task}"] = len(valid_stems)
+                detail[f"classifier_type_{task}"] = ensemble.description()
+                return {"aggregates": agg, "detail": detail}
+
+        # ----------------------------------------------------------
+        # Single-model mode
+        # ----------------------------------------------------------
+        if pkl_model_path is None:
+            detail[f"note_{task}"] = (
+                f"No pre-trained {task} classifier found. "
+                "Provide model via --clf-model-dir-tumor-roi "
+                "or --clf-model-dir."
+            )
+            return {"aggregates": agg, "detail": detail}
+
+        clf = RadiomicsClassifier(task=task, model_path=pkl_model_path)
         y_score = clf.predict_proba(all_feats)
         clf_result = evaluate_classification(y_true, y_score)
         agg[metric_key] = clf_result["auroc"]
