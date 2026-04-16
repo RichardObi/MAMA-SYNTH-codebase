@@ -89,6 +89,7 @@ WORK_SUBDIR = ".synthesis_work"
 # the combined synthesize-and-evaluate pipeline.
 GT_SLICES_SUBDIR = ".gt_slices"
 MASK_SLICES_SUBDIR = ".mask_slices"
+PRECON_SLICES_SUBDIR = ".precontrast_slices"
 
 # 2D image extensions (formats that do *not* require NIfTI slice extraction).
 _2D_IMAGE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"})
@@ -1771,6 +1772,7 @@ def synthesize_and_evaluate_main(
     # extract matching slices the same way the synthesis step did.
     gt_eval_dir: Path = args.ground_truth_path
     mask_eval_dir: Optional[Path] = args.masks_path
+    precontrast_eval_dir: Optional[Path] = getattr(args, "precontrast_path", None)
 
     # Check if GT already contains 2D images — no extraction needed
     gt_already_2d = _dir_has_2d_images(args.ground_truth_path)
@@ -1820,6 +1822,40 @@ def synthesize_and_evaluate_main(
                 masks_output_dir=mask_eval_dir,
             )
 
+        # --- Step 1c: Extract pre-contrast slices (for contrast CLF) ------
+        #
+        # When --precontrast-path was not given explicitly, check whether
+        # the *original* GT directory contains pre-contrast volumes
+        # (*_0000.*).  If so, extract 2D slices at the same positions so
+        # that contrast classification can compare pre- vs post-contrast.
+        if precontrast_eval_dir is None:
+            _precon_slices_candidate = _slice_base / PRECON_SLICES_SUBDIR
+            precon_volumes = _discover_input_images(
+                args.ground_truth_path, phase=DEFAULT_PHASE_PRE,
+            )
+            if precon_volumes:
+                if (
+                    _precon_slices_candidate.exists()
+                    and any(_precon_slices_candidate.glob("*.png"))
+                ):
+                    logger.info(
+                        "Reusing previously extracted pre-contrast slices: "
+                        f"{_precon_slices_candidate}"
+                    )
+                else:
+                    logger.info(
+                        "\n--- Step 1c: Extracting pre-contrast slices ---"
+                    )
+                    extract_ground_truth_slices(
+                        gt_dir=args.ground_truth_path,
+                        masks_dir=args.masks_dir,
+                        output_dir=_precon_slices_candidate,
+                        slice_mode=args.slice_mode,
+                        phase=DEFAULT_PHASE_PRE,
+                        masks_output_dir=None,
+                    )
+                precontrast_eval_dir = _precon_slices_candidate
+
     # --- Step 2: Evaluation -----------------------------------------------
     logger.info("\n--- Step 2: Evaluation ---")
     logger.info(f"Predictions:   {args.predictions_dir}")
@@ -1832,7 +1868,7 @@ def synthesize_and_evaluate_main(
         output_file=args.output_file,
         masks_dir=mask_eval_dir,
         labels_path=args.labels_path,
-        precontrast_path=getattr(args, "precontrast_path", None),
+        precontrast_path=precontrast_eval_dir,
         clf_model_dir=args.clf_model_dir,
         clf_model_dir_contrast=args.clf_model_dir_contrast,
         clf_model_dir_tumor_roi=args.clf_model_dir_tumor_roi,
