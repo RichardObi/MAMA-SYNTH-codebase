@@ -95,21 +95,6 @@ PRECON_SLICES_SUBDIR = ".precontrast_slices"
 _2D_IMAGE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"})
 
 
-def _is_2d_image(path: Path) -> bool:
-    """Return ``True`` if *path* has a 2D image extension (PNG, JPEG, …)."""
-    return path.suffix.lower() in _2D_IMAGE_SUFFIXES
-
-
-def _dir_has_2d_images(directory: Path) -> bool:
-    """Return ``True`` if *directory* contains at least one 2D image file."""
-    if not directory.is_dir():
-        return False
-    return any(
-        f.is_file() and f.suffix.lower() in _2D_IMAGE_SUFFIXES
-        for f in directory.iterdir()
-    )
-
-
 # ---------------------------------------------------------------------------
 # Medigan-based synthesis
 # ---------------------------------------------------------------------------
@@ -649,28 +634,22 @@ def _discover_input_images(
             for f in sorted(patient_dir.iterdir()):
                 if phase_suffix in f.stem and f.suffix in (".gz", ".nii", ".mha"):
                     images.append(f)
-
     if images:
         return images
 
-    # Fall back to flat layout (3D volumes)
+    # Fall back to volumes with all phases in single folder
     for f in sorted(input_dir.iterdir()):
         if (
             f.is_file()
-            and phase_suffix in f.stem
-            and f.suffix in (".gz", ".nii", ".mha")
-        ):
+            and phase_suffix in f.stem):
             images.append(f)
-
     if images:
         return images
-
-    # Fall back to 2D image files (pre-extracted slices)
-    for f in sorted(input_dir.iterdir()):
-        if f.is_file() and f.suffix.lower() in _2D_IMAGE_SUFFIXES:
-            images.append(f)
-
-    return images
+    else:
+        logger.warning(
+            f"No NIfTI files with phase suffix '{phase_suffix}' found in "
+            f"{input_dir} or its immediate subdirectories."
+        )
 
 
 def _extract_patient_id(path: Path) -> str:
@@ -927,28 +906,6 @@ def _extract_and_save_slices(
     except ImportError:
         raise ImportError("PNG I/O requires Pillow.")
 
-    # ── Fast path: 2D image input (already sliced) ────────────────────
-    if _is_2d_image(image_path):
-        pil_img = Image.open(image_path).convert("L")
-        arr = np.array(pil_img, dtype=np.float64)
-
-        vmin, vmax = float(arr.min()), float(arr.max())
-        if vmax > vmin:
-            norm = (arr - vmin) / (vmax - vmin) * 255.0
-        else:
-            norm = np.zeros_like(arr)
-
-        output_dir.mkdir(parents=True, exist_ok=True)
-        if sequential_naming:
-            name = "slice_0000.png"
-        else:
-            name = f"{patient_id}.png"
-
-        png_path = output_dir / name
-        Image.fromarray(norm.astype(np.uint8), mode="L").save(png_path)
-        return [(png_path, 0)]
-
-    # ── Standard path: 3D NIfTI / MHA volume ─────────────────────────
     try:
         import SimpleITK as sitk
     except ImportError:
@@ -1530,6 +1487,16 @@ def parse_synthesize_and_evaluate_args(
             "Requires --predictions-dir."
         ),
     )
+    synth.add_argument(
+        "--input_mode",
+        type=str,
+        choices=["2d", "3d"],
+        default="2d",
+        help=(
+            "Input mode for synthesis. "
+            "Default: '2d'."
+        ),
+    )
 
     # --- Evaluation options ------------------------------------------------
     evl = parser.add_argument_group("evaluation options")
@@ -1791,15 +1758,16 @@ def synthesize_and_evaluate_main(
     precontrast_eval_dir: Optional[Path] = getattr(args, "precontrast_path", None)
 
     # Check if GT already contains 2D images — no extraction needed
-    gt_already_2d = _dir_has_2d_images(args.ground_truth_path)
-    if gt_already_2d:
+    if args.input_mode == "2d":
         logger.info(
             "Ground-truth directory already contains 2D images — "
             "skipping slice extraction."
         )
         # masks_path may also point to 2D masks; use directly if available
-        if args.masks_path and _dir_has_2d_images(args.masks_path):
+        if args.masks_path and os.listdir(args.masks_path) not in ([]):
             mask_eval_dir = args.masks_path
+        else:
+            logger.info(f"No mask images found in {args.masks_path}; ROI-based evaluation will be skipped.")
     else:
         # Determine output base for GT/mask slice directories.
         # Use --output-dir if given, otherwise place next to predictions.
