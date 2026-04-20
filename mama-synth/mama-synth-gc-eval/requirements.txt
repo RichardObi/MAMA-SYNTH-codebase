@@ -5,3 +5,6 @@ scipy>=1.10
 scikit-image>=0.20
 pyradiomics>=3.1
 lpips>=0.1
+frd-score>=0.2
+torchmetrics>=1.0
+torch>=1.9

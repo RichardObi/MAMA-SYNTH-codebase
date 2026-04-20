@@ -20,8 +20,16 @@ from numpy.typing import NDArray
 class Case:
     """A single evaluation case with all required image arrays.
 
-    All images are 2-D ``float64`` arrays normalised to ``[0, 1]``.
+    All images are 2-D ``float64`` arrays.  They are expected to arrive
+    **z-score normalised** using the same reference statistics (computed
+    from pre-contrast ground truth during dataset preparation).  No
+    additional per-image normalisation is applied by the pipeline.
+
     Masks are boolean arrays of the same spatial shape.
+
+    Optional ``*_path`` fields carry the on-disk file paths so that
+    the ``frd-score`` library (which operates on file paths) can be
+    called directly without writing temporary files.
     """
 
     case_id: str
@@ -29,6 +37,10 @@ class Case:
     ground_truth: NDArray[np.float64]
     mask: Optional[NDArray[np.bool_]] = None
     precontrast: Optional[NDArray[np.float64]] = None
+    # File paths for frd-score library
+    prediction_path: Optional[str] = None
+    ground_truth_path: Optional[str] = None
+    mask_path: Optional[str] = None
 
 
 @dataclass

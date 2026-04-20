@@ -3,6 +3,7 @@ numpy>=1.21.0
 SimpleITK>=2.2.0
 scipy>=1.7.0
 scikit-learn>=1.0.0
+scikit-image>=0.20.0
 
 # Optional: Progress bars
 tqdm>=4.60.0

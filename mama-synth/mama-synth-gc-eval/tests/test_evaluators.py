@@ -29,12 +29,14 @@ from evaluators.segmentation import compute_dice, compute_hausdorff_95
 # ======================================================================
 
 def _make_case(seed: int = 42, size: int = 64) -> Case:
-    """Create a deterministic mock Case with random images."""
+    """Create a deterministic mock Case with z-score-like images.
+
+    Images are drawn from a standard normal distribution (mean≈0, std≈1)
+    to match the z-score-normalised inputs expected by the GC pipeline.
+    """
     rng = np.random.RandomState(seed)
-    gt = rng.rand(size, size).astype(np.float64)
-    pred = np.clip(
-        gt + rng.normal(0, 0.05, gt.shape), 0, 1
-    ).astype(np.float64)
+    gt = rng.randn(size, size).astype(np.float64)  # z-score: mean≈0, std≈1
+    pred = (gt + rng.normal(0, 0.05, gt.shape)).astype(np.float64)
     mask = np.zeros((size, size), dtype=bool)
     q = size // 4
     mask[q : 3 * q, q : 3 * q] = True
@@ -76,11 +78,11 @@ class TestImageMetrics:
         assert abs(result.per_case[c.case_id]["mse"]) < 1e-12
 
     def test_lpips_present_when_available(self) -> None:
-        """LPIPS should be present if torch + lpips are installed."""
+        """LPIPS should be present if torch + lpips/torchmetrics installed."""
         cases = [_make_case(0)]
         ev = ImageMetricsEvaluator()
         result = ev.evaluate(cases)
-        if ev._lpips_fn is not None:
+        if ev._lpips_available:
             assert "lpips" in result.per_case[cases[0].case_id]
             assert "lpips" in result.aggregates
 
@@ -96,7 +98,8 @@ class TestROIMetrics:
         result = ROIMetricsEvaluator().evaluate(cases)
         for c in cases:
             assert "ssim_tumor" in result.per_case[c.case_id]
-            assert 0.0 <= result.per_case[c.case_id]["ssim_tumor"] <= 1.0
+            # skimage local-window SSIM is in [-1, 1]
+            assert -1.0 <= result.per_case[c.case_id]["ssim_tumor"] <= 1.0
         assert "ssim_tumor" in result.aggregates
 
     def test_ssim_skipped_without_mask(self) -> None:

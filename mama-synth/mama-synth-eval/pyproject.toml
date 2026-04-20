@@ -40,6 +40,7 @@ dependencies = [
     "SimpleITK>=2.2.0",
     "scipy>=1.7.0",
     "scikit-learn>=1.0.0",
+    "scikit-image>=0.20.0",
 ]
 
 [project.optional-dependencies]

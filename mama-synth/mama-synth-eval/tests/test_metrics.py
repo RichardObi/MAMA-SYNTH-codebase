@@ -441,10 +441,12 @@ class TestSSIMMask:
         ssim_no_mask = compute_ssim(pred, gt)
         ssim_with_mask = compute_ssim(pred, gt, mask=mask)
 
-        # Without mask, the large zero background inflates similarity.
-        # With mask, SSIM reflects only the actual signal region.
-        # They should be different values.
-        assert ssim_no_mask != pytest.approx(ssim_with_mask, abs=0.01), (
+        # Without mask, the large zero background inflates similarity
+        # (whole-image SSIM map including background windows).
+        # With mask, SSIM is averaged only over the centre pixels.
+        # Local-window SSIM produces a smaller masked/unmasked gap
+        # than the old global estimator; we only require they differ.
+        assert ssim_no_mask != pytest.approx(ssim_with_mask, abs=1e-6), (
             "SSIM with mask should differ from SSIM without mask "
             "when background is zero-padded"
         )

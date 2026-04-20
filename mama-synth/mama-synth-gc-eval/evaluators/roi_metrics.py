@@ -1,24 +1,50 @@
 """ROI-level metrics: SSIM within the tumour mask and FRD.
 
-* **SSIM (tumour)** – per-case structural similarity computed on the
-  full image and averaged within the tumour mask.
-* **FRD** – Fréchet Radiomics Distance (aggregate-only).  Radiomic
-  features are extracted from the tumour mask region of every
-  prediction and every ground-truth image; the Fréchet distance
-  between the two feature distributions is reported.
+* **SSIM (tumour)** – per-case local-window structural similarity
+  (``skimage.metrics.structural_similarity``) computed on the full
+  image and averaged within the tumour mask.
+* **FRD** – Fréchet Radiomics Distance (aggregate-only) computed via
+  the ``frd-score`` library with mask conditioning and z-score
+  feature standardisation.
 """
 
 from __future__ import annotations
 
+import hashlib
 import sys
+import tempfile
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
 import SimpleITK as sitk
-from scipy import linalg
 from skimage.metrics import structural_similarity
 
 from .base import BaseEvaluator, Case, EvaluationResult
+
+# ======================================================================
+# Pyradiomics settings — aligned with mama-synth-eval / frd-score
+# ======================================================================
+
+FRD_FEATURE_CLASSES: list[str] = [
+    "firstorder",
+    "glcm",
+    "glrlm",
+    "gldm",
+    "glszm",
+    "ngtdm",
+]
+
+FRD_DEFAULT_BIN_WIDTH: int = 25
+
+# Extractor cache (per-process)
+_EXTRACTOR_CACHE: dict[tuple, object] = {}
+
+# Canonical feature count cache so failures can return zero vectors
+_FEATURE_COUNT_CACHE: dict[tuple, int] = {}
+
+# In-memory feature cache keyed by "<image_hash>|<mask_hash>"
+_feature_cache: dict[str, np.ndarray] = {}
 
 
 class ROIMetricsEvaluator(BaseEvaluator):
@@ -26,143 +52,290 @@ class ROIMetricsEvaluator(BaseEvaluator):
 
     def evaluate(self, cases: list[Case]) -> EvaluationResult:
         per_case: dict[str, dict[str, float]] = {}
-        pred_features: list[np.ndarray] = []
-        gt_features: list[np.ndarray] = []
 
         for case in cases:
             if case.mask is None or not np.any(case.mask):
                 continue
 
-            # ---- SSIM within mask ------------------------------------
+            # ---- SSIM within mask (standard local-window) --------
+            data_range = float(
+                np.max(case.ground_truth) - np.min(case.ground_truth)
+            )
+            if data_range == 0:
+                data_range = 1.0
+
             ssim_full, ssim_map = structural_similarity(
                 case.prediction,
                 case.ground_truth,
-                data_range=1.0,
+                data_range=data_range,
                 full=True,
             )
             ssim_roi = float(np.mean(ssim_map[case.mask]))
             per_case[case.case_id] = {"ssim_tumor": ssim_roi}
 
-            # ---- Radiomic features for FRD ---------------------------
-            try:
-                pf = extract_radiomic_features(case.prediction, case.mask)
-                gf = extract_radiomic_features(case.ground_truth, case.mask)
-                if (
-                    pf.size > 0
-                    and gf.size > 0
-                    and pf.shape == gf.shape
-                ):
-                    pred_features.append(pf)
-                    gt_features.append(gf)
-            except Exception as exc:
-                print(
-                    f"WARNING: radiomic feature extraction failed "
-                    f"for {case.case_id}: {exc}",
-                    file=sys.stderr,
-                )
-
-        # ---- Aggregates ----------------------------------------------
+        # ---- Aggregates ------------------------------------------
         agg: dict[str, dict[str, float]] = {}
         ssim_agg = self._aggregate_metric(per_case, "ssim_tumor")
         if ssim_agg:
             agg["ssim_tumor"] = ssim_agg
 
-        if len(pred_features) >= 2 and len(gt_features) >= 2:
-            try:
-                X_pred = np.vstack(pred_features)
-                X_gt = np.vstack(gt_features)
-                frd_val = frechet_distance(X_pred, X_gt)
-                agg["frd"] = {"mean": frd_val, "std": 0.0}
-            except Exception as exc:
-                print(
-                    f"WARNING: FRD computation failed: {exc}",
-                    file=sys.stderr,
-                )
+        # ---- FRD via frd-score library ---------------------------
+        frd_val = self._compute_frd(cases)
+        if frd_val is not None:
+            agg["frd"] = {"mean": frd_val, "std": 0.0}
 
         return EvaluationResult(per_case=per_case, aggregates=agg)
 
+    # ------------------------------------------------------------------
+    # FRD via frd-score library (no fallback — errors propagate)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _compute_frd(cases: list[Case]) -> Optional[float]:
+        """Compute FRD using the ``frd-score`` library.
+
+        Requires at least 2 cases with non-empty masks.  Uses file
+        paths stored in the :class:`Case` objects.  If paths are not
+        available, arrays are written to temporary ``.mha`` files.
+        """
+        valid = [
+            c for c in cases
+            if c.mask is not None and np.any(c.mask)
+        ]
+        if len(valid) < 2:
+            return None
+
+        try:
+            from frd_score import compute_frd as frd_compute
+        except ImportError:
+            print(
+                "WARNING: FRD unavailable (frd-score not installed). "
+                "Install with: pip install frd-score",
+                file=sys.stderr,
+            )
+            return None
+
+        # Collect file paths (or write temp files)
+        gt_paths: list[str] = []
+        pred_paths: list[str] = []
+        mask_paths: list[str] = []
+        tmp_dir_obj = None
+
+        try:
+            for case in valid:
+                gt_p = case.ground_truth_path
+                pred_p = case.prediction_path
+                mask_p = case.mask_path
+
+                # Write temp files for any missing paths
+                if gt_p is None or pred_p is None or mask_p is None:
+                    if tmp_dir_obj is None:
+                        tmp_dir_obj = tempfile.TemporaryDirectory()
+                    tmp_dir = Path(tmp_dir_obj.name)
+
+                    if gt_p is None:
+                        gt_p = str(
+                            tmp_dir / f"{case.case_id}_gt.mha"
+                        )
+                        _write_mha(case.ground_truth, gt_p)
+                    if pred_p is None:
+                        pred_p = str(
+                            tmp_dir / f"{case.case_id}_pred.mha"
+                        )
+                        _write_mha(case.prediction, pred_p)
+                    if mask_p is None:
+                        mask_p = str(
+                            tmp_dir / f"{case.case_id}_mask.mha"
+                        )
+                        _write_mha(
+                            case.mask.astype(np.uint8), mask_p
+                        )
+
+                gt_paths.append(gt_p)
+                pred_paths.append(pred_p)
+                mask_paths.append(mask_p)
+
+            # frd-score: same GT mask for both real and synthetic
+            frd_val = frd_compute(
+                [gt_paths, pred_paths],
+                paths_masks=[mask_paths, mask_paths],
+            )
+            return float(frd_val)
+        except Exception as exc:
+            print(
+                f"WARNING: FRD computation failed: {exc}",
+                file=sys.stderr,
+            )
+            return None
+        finally:
+            if tmp_dir_obj is not None:
+                tmp_dir_obj.cleanup()
+
 
 # ======================================================================
-# Radiomic feature extraction  (thin wrapper around pyradiomics)
+# Radiomic feature extraction (for classification, shared with FRD)
 # ======================================================================
+
+
+def _get_cached_extractor(
+    feature_classes: tuple[str, ...],
+    bin_width: int,
+    was_2d: bool,
+) -> object:
+    """Return a cached ``RadiomicsFeatureExtractor``."""
+    key = (feature_classes, bin_width, was_2d)
+    extractor = _EXTRACTOR_CACHE.get(key)
+    if extractor is not None:
+        return extractor
+
+    from radiomics import featureextractor  # type: ignore[import-untyped]
+
+    settings = {
+        "binWidth": bin_width,
+        "resampledPixelSpacing": None,
+        "interpolator": "sitkBSpline",
+        "minimumROIDimensions": 1,
+        "minimumROISize": 1,
+        "force2D": was_2d,
+        "force2Ddimension": 0 if was_2d else None,
+    }
+    ext = featureextractor.RadiomicsFeatureExtractor(**settings)
+    ext.disableAllFeatures()
+    for fc in feature_classes:
+        ext.enableFeatureClassByName(fc)
+
+    _EXTRACTOR_CACHE[key] = ext
+    return ext
+
 
 def extract_radiomic_features(
     image: np.ndarray,
     mask: np.ndarray,
+    feature_classes: Optional[list[str]] = None,
+    bin_width: int = FRD_DEFAULT_BIN_WIDTH,
 ) -> np.ndarray:
-    """Extract radiomic features from a 2-D image within *mask*.
+    """Extract IBSI-compliant radiomic features from a 2-D image.
 
-    Returns a 1-D ``float64`` feature vector.  Raises ``ImportError``
-    if ``pyradiomics`` is not installed.
+    Returns a 1-D ``float64`` feature vector.  Settings (``binWidth``,
+    feature classes, etc.) are aligned with ``mama-synth-eval`` and the
+    ``frd-score`` library defaults.
+
+    Raises ``ImportError`` if ``pyradiomics`` is not installed.
     """
+    import radiomics  # type: ignore[import-untyped]
     from radiomics import featureextractor  # type: ignore[import-untyped]
 
-    # pyradiomics needs 3-D SimpleITK images
-    img_3d = image[np.newaxis, ...] if image.ndim == 2 else image
-    msk_3d = (
-        mask.astype(np.uint8)[np.newaxis, ...]
-        if mask.ndim == 2
-        else mask.astype(np.uint8)
+    if feature_classes is None:
+        feature_classes = FRD_FEATURE_CLASSES
+
+    # Suppress verbose pyradiomics logging (once)
+    if not getattr(extract_radiomic_features, "_verbosity_set", False):
+        radiomics.setVerbosity(60)
+        extract_radiomic_features._verbosity_set = True
+
+    was_2d = image.ndim == 2
+    if was_2d:
+        image = image[np.newaxis, :, :]
+
+    if mask.ndim == 2 and was_2d:
+        mask_arr = mask[np.newaxis, :, :].astype(np.uint8)
+    else:
+        mask_arr = mask.astype(np.uint8)
+
+    if np.sum(mask_arr) == 0:
+        mask_arr = np.ones(image.shape, dtype=np.uint8)
+
+    sitk_img = sitk.GetImageFromArray(image.astype(np.float64))
+    sitk_msk = sitk.GetImageFromArray(mask_arr)
+
+    extractor = _get_cached_extractor(
+        feature_classes=tuple(feature_classes),
+        bin_width=bin_width,
+        was_2d=was_2d,
     )
+    config_key = (tuple(feature_classes), bin_width, was_2d)
 
-    sitk_img = sitk.GetImageFromArray(img_3d.astype(np.float64))
-    sitk_msk = sitk.GetImageFromArray(msk_3d)
-
-    extractor = featureextractor.RadiomicsFeatureExtractor()
-    extractor.settings["force2D"] = True
-    extractor.settings["force2Ddimension"] = 0
-    extractor.disableAllFeatures()
-    for cls_name in (
-        "firstorder",
-        "glcm",
-        "glrlm",
-        "glszm",
-        "gldm",
-        "ngtdm",
-    ):
-        extractor.enableFeatureClassByName(cls_name)
-
-    result = extractor.execute(sitk_img, sitk_msk)
+    try:
+        result = extractor.execute(sitk_img, sitk_msk)
+    except Exception as e:
+        n = _FEATURE_COUNT_CACHE.get(config_key, 93)
+        return np.zeros(n, dtype=np.float64)
 
     features: list[float] = []
     for key in sorted(result.keys()):
-        if not key.startswith("diagnostics_"):
-            try:
-                features.append(float(result[key]))
-            except (ValueError, TypeError):
-                pass
+        if key.startswith("diagnostics_"):
+            continue
+        try:
+            features.append(float(result[key]))
+        except (ValueError, TypeError):
+            features.append(0.0)
 
-    return np.array(features, dtype=np.float64)
+    arr = np.array(features, dtype=np.float64)
+    if config_key not in _FEATURE_COUNT_CACHE and arr.size > 0:
+        _FEATURE_COUNT_CACHE[config_key] = arr.size
+
+    return arr
 
 
 # ======================================================================
-# Fréchet distance
+# Feature caching helpers
 # ======================================================================
 
 
-def frechet_distance(X1: np.ndarray, X2: np.ndarray) -> float:
-    r"""Fréchet distance between two sets of feature vectors.
+def _image_hash(arr: np.ndarray) -> str:
+    """SHA-256 hash of array bytes (first 16 hex chars)."""
+    return hashlib.sha256(arr.tobytes()).hexdigest()[:16]
 
-    .. math::
-        d^2 = \|\mu_1 - \mu_2\|^2
-              + \operatorname{Tr}\!\bigl(
-                  \Sigma_1 + \Sigma_2
-                  - 2\,(\Sigma_1 \Sigma_2)^{1/2}
-              \bigr)
 
-    A small ridge (``1e-6 * I``) is added to the covariance
-    matrices for numerical stability when ``N < D``.
-    """
-    mu1 = np.mean(X1, axis=0)
-    mu2 = np.mean(X2, axis=0)
-    d = mu1.shape[0]
+def get_cached_features(
+    image: np.ndarray,
+    mask: np.ndarray,
+) -> Optional[np.ndarray]:
+    """Retrieve cached features, or ``None``."""
+    key = f"{_image_hash(image)}|{_image_hash(mask)}"
+    return _feature_cache.get(key)
 
-    sigma1 = np.cov(X1, rowvar=False) + np.eye(d) * 1e-6
-    sigma2 = np.cov(X2, rowvar=False) + np.eye(d) * 1e-6
 
-    diff = mu1 - mu2
-    covmean, _ = linalg.sqrtm(sigma1 @ sigma2, disp=False)
-    if np.iscomplexobj(covmean):
-        covmean = covmean.real
+def cache_features(
+    image: np.ndarray,
+    mask: np.ndarray,
+    features: np.ndarray,
+) -> None:
+    """Store features in the in-memory cache."""
+    key = f"{_image_hash(image)}|{_image_hash(mask)}"
+    _feature_cache[key] = features
 
-    return float(diff @ diff + np.trace(sigma1 + sigma2 - 2 * covmean))
+
+def extract_radiomic_features_cached(
+    image: np.ndarray,
+    mask: np.ndarray,
+    feature_classes: Optional[list[str]] = None,
+    bin_width: int = FRD_DEFAULT_BIN_WIDTH,
+) -> np.ndarray:
+    """Extract radiomic features with in-memory caching."""
+    cached = get_cached_features(image, mask)
+    if cached is not None:
+        return cached
+    feats = extract_radiomic_features(
+        image, mask,
+        feature_classes=feature_classes,
+        bin_width=bin_width,
+    )
+    cache_features(image, mask, feats)
+    return feats
+
+
+def clear_feature_cache() -> None:
+    """Clear the in-memory feature cache."""
+    _feature_cache.clear()
+
+
+# ======================================================================
+# Helper
+# ======================================================================
+
+
+def _write_mha(arr: np.ndarray, path: str) -> None:
+    """Write a numpy array as a ``.mha`` file."""
+    img = sitk.GetImageFromArray(arr)
+    sitk.WriteImage(img, path)

@@ -1,10 +1,13 @@
 """Segmentation metrics: Dice coefficient and Hausdorff distance (HD95).
 
 A callable ``segment_fn`` must be provided at init time.  It receives
-a 2-D ``float64`` image (normalised to ``[0, 1]``) and returns a
-binary ``bool`` mask of the same shape.
+a 2-D ``float64`` image (z-score normalised) and returns a binary
+``bool`` mask of the same shape.
 
 When no ``segment_fn`` is given the evaluator returns empty results.
+
+HD95 is computed via ``scipy.ndimage.distance_transform_edt`` with
+optional ``voxel_spacing`` support — aligned with ``mama-synth-eval``.
 """
 
 from __future__ import annotations
@@ -12,8 +15,7 @@ from __future__ import annotations
 from typing import Callable, Optional
 
 import numpy as np
-from scipy.ndimage import binary_erosion
-from scipy.spatial.distance import cdist
+from scipy import ndimage
 
 from .base import BaseEvaluator, Case, EvaluationResult
 
@@ -80,22 +82,57 @@ def compute_dice(pred: np.ndarray, gt: np.ndarray) -> float:
     return float(2.0 * intersection / total)
 
 
-def compute_hausdorff_95(pred: np.ndarray, gt: np.ndarray) -> float:
-    """95th-percentile Hausdorff distance between mask surfaces."""
+def compute_hausdorff_95(
+    pred: np.ndarray,
+    gt: np.ndarray,
+    voxel_spacing: Optional[tuple[float, ...]] = None,
+) -> float:
+    """95th-percentile Hausdorff distance between mask surfaces.
+
+    Uses ``scipy.ndimage.distance_transform_edt`` for physically
+    correct distances (when ``voxel_spacing`` is provided).  This
+    aligns with the ``mama-synth-eval`` implementation.
+
+    Returns 0.0 when both masks are empty, ``inf`` when exactly one
+    mask is empty.
+    """
     pred_b = pred.astype(bool)
     gt_b = gt.astype(bool)
 
-    pred_surface = pred_b ^ binary_erosion(pred_b, iterations=1)
-    gt_surface = gt_b ^ binary_erosion(gt_b, iterations=1)
+    pred_sum = int(np.sum(pred_b))
+    gt_sum = int(np.sum(gt_b))
 
-    pred_pts = np.argwhere(pred_surface)
-    gt_pts = np.argwhere(gt_surface)
-
-    if len(pred_pts) == 0 or len(gt_pts) == 0:
+    if pred_sum == 0 and gt_sum == 0:
+        return 0.0
+    if pred_sum == 0 or gt_sum == 0:
         return float("inf")
 
-    # Directed distances in both directions
-    d_pred_to_gt = cdist(pred_pts, gt_pts).min(axis=1)
-    d_gt_to_pred = cdist(gt_pts, pred_pts).min(axis=1)
-    all_dists = np.concatenate([d_pred_to_gt, d_gt_to_pred])
-    return float(np.percentile(all_dists, 95))
+    if voxel_spacing is None:
+        voxel_spacing = tuple(1.0 for _ in range(pred_b.ndim))
+
+    # Surface extraction: border = mask XOR eroded mask
+    pred_border = pred_b ^ ndimage.binary_erosion(pred_b)
+    gt_border = gt_b ^ ndimage.binary_erosion(gt_b)
+
+    # Single-voxel masks: erosion yields empty → use mask itself
+    if not np.any(pred_border):
+        pred_border = pred_b
+    if not np.any(gt_border):
+        gt_border = gt_b
+
+    # EDT from every voxel to nearest foreground voxel
+    dt_pred = ndimage.distance_transform_edt(
+        ~pred_b, sampling=voxel_spacing
+    )
+    dt_gt = ndimage.distance_transform_edt(
+        ~gt_b, sampling=voxel_spacing
+    )
+
+    # Surface distances in both directions
+    surf_dist_pred_to_gt = dt_gt[pred_border]
+    surf_dist_gt_to_pred = dt_pred[gt_border]
+
+    all_distances = np.concatenate(
+        [surf_dist_pred_to_gt, surf_dist_gt_to_pred]
+    )
+    return float(np.percentile(all_distances, 95))

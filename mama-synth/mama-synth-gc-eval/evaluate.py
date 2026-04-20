@@ -80,14 +80,17 @@ INPUT_SLUG = os.environ.get(
 
 
 def load_image(path: Path) -> np.ndarray:
-    """Load a .mha image and normalise to ``[0, 1]`` float64."""
+    """Load a .mha image as ``float64`` (no additional normalisation).
+
+    Images are expected to arrive **z-score normalised** using pre-contrast
+    reference statistics.  No per-image min-max is applied — this avoids
+    the bias that independent normalisation would introduce in MSE, LPIPS,
+    and SSIM.
+    """
     img = sitk.ReadImage(str(path))
     arr = sitk.GetArrayFromImage(img).astype(np.float64)
     if arr.ndim == 3 and arr.shape[0] == 1:
         arr = arr[0]
-    lo, hi = float(arr.min()), float(arr.max())
-    if hi > lo:
-        arr = (arr - lo) / (hi - lo)
     return arr
 
 
@@ -166,7 +169,16 @@ def load_cases_gc(
             precontrast = load_image(precon_path)
 
         cases.append(
-            Case(case_id, prediction, ground_truth, mask, precontrast)
+            Case(
+                case_id=case_id,
+                prediction=prediction,
+                ground_truth=ground_truth,
+                mask=mask,
+                precontrast=precontrast,
+                prediction_path=str(pred_files[0]),
+                ground_truth_path=str(gt_path),
+                mask_path=str(mask_path) if mask_path else None,
+            )
         )
 
     return cases
@@ -187,10 +199,11 @@ def load_cases_local(
             continue
 
         mask: Optional[np.ndarray] = None
+        mask_file: Optional[Path] = None
         if masks_dir:
-            mask_path = _find_file(masks_dir, case_id)
-            if mask_path:
-                mask = load_mask(mask_path)
+            mask_file = _find_file(masks_dir, case_id)
+            if mask_file:
+                mask = load_mask(mask_file)
 
         precontrast: Optional[np.ndarray] = None
         if precon_dir:
@@ -205,6 +218,9 @@ def load_cases_local(
                 ground_truth=load_image(gt_path),
                 mask=mask,
                 precontrast=precontrast,
+                prediction_path=str(pred_file),
+                ground_truth_path=str(gt_path),
+                mask_path=str(mask_file) if mask_file else None,
             )
         )
     return cases
@@ -229,8 +245,8 @@ def load_segmentation_model(
     """Return a segmentation callable, or ``None`` if unavailable.
 
     Replace this stub with your nnUNet / custom model loader.
-    The callable must accept a 2-D ``float64`` array (normalised
-    to ``[0, 1]``) and return a binary ``bool`` mask.
+    The callable must accept a 2-D ``float64`` array (z-score
+    normalised) and return a binary ``bool`` mask.
     """
     if models_dir is None:
         return None
@@ -260,6 +276,11 @@ def run_evaluation(
 
     This is the main public API for programmatic use and testing.
     """
+    # Check for ensemble mode via environment variable
+    ensemble = os.environ.get("MAMA_ENSEMBLE", "").lower() in (
+        "1", "true", "yes",
+    )
+
     evaluators: list[tuple[str, object]] = [
         ("ImageMetrics", ImageMetricsEvaluator()),
         ("ROIMetrics", ROIMetricsEvaluator()),
@@ -276,6 +297,8 @@ def run_evaluation(
                     if models_dir
                     else None
                 ),
+                models_dir=models_dir,
+                ensemble=ensemble,
             ),
         ),
         (
@@ -299,6 +322,10 @@ def run_evaluation(
             print(f"  {name}: OK ({n_agg} aggregate metric(s))")
         except Exception as exc:
             print(f"  {name}: FAILED — {exc}", file=sys.stderr)
+
+    # Clear the in-memory radiomic feature cache to free memory
+    from evaluators.roi_metrics import clear_feature_cache
+    clear_feature_cache()
 
     return {"case": all_per_case, "aggregates": all_aggregates}
 
