@@ -8,9 +8,12 @@ RUN groupadd -r user && useradd -m --no-log-init -r -g user user
 
 WORKDIR /opt/app
 
-# System dependencies for pyradiomics / SimpleITK
+# System dependencies:
+#   gcc/g++  — required to compile pyradiomics C extensions
+#   git      — required because pyradiomics must be installed from GitHub
+#              (PyPI release is broken for Python >= 3.10, see issue #903)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc g++ && \
+    gcc g++ git && \
     rm -rf /var/lib/apt/lists/*
 
 COPY --chown=user:user requirements.txt /opt/app/

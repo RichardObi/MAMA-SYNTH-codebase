@@ -8,7 +8,8 @@ Both metrics operate on the full image (no masking).
   post-contrast intensities falling in the long tail of the pre-contrast
   z-score distribution.
 
-LPIPS backend priority: ``torchmetrics`` (preferred) → ``lpips``.
+LPIPS backend: ``torchmetrics`` only (the ``lpips`` pip package is
+not used — see requirements.txt).
 The model is cached at **module level** to avoid OOM in long sessions.
 """
 
@@ -30,44 +31,24 @@ LPIPS_CLIP_SIGMA: float = 5.0
 
 
 def _get_lpips_model(net: str = "alex"):
-    """Return a cached LPIPS model and its backend name.
+    """Return a cached LPIPS model and its backend name (``torchmetrics``).
 
-    Tries ``torchmetrics`` first (actively maintained, reliable memory
-    behaviour), falling back to the ``lpips`` pip package.
+    Only ``torchmetrics`` is supported.  The legacy ``lpips`` pip package
+    is intentionally *not* used here — it is not listed in requirements.txt
+    and has known maintenance / reproducibility issues.
     """
     if net in _LPIPS_MODEL_CACHE:
         model = _LPIPS_MODEL_CACHE[net]
-        backend = "torchmetrics" if hasattr(model, "compute") else "lpips"
-        return model, backend
-
-    # --- Prefer torchmetrics -----------------------------------------
-    try:
-        from torchmetrics.image.lpip import (
-            LearnedPerceptualImagePatchSimilarity,
-        )
-
-        model = LearnedPerceptualImagePatchSimilarity(net_type=net)
-        model.eval()
-        _LPIPS_MODEL_CACHE[net] = model
         return model, "torchmetrics"
-    except (ImportError, Exception):
-        pass
 
-    # --- Fall back to lpips package ----------------------------------
-    try:
-        import lpips as lpips_mod  # type: ignore[import-untyped]
-
-        model = lpips_mod.LPIPS(net=net, verbose=False)
-        model.eval()
-        _LPIPS_MODEL_CACHE[net] = model
-        return model, "lpips"
-    except ImportError:
-        pass
-
-    raise ImportError(
-        "LPIPS requires 'torchmetrics' (recommended) or 'lpips'. "
-        "Install with: pip install torchmetrics  or  pip install lpips"
+    from torchmetrics.image.lpip import (
+        LearnedPerceptualImagePatchSimilarity,
     )
+
+    model = LearnedPerceptualImagePatchSimilarity(net_type=net)
+    model.eval()
+    _LPIPS_MODEL_CACHE[net] = model
+    return model, "torchmetrics"
 
 
 class ImageMetricsEvaluator(BaseEvaluator):
@@ -80,7 +61,7 @@ class ImageMetricsEvaluator(BaseEvaluator):
             self._lpips_available = True
         except Exception:
             print(
-                "WARNING: LPIPS unavailable (torch/lpips not installed), "
+                "WARNING: LPIPS unavailable (torch + torchmetrics required), "
                 "LPIPS metric will be skipped.",
                 file=sys.stderr,
             )
@@ -163,12 +144,10 @@ class ImageMetricsEvaluator(BaseEvaluator):
                         .expand(-1, 3, -1, -1)
                     )
 
-                    if backend == "torchmetrics":
-                        model.reset()  # type: ignore[union-attr]
-                        model.update(tp, tg)  # type: ignore[union-attr]
-                        val = model.compute()  # type: ignore[union-attr]
-                    else:
-                        val = model(tp, tg)  # type: ignore[operator]
+                    # torchmetrics is the only supported backend
+                    model.reset()  # type: ignore[union-attr]
+                    model.update(tp, tg)  # type: ignore[union-attr]
+                    val = model.compute()  # type: ignore[union-attr]
 
                     lpips_values.append(float(val.item()))
 

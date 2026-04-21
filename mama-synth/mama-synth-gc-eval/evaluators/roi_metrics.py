@@ -4,8 +4,9 @@
   (``skimage.metrics.structural_similarity``) computed on the full
   image and averaged within the tumour mask.
 * **FRD** – Fréchet Radiomics Distance (aggregate-only) computed via
-  the ``frd-score`` library with mask conditioning and z-score
-  feature standardisation.
+  the ``frd-score`` library using **FRD v1**: z-score / D1-referenced
+  normalisation, ~464 radiomic features (Original + LoG + Wavelet
+  filter banks), and tumour-mask conditioning.
 """
 
 from __future__ import annotations
@@ -155,10 +156,13 @@ class ROIMetricsEvaluator(BaseEvaluator):
                 pred_paths.append(pred_p)
                 mask_paths.append(mask_p)
 
-            # frd-score: same GT mask for both real and synthetic
+            # frd-score v1: z-score/D1-ref normalisation, ~464 features
+            # (Original + LoG + Wavelet).  Masks are passed as conditions
+            # for both the real and synthetic distributions.
             frd_val = frd_compute(
                 [gt_paths, pred_paths],
                 paths_masks=[mask_paths, mask_paths],
+                frd_version="v1",
             )
             return float(frd_val)
         except Exception as exc:
