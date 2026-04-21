@@ -1,9 +1,9 @@
-numpy>=1.24
+numpy>=1.24,<2
 SimpleITK>=2.2
 scikit-learn>=1.2
 scipy>=1.10
 scikit-image>=0.20
-pyradiomics>=3.1
+pyradiomics>=3.0.1
 lpips>=0.1
 frd-score>=0.2
 torchmetrics>=1.0
