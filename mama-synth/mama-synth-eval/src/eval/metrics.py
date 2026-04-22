@@ -27,6 +27,7 @@ from typing import Optional
 import numpy as np
 from numpy.typing import NDArray
 from scipy import ndimage
+from skimage.metrics import structural_similarity
 
 logger = logging.getLogger(__name__)
 
@@ -186,20 +187,19 @@ def compute_ssim(
 ) -> float:
     """Compute Structural Similarity Index between prediction and ground truth.
 
-    This is a simplified SSIM implementation using global image statistics
-    rather than local window-based computation. For 3D volumes, SSIM is
-    computed slice-by-slice and averaged.
+    Uses scikit-image's local-window SSIM (``structural_similarity``) which
+    is the standard implementation used in imaging challenges.  When *mask*
+    is provided, the full SSIM map is computed and then averaged only over
+    the masked pixels.
 
-    When *mask* is provided, statistics are computed only over the masked
-    (``True``) voxels so that zero-padded background regions do not
-    bias the result.
+    For 3D volumes, SSIM is computed slice-by-slice and averaged.
 
     Args:
         prediction: Predicted image array (2D or 3D).
         ground_truth: Ground truth image array (2D or 3D).
         data_range: The data range of the input images. If None, computed as
                    max(ground_truth) - min(ground_truth) (over mask if given).
-        win_size: Kept for API compatibility (unused in this global implementation).
+        win_size: Size of the local Gaussian window (default: 7, must be odd).
         k1: Constant for luminance comparison (default: 0.01).
         k2: Constant for contrast comparison (default: 0.03).
         mask: Optional boolean mask.  When provided, only pixels where
@@ -220,21 +220,18 @@ def compute_ssim(
             return 1.0 if np.allclose(prediction[mask], ground_truth[mask]) else 0.0
         return 1.0 if np.allclose(prediction, ground_truth) else 0.0
 
-    c1 = (k1 * data_range) ** 2
-    c2 = (k2 * data_range) ** 2
-
     # For 3D volumes, compute SSIM slice by slice and average
     if prediction.ndim == 3:
         ssim_values = []
         for i in range(prediction.shape[0]):
             m_i = mask[i] if mask is not None else None
             ssim_val = _compute_ssim_2d(
-                prediction[i], ground_truth[i], c1, c2, win_size, mask=m_i
+                prediction[i], ground_truth[i], data_range, win_size, k1, k2, mask=m_i
             )
             ssim_values.append(ssim_val)
         return float(np.mean(ssim_values))
     elif prediction.ndim == 2:
-        return _compute_ssim_2d(prediction, ground_truth, c1, c2, win_size, mask=mask)
+        return _compute_ssim_2d(prediction, ground_truth, data_range, win_size, k1, k2, mask=mask)
     else:
         raise ValueError(f"SSIM only supports 2D or 3D arrays, got {prediction.ndim}D")
 
@@ -242,52 +239,61 @@ def compute_ssim(
 def _compute_ssim_2d(
     prediction: NDArray[np.floating],
     ground_truth: NDArray[np.floating],
-    c1: float,
-    c2: float,
+    data_range: float,
     win_size: int,
+    k1: float,
+    k2: float,
     mask: Optional[NDArray[np.bool_]] = None,
 ) -> float:
-    """Compute global SSIM for 2D images.
+    """Compute local-window SSIM for 2D images via scikit-image.
 
-    This is a simplified SSIM implementation using global image statistics
-    rather than local window-based computation. The win_size parameter is
-    accepted for API compatibility but not used in this implementation.
-
-    When *mask* is provided, statistics are computed only from the
-    ``True`` pixels so that zero-padded background does not dilute the
-    result.
+    When *mask* is provided, the full SSIM map is computed (``full=True``)
+    and then averaged over the masked region.
 
     Args:
         prediction: 2D predicted image array.
         ground_truth: 2D ground truth image array.
-        c1: Constant for luminance comparison.
-        c2: Constant for contrast comparison.
-        win_size: Size of local window (unused in this global implementation).
+        data_range: Dynamic range of the images.
+        win_size: Size of the local Gaussian window (must be odd).
+        k1: Constant for luminance comparison.
+        k2: Constant for contrast comparison.
         mask: Optional 2D boolean mask restricting which pixels contribute.
 
     Returns:
-        Global SSIM value for the image.
+        SSIM value averaged over the (optionally masked) region.
     """
-    # Using global statistics for a simplified, robust implementation
-    _ = win_size  # Explicitly mark as unused
+    # Ensure win_size is odd
+    if win_size % 2 == 0:
+        win_size += 1
+
+    # Ensure images are large enough for the window
+    min_dim = min(prediction.shape)
+    if min_dim < win_size:
+        win_size = max(3, min_dim if min_dim % 2 == 1 else min_dim - 1)
 
     if mask is not None and np.any(mask):
-        pred_vals = prediction[mask]
-        gt_vals = ground_truth[mask]
+        # Compute full SSIM map, then average within mask
+        _, ssim_map = structural_similarity(
+            prediction,
+            ground_truth,
+            data_range=data_range,
+            win_size=win_size,
+            K1=k1,
+            K2=k2,
+            full=True,
+        )
+        return float(np.mean(ssim_map[mask]))
     else:
-        pred_vals = prediction.ravel()
-        gt_vals = ground_truth.ravel()
-
-    mu_pred = np.mean(pred_vals)
-    mu_gt = np.mean(gt_vals)
-    sigma_pred = np.std(pred_vals)
-    sigma_gt = np.std(gt_vals)
-    sigma_pred_gt = np.mean((pred_vals - mu_pred) * (gt_vals - mu_gt))
-
-    numerator = (2 * mu_pred * mu_gt + c1) * (2 * sigma_pred_gt + c2)
-    denominator = (mu_pred ** 2 + mu_gt ** 2 + c1) * (sigma_pred ** 2 + sigma_gt ** 2 + c2)
-
-    return float(numerator / denominator)
+        return float(
+            structural_similarity(
+                prediction,
+                ground_truth,
+                data_range=data_range,
+                win_size=win_size,
+                K1=k1,
+                K2=k2,
+            )
+        )
 
 
 def compute_ncc(

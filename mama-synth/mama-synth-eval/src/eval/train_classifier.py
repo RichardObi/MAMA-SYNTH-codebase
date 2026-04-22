@@ -62,7 +62,7 @@ import os
 import pickle
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import numpy as np
 from numpy.typing import NDArray
@@ -141,6 +141,285 @@ SPLIT_CSV_CANDIDATES = [
 # Matching is done *case-insensitively* — only lowercase forms are needed here.
 TEST_SPLIT_VALUES = {"test", "testing"}
 TRAIN_SPLIT_VALUES = {"train", "training"}
+
+
+# ---------------------------------------------------------------------------
+# Global z-score normalisation
+# ---------------------------------------------------------------------------
+
+# Filename written alongside the trained models so the normalisation that was
+# used during training is fully documented and reproducible.
+NORMALIZATION_STATS_FILENAME = "normalization_stats.json"
+
+
+class NormalizationStats:
+    """Global dataset-level z-score normalisation statistics.
+
+    Computed from all pre-contrast (phase 0) volumes in the MAMA-MIA
+    training set using Welford's online algorithm (memory-efficient: no
+    need to hold all voxels in RAM simultaneously).  The resulting
+    ``mean`` and ``std`` are stored in a JSON file (see
+    ``NORMALIZATION_STATS_FILENAME``) and re-used at training and
+    inference time to guarantee that both domains live in the same
+    intensity space.
+
+    Attributes
+    ----------
+    mean : float
+        Population mean over all pre-contrast voxels.
+    std : float
+        Population standard deviation over all pre-contrast voxels.
+    n_voxels : int
+        Total voxel count accumulated (informational).
+    n_patients : int
+        Number of patients whose pre-contrast volume was included.
+    """
+
+    def __init__(
+        self,
+        mean: float,
+        std: float,
+        n_voxels: int = 0,
+        n_patients: int = 0,
+    ) -> None:
+        if std <= 0:
+            raise ValueError(
+                f"std must be positive, got {std}. "
+                "Ensure the pre-contrast images contain real intensity data."
+            )
+        self.mean = float(mean)
+        self.std = float(std)
+        self.n_voxels = int(n_voxels)
+        self.n_patients = int(n_patients)
+
+    def to_dict(self) -> dict:
+        return {
+            "mean": self.mean,
+            "std": self.std,
+            "n_voxels": self.n_voxels,
+            "n_patients": self.n_patients,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "NormalizationStats":
+        return cls(
+            mean=float(d["mean"]),
+            std=float(d["std"]),
+            n_voxels=int(d.get("n_voxels", 0)),
+            n_patients=int(d.get("n_patients", 0)),
+        )
+
+    def __repr__(self) -> str:
+        return (
+            f"NormalizationStats(mean={self.mean:.4f}, std={self.std:.4f}, "
+            f"n_voxels={self.n_voxels:,}, n_patients={self.n_patients})"
+        )
+
+
+def load_normalization_stats(path: Path) -> NormalizationStats:
+    """Load normalisation statistics from a JSON file.
+
+    Parameters
+    ----------
+    path : Path
+        Path to a JSON produced by :func:`compute_normalization_stats`
+        or by the companion ``compute_dataset_stats.py`` preprocessing
+        script.  Expected keys: ``mean``, ``std``; optional:
+        ``n_voxels``, ``n_patients``.
+
+    Returns
+    -------
+    NormalizationStats
+    """
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Normalisation stats file not found: {path}\n"
+            "Run compute_dataset_stats.py or --normalization-stats to "
+            "generate it, or use --no-normalization to skip."
+        )
+    with open(path) as f:
+        d = json.load(f)
+    stats = NormalizationStats.from_dict(d)
+    logger.info(
+        f"Loaded normalisation stats from {path}: {stats}"
+    )
+    return stats
+
+
+def save_normalization_stats(stats: NormalizationStats, path: Path) -> None:
+    """Save normalisation statistics to a JSON file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(stats.to_dict(), f, indent=2)
+    logger.info(f"Normalisation stats saved to {path}")
+
+
+def compute_normalization_stats(
+    images_dir: Path,
+    phase: int = 0,
+) -> NormalizationStats:
+    """Compute global z-score statistics from pre-contrast volumes.
+
+    Uses Welford's online algorithm to accumulate mean and variance
+    across all pre-contrast voxels without loading all volumes into
+    memory simultaneously.
+
+    This matches the behaviour of ``compute_dataset_stats.py`` in the
+    MAMA-SYNTH preprocessing pipeline: stats are computed from the
+    **lowest-phase** (pre-contrast) volume of every patient, then
+    applied uniformly to **all phases** so that the contrast
+    enhancement is preserved as a real intensity difference in z-score
+    space.
+
+    Parameters
+    ----------
+    images_dir : Path
+        Root directory containing per-patient sub-folders, each holding
+        NIfTI phase files following the MAMA-MIA naming convention
+        ``{patient_id}_{phase:04d}.nii.gz``.
+    phase : int
+        Phase index to use as the normalisation reference.  Default: ``0``
+        (pre-contrast), which is the correct choice for MAMA-MIA.
+
+    Returns
+    -------
+    NormalizationStats
+        Global mean and standard deviation.
+
+    Raises
+    ------
+    RuntimeError
+        If no valid pre-contrast volumes are found.
+    """
+    import math
+
+    import SimpleITK as sitk  # type: ignore[import-untyped]
+
+    if not images_dir.exists():
+        raise FileNotFoundError(f"images_dir not found: {images_dir}")
+
+    patient_folders = sorted(
+        p for p in images_dir.iterdir() if p.is_dir()
+    )
+    if not patient_folders:
+        raise RuntimeError(f"No patient sub-folders found in {images_dir}")
+
+    logger.info(
+        f"Computing normalisation stats from {len(patient_folders)} patients "
+        f"(phase {phase}) in {images_dir} …"
+    )
+
+    # Welford online algorithm (numerically stable, single-pass)
+    n_total: int = 0
+    mean: float = 0.0
+    M2: float = 0.0
+    n_patients: int = 0
+
+    for patient_folder in patient_folders:
+        pid = patient_folder.name
+        phase_path = patient_folder / f"{pid}_{phase:04d}.nii.gz"
+        if not phase_path.exists():
+            # Try .nii as fallback
+            phase_path = patient_folder / f"{pid}_{phase:04d}.nii"
+            if not phase_path.exists():
+                logger.warning(
+                    f"Phase-{phase} file not found for {pid}, skipping."
+                )
+                continue
+
+        try:
+            sitk_img = sitk.ReadImage(str(phase_path), sitk.sitkFloat32)
+            voxels = sitk.GetArrayFromImage(sitk_img).ravel().astype(np.float64)
+            voxels = voxels[np.isfinite(voxels)]
+        except Exception as exc:
+            logger.warning(f"Could not load {phase_path}: {exc}, skipping.")
+            continue
+
+        n_batch = len(voxels)
+        if n_batch == 0:
+            continue
+
+        batch_mean = float(np.mean(voxels))
+        batch_var = float(np.var(voxels))
+
+        # Parallel merge: update running mean and M2
+        n_new = n_total + n_batch
+        delta = batch_mean - mean
+        mean = (n_total * mean + n_batch * batch_mean) / n_new
+        M2 = M2 + n_batch * batch_var + delta ** 2 * n_total * n_batch / n_new
+        n_total = n_new
+        n_patients += 1
+
+        logger.debug(
+            f"  [{n_patients:>4d}] {pid}  voxels={n_batch:,}  "
+            f"running mean={mean:.4f}"
+        )
+
+    if n_total == 0:
+        raise RuntimeError(
+            "No voxels accumulated — check images_dir path and file format. "
+            f"Looked for phase-{phase} files in {images_dir}"
+        )
+
+    population_std = math.sqrt(M2 / n_total)
+    stats = NormalizationStats(
+        mean=mean,
+        std=population_std,
+        n_voxels=n_total,
+        n_patients=n_patients,
+    )
+    logger.info(
+        f"Computed normalisation stats from {n_patients} patients "
+        f"({n_total:,} voxels): {stats}"
+    )
+    return stats
+
+
+def apply_normalization(
+    image: NDArray[np.floating],
+    stats: NormalizationStats,
+) -> NDArray[np.floating]:
+    """Apply global z-score normalisation: ``(image − mean) / std``.
+
+    No clipping is applied — this matches the behaviour of
+    ``preprocess.py`` in the MAMA-SYNTH preprocessing pipeline.
+
+    Parameters
+    ----------
+    image : NDArray
+        Raw intensity array (any shape, float32 or float64).
+    stats : NormalizationStats
+        Dataset-level statistics from :func:`load_normalization_stats`
+        or :func:`compute_normalization_stats`.
+
+    Returns
+    -------
+    NDArray of the same shape as *image*, dtype ``float32``.
+    """
+    return ((image.astype(np.float32) - stats.mean) / stats.std).astype(
+        np.float32
+    )
+
+
+def make_normalizer(
+    stats: Optional[NormalizationStats],
+) -> Optional[Callable[[NDArray[np.floating]], NDArray[np.floating]]]:
+    """Return a normaliser callable, or ``None`` when disabled.
+
+    Parameters
+    ----------
+    stats : NormalizationStats | None
+        When ``None``, normalisation is disabled and this function
+        returns ``None``.  Callers should treat ``None`` as a no-op
+        and leave images unmodified.
+
+    Returns
+    -------
+    Callable or None
+    """
+    if stats is None:
+        return None
+    return lambda img: apply_normalization(img, stats)
 
 
 # ---------------------------------------------------------------------------
@@ -526,6 +805,7 @@ def create_contrast_dataset(
     n_workers: int = 1,
     slice_mode: Optional[str] = None,
     n_slices: int = DEFAULT_N_SLICES,
+    normalizer: Optional[Callable[[NDArray[np.floating]], NDArray[np.floating]]] = None,
 ) -> tuple[NDArray[np.floating], NDArray[np.integer], list[str], list[int]]:
     """Build a feature matrix for the pre-/post-contrast classification task.
 
@@ -544,6 +824,10 @@ def create_contrast_dataset(
         Feature cache directory.
     n_workers, slice_mode, n_slices : int | str | None
         Feature extraction parameters (passed through).
+    normalizer : Callable | None
+        Optional image normalisation function produced by
+        :func:`make_normalizer`.  When not ``None`` it is applied to
+        every loaded volume before feature extraction.
 
     Returns
     -------
@@ -577,6 +861,7 @@ def create_contrast_dataset(
             slice_mode=slice_mode,
             n_slices=n_slices,
             dual_phase=False,  # never dual-phase for contrast task itself
+            normalizer=normalizer,
         )
         n_samples = feat_matrix.shape[0]
         all_feats.append(feat_matrix)
@@ -609,6 +894,7 @@ def create_tumor_roi_dataset(
     n_slices: int = 5,
     search_fraction: float = 0.4,
     min_tissue_fraction: float = 0.3,
+    normalizer: Optional[Callable[[NDArray[np.floating]], NDArray[np.floating]]] = None,
 ) -> tuple[NDArray[np.floating], NDArray[np.integer], list[str], list[int]]:
     """Build a feature matrix for the tumor-ROI vs mirrored-ROI task.
 
@@ -647,6 +933,12 @@ def create_tumor_roi_dataset(
         Passed to :func:`eval.mirror_utils.detect_midline`.
     min_tissue_fraction : float
         Passed to :func:`eval.mirror_utils.validate_mirrored_region`.
+    normalizer : Callable | None
+        Optional image normalisation function produced by
+        :func:`make_normalizer`.  When not ``None`` it is applied to
+        the loaded post-contrast volume before feature extraction.
+        Mirror slices are extracted from the already-normalised volume,
+        so no per-slice re-normalisation is needed when this is set.
 
     Returns
     -------
@@ -750,6 +1042,11 @@ def create_tumor_roi_dataset(
             n_skipped += 1
             continue
 
+        # Apply global normalisation before any feature extraction so that
+        # all images are in the same intensity space as the gc-eval domain.
+        if normalizer is not None:
+            image_array = normalizer(image_array)
+
         try:
             mask_array = _load_mask_as_array(seg_path)
         except Exception as e:
@@ -777,25 +1074,33 @@ def create_tumor_roi_dataset(
             n_skipped += 1
             continue
 
+        # Whether to apply per-slice z-score inside extract_all_tumor_slices:
+        # skip when a global normaliser has already been applied to the volume.
+        _per_slice_norm = normalizer is None
+
         # --- Extract features ---
         try:
             if _use_all_tumor and image_array.ndim == 3:
                 # All-tumour slices: extract per-slice features
                 tumor_slices_img, tumor_slices_msk, tumor_idxs = (
                     extract_all_tumor_slices(
-                        image_array, mask=mask_array, normalize=True,
+                        image_array, mask=mask_array,
+                        normalize=_per_slice_norm,
                     )
                 )
-                # Extract mirror slices at the same z-indices
+                # Extract mirror slices at the same z-indices.
+                # When global normalisation is active the volume is already
+                # normalised, so no per-slice re-normalisation is applied.
                 mirror_slices_img = []
                 mirror_slices_msk = []
                 for z_idx in tumor_idxs:
                     img_slice = image_array[z_idx]
-                    # Normalise the same way as extract_all_tumor_slices
-                    mu = img_slice.mean()
-                    std = img_slice.std()
-                    if std > 0:
-                        img_slice = (img_slice - mu) / std
+                    if _per_slice_norm:
+                        # Normalise the same way as extract_all_tumor_slices
+                        mu = img_slice.mean()
+                        std = img_slice.std()
+                        if std > 0:
+                            img_slice = (img_slice - mu) / std
                     mirror_slices_img.append(img_slice)
                     mirror_slices_msk.append(mirrored_mask[z_idx])
 
@@ -1245,6 +1550,7 @@ def extract_features_for_patients(
     slice_mode: Optional[str] = None,
     n_slices: int = DEFAULT_N_SLICES,
     dual_phase: bool = False,
+    normalizer: Optional[Callable[[NDArray[np.floating]], NDArray[np.floating]]] = None,
 ) -> tuple[NDArray[np.floating], list[str], list[int]]:
     """Extract radiomic features for a list of patients.
 
@@ -1278,6 +1584,11 @@ def extract_features_for_patients(
         dual_phase: When True, also extract features from phase 0
             (pre-contrast) and concatenate them with phase 1 features,
             doubling the feature dimension. Disabled by default.
+        normalizer: Optional image normalisation function produced by
+            :func:`make_normalizer`.  When not ``None`` it is applied to
+            every loaded volume (both phases) before feature extraction,
+            replacing per-slice z-score normalisation so that the trained
+            classifier operates in the same intensity domain as gc-eval.
 
     Returns:
         Tuple of:
@@ -1330,11 +1641,12 @@ def extract_features_for_patients(
     n_extracted = 0
     n_failed = 0
 
-    # Cache suffix differentiates 3D vs 2D cached features
+    # Cache suffix differentiates 3D vs 2D cached features and normalization
     _dp_tag = "_dualphase" if dual_phase else ""
+    _norm_tag = "_gznorm" if normalizer is not None else ""
     cache_suffix = (
-        f"_phase{phase}{_dp_tag}.npy" if _slice_mode is None
-        else f"_phase{phase}_{_slice_mode.value}{_dp_tag}.npy"
+        f"_phase{phase}{_dp_tag}{_norm_tag}.npy" if _slice_mode is None
+        else f"_phase{phase}_{_slice_mode.value}{_dp_tag}{_norm_tag}.npy"
     )
 
     for i, pid in iterator:
@@ -1373,6 +1685,11 @@ def extract_features_for_patients(
             logger.warning(f"Failed to load image for {pid}: {e}, skipping.")
             n_failed += 1
             continue
+
+        # Apply global normalisation before any feature extraction so that
+        # all images are in the same intensity space as the gc-eval domain.
+        if normalizer is not None:
+            image_array = normalizer(image_array)
 
         # Load mask (required for mask-dependent slice modes, optional otherwise)
         _mask_dependent = _slice_mode in (
@@ -1424,7 +1741,8 @@ def extract_features_for_patients(
                     # All-tumour: every slice with ≥1 mask voxel →
                     # each becomes an independent training sample.
                     at_imgs, at_masks, at_idxs = extract_all_tumor_slices(
-                        image_array, mask=mask_array, normalize=True,
+                        image_array, mask=mask_array,
+                        normalize=(normalizer is None),
                     )
                     at_feats: list[NDArray[np.floating]] = []
                     for s_img, s_msk in zip(at_imgs, at_masks):
@@ -1468,7 +1786,7 @@ def extract_features_for_patients(
                     # Multi-slice: extract features per slice and concatenate
                     slices_2d, masks_2d, _ = extract_multi_slices(
                         image_array, mask=mask_array,
-                        n_slices=n_slices, normalize=True,
+                        n_slices=n_slices, normalize=(normalizer is None),
                     )
                     slice_feats = []
                     for s_img, s_msk in zip(slices_2d, masks_2d):
@@ -1483,7 +1801,7 @@ def extract_features_for_patients(
                     # Single-slice modes (max_tumor, center_tumor, middle)
                     img_2d, msk_2d, slice_idx = extract_2d_slice(
                         image_array, mask=mask_array,
-                        mode=_slice_mode, normalize=True,
+                        mode=_slice_mode, normalize=(normalizer is None),
                     )
                     feat = extract_radiomic_features(
                         img_2d, mask=msk_2d,
@@ -1523,6 +1841,11 @@ def extract_features_for_patients(
                 )
                 n_failed += 1
                 continue
+
+            # Apply same global normalisation to phase-0 volume
+            if normalizer is not None:
+                phase0_array = normalizer(phase0_array)
+
             try:
                 if _slice_mode is not None and phase0_array.ndim == 3:
                     if _slice_mode in (
@@ -1531,7 +1854,7 @@ def extract_features_for_patients(
                     ):
                         p0_2d, p0_msk, _ = extract_2d_slice(
                             phase0_array, mask=mask_array,
-                            mode=_slice_mode, normalize=True,
+                            mode=_slice_mode, normalize=(normalizer is None),
                         )
                         feat_p0 = extract_radiomic_features(
                             p0_2d, mask=p0_msk,
@@ -2409,6 +2732,35 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         ),
     )
 
+    # Normalisation
+    norm_grp = parser.add_argument_group(
+        "Normalisation",
+        "Global z-score intensity normalisation (recommended for cross-domain "
+        "consistency with the gc-eval test pipeline).",
+    )
+    norm_grp.add_argument(
+        "--normalization-stats",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Path to a pre-computed normalization_stats.json produced by "
+            "compute_normalization_stats(). When omitted the statistics are "
+            "computed on-the-fly from the pre-contrast (phase-0) volumes in "
+            "--images-dir and saved to --output-dir/normalization_stats.json."
+        ),
+    )
+    norm_grp.add_argument(
+        "--no-normalization",
+        action="store_true",
+        default=False,
+        help=(
+            "Disable global z-score intensity normalisation. When set, each "
+            "2D slice is normalised independently (legacy behaviour). Not "
+            "recommended when training classifiers intended for gc-eval inference."
+        ),
+    )
+
     # Logging
     parser.add_argument(
         "--verbose", "-v",
@@ -2564,6 +2916,44 @@ def main(argv: Optional[list[str]] = None) -> None:
                 f"Found {len(test_patient_ids_global)} test-set patients."
             )
 
+    # ---------------------------------------------------------------------------
+    # Normalisation setup
+    # ---------------------------------------------------------------------------
+    _images_dir_for_norm = args.images_dir if args.images_dir else args.data_dir / IMAGES_SUBDIR
+    normalizer: Optional[Callable[[NDArray[np.floating]], NDArray[np.floating]]] = None
+    norm_stats_for_report: Optional[dict] = None
+
+    if not getattr(args, "no_normalization", False):
+        norm_stats_path = getattr(args, "normalization_stats", None)
+        if norm_stats_path is not None and Path(norm_stats_path).exists():
+            logger.info(f"Loading normalisation stats from {norm_stats_path}")
+            norm_stats = load_normalization_stats(Path(norm_stats_path))
+        else:
+            if norm_stats_path is not None:
+                logger.warning(
+                    f"--normalization-stats path not found ({norm_stats_path}); "
+                    "computing stats from pre-contrast volumes."
+                )
+            logger.info(
+                "Computing global z-score normalisation stats from pre-contrast "
+                f"(phase-0) volumes in {_images_dir_for_norm} ..."
+            )
+            norm_stats = compute_normalization_stats(_images_dir_for_norm, phase=0)
+            # Save to output dir for reproducibility
+            norm_save_path = args.output_dir / NORMALIZATION_STATS_FILENAME
+            args.output_dir.mkdir(parents=True, exist_ok=True)
+            save_normalization_stats(norm_stats, norm_save_path)
+            logger.info(f"Saved normalisation stats to {norm_save_path}")
+
+        normalizer = make_normalizer(norm_stats)
+        norm_stats_for_report = norm_stats.to_dict()
+        logger.info(repr(norm_stats))
+    else:
+        logger.info(
+            "Global normalisation disabled (--no-normalization). "
+            "Per-slice z-score normalisation will be used instead."
+        )
+
     # Training report to save at the end
     report: dict[str, Any] = {
         "data_dir": str(args.data_dir),
@@ -2575,6 +2965,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         "seed": args.seed,
         "slice_mode": args.slice_mode,
         "dual_phase": getattr(args, "dual_phase", False),
+        "normalization": norm_stats_for_report,
         "total_patients": len(clinical_df),
         "tasks": {},
     }
@@ -2715,6 +3106,7 @@ def main(argv: Optional[list[str]] = None) -> None:
                     n_workers=args.n_workers,
                     slice_mode=args.slice_mode,
                     n_slices=args.n_slices,
+                    normalizer=normalizer,
                 )
             )
         elif task == "tumor_roi":
@@ -2730,6 +3122,7 @@ def main(argv: Optional[list[str]] = None) -> None:
                     n_workers=args.n_workers,
                     slice_mode=args.slice_mode,
                     n_slices=args.n_slices,
+                    normalizer=normalizer,
                 )
             )
         else:
@@ -2744,6 +3137,7 @@ def main(argv: Optional[list[str]] = None) -> None:
                 slice_mode=args.slice_mode,
                 n_slices=args.n_slices,
                 dual_phase=getattr(args, "dual_phase", False),
+                normalizer=normalizer,
             )
             # Filter labels to match valid patients
             valid_labels = labels[valid_indices]
@@ -2867,6 +3261,7 @@ def main(argv: Optional[list[str]] = None) -> None:
                             n_workers=args.n_workers,
                             slice_mode=args.slice_mode,
                             n_slices=args.n_slices,
+                            normalizer=normalizer,
                         )
                     )
                 elif task == "tumor_roi":
@@ -2882,6 +3277,7 @@ def main(argv: Optional[list[str]] = None) -> None:
                             n_workers=args.n_workers,
                             slice_mode=args.slice_mode,
                             n_slices=args.n_slices,
+                            normalizer=normalizer,
                         )
                     )
                 else:
@@ -2916,6 +3312,7 @@ def main(argv: Optional[list[str]] = None) -> None:
                                 slice_mode=args.slice_mode,
                                 n_slices=args.n_slices,
                                 dual_phase=getattr(args, "dual_phase", False),
+                                normalizer=normalizer,
                             )
                         )
                         test_labels_valid = test_labels_task[test_valid_idx]

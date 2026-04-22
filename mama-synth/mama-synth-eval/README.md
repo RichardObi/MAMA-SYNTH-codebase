@@ -481,6 +481,8 @@ mamasia-train \
 | `--radiomics-model` | `all` | Radiomics family filter: `all`, `xgboost`, `random_forest`, `logistic_regression`, `svm` |
 | `--save-all-models` | `false` | Save all trained models (not just best) for ensemble |
 | `--dual-phase` | `false` | Use both phase 0 + phase 1 for classification |
+| `--normalization-stats` | `None` | Path to a pre-computed `normalization_stats.json`.  When omitted, global z-score stats are computed on-the-fly from phase-0 volumes and saved to `--output-dir` |
+| `--no-normalization` | `false` | Disable global z-score normalisation so each 2D slice is normalised independently (legacy behaviour; not recommended when targeting gc-eval inference) |
 | `--device` | `auto` | Device for CNN training: `auto`, `cpu`, `cuda`, `mps` |
 | `--run-name` | `None` | Custom label appended to the versioned run directory name |
 | `--flat-output` | `false` | Disable versioned run directories; write directly to `--output-dir` |
@@ -528,6 +530,29 @@ python -m eval.train_classifier \
     --output-dir ./models \
     --slice-mode all_tumor
 ```
+
+**Global z-score intensity normalisation** (default, on): Before feature extraction every volume is normalised with `(x - μ) / σ` where `μ` and `σ` are computed once from **all pre-contrast (phase-0) volumes** across the whole training set, matching the `preprocess.py` pipeline in MAMA-SYNTH.  This puts training and inference images in the same intensity domain and is essential for the contrast-enhancement classification task.
+
+```bash
+# Compute + save stats automatically (default)
+python -m eval.train_classifier \
+    --data-dir /path/to/mama-mia-dataset \
+    --output-dir ./models
+
+# Reuse previously computed stats
+python -m eval.train_classifier \
+    --data-dir /path/to/mama-mia-dataset \
+    --output-dir ./models \
+    --normalization-stats ./models/run_001/normalization_stats.json
+
+# Disable global normalisation (legacy per-slice z-score)
+python -m eval.train_classifier \
+    --data-dir /path/to/mama-mia-dataset \
+    --output-dir ./models \
+    --no-normalization
+```
+
+The computed statistics are saved as `normalization_stats.json` in the run output directory so they can be passed directly to gc-eval or reused.
 
 **CNN classifier** (EfficientNet): Train a deep learning classifier instead of the radiomics-based models. Automatically defaults to `all_tumor` slice mode.
 
