@@ -8,7 +8,7 @@ from .classification import (
     RadiomicsClassifier,
 )
 from .image_metrics import ImageMetricsEvaluator
-from .mirror_utils import create_mirrored_mask, detect_midline, mirror_mask
+from .mirror_utils import create_mirrored_mask, detect_bilateral_breasts, detect_midline, mirror_mask
 from .roi_metrics import (
     ROIMetricsEvaluator,
     clear_feature_cache,
@@ -29,6 +29,7 @@ __all__ = [
     "SegmentationEvaluator",
     "clear_feature_cache",
     "create_mirrored_mask",
+    "detect_bilateral_breasts",
     "detect_midline",
     "extract_radiomic_features_cached",
     "mirror_mask",

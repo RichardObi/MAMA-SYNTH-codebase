@@ -19,7 +19,9 @@ import pytest
 
 from eval.mirror_utils import (
     _compute_tissue_threshold,
+    _detect_midline_argmin,
     create_mirrored_mask,
+    detect_bilateral_breasts,
     detect_midline,
     mirror_mask,
     validate_mirrored_region,
@@ -126,14 +128,14 @@ class TestMirrorMask:
     def test_2d_exact_reflection(self) -> None:
         mask = np.zeros((10, 20), dtype=bool)
         mask[3, 2] = True  # col 2, midline 10 → mirrored col 18
-        mirrored = mirror_mask(mask, midline_col=10)
+        mirrored = mirror_mask(mask, midline=10)
         assert mirrored[3, 18]
         assert np.sum(mirrored) == 1
 
     def test_3d_exact_reflection(self) -> None:
         mask = np.zeros((4, 10, 20), dtype=bool)
         mask[1, 3, 5] = True  # col 5, midline 10 → mirrored col 15
-        mirrored = mirror_mask(mask, midline_col=10)
+        mirrored = mirror_mask(mask, midline=10)
         assert mirrored[1, 3, 15]
         assert np.sum(mirrored) == 1
 
@@ -141,18 +143,18 @@ class TestMirrorMask:
         """Voxels mirroring outside the image are silently dropped."""
         mask = np.zeros((10, 20), dtype=bool)
         mask[5, 18] = True  # col 18, midline 5 → mirrored col = -8 → clip
-        mirrored = mirror_mask(mask, midline_col=5)
+        mirrored = mirror_mask(mask, midline=5)
         assert np.sum(mirrored) == 0  # No valid target column
 
     def test_empty_mask(self) -> None:
         mask = np.zeros((10, 20), dtype=bool)
-        mirrored = mirror_mask(mask, midline_col=10)
+        mirrored = mirror_mask(mask, midline=10)
         assert np.sum(mirrored) == 0
 
     def test_midline_voxel_maps_to_itself(self) -> None:
         mask = np.zeros((10, 20), dtype=bool)
         mask[5, 10] = True
-        mirrored = mirror_mask(mask, midline_col=10)
+        mirrored = mirror_mask(mask, midline=10)
         assert mirrored[5, 10]
         assert np.sum(mirrored) == 1
 
@@ -161,7 +163,7 @@ class TestMirrorMask:
         mask = np.zeros((10, 20), dtype=bool)
         mask[4, 8] = True
         mask[4, 12] = True  # symmetric pair around col 10
-        mirrored = mirror_mask(mask, midline_col=10)
+        mirrored = mirror_mask(mask, midline=10)
         assert mirrored[4, 8]
         assert mirrored[4, 12]
 
@@ -169,7 +171,7 @@ class TestMirrorMask:
         mask = np.zeros((10, 100), dtype=bool)
         rng = np.random.default_rng(0)
         mask[rng.integers(0, 10, 20), rng.integers(10, 40, 20)] = True
-        mirrored = mirror_mask(mask, midline_col=50)
+        mirrored = mirror_mask(mask, midline=50)
         # All source voxels in cols [10,40); mirrored → [60,90) which is in [0,100)
         assert np.sum(mirrored) == np.sum(mask)
 
@@ -187,13 +189,15 @@ class TestComputeTissueThreshold:
         assert _compute_tissue_threshold(img) == 0.0
 
     def test_simple_image(self) -> None:
+        # Use z-score-normalised values: background < -1.5, tissue ≥ -1.5
+        from eval.mirror_utils import BACKGROUND_Z_THRESHOLD
         rng = np.random.default_rng(42)
-        img = np.zeros((50, 50), dtype=np.float64)
-        img[10:40, 10:40] = rng.uniform(100, 300, (30, 30))
+        img = np.full((50, 50), -3.0, dtype=np.float64)  # background
+        img[10:40, 10:40] = rng.uniform(0, 3, (30, 30))  # tissue z-scores
         thresh = _compute_tissue_threshold(img, percentile=10)
-        # Should be near the low end of the non-zero values
-        nonzero = img[img > 0]
-        expected = np.percentile(nonzero, 10)
+        # Should equal the 10th percentile of tissue voxels (> BACKGROUND_Z_THRESHOLD)
+        tissue = img[img > BACKGROUND_Z_THRESHOLD]
+        expected = np.percentile(tissue, 10)
         assert abs(thresh - expected) < 1e-10
 
 
@@ -208,14 +212,16 @@ class TestValidateMirroredRegion:
     def test_all_tissue_passes(self) -> None:
         img = np.full((10, 10), 200.0, dtype=np.float64)
         mask = np.ones((10, 10), dtype=bool)
-        # Explicit threshold below the uniform value (auto-threshold
-        # for a uniform image equals the value itself, and > is strict).
+        # Explicit threshold equal to the uniform value: >= semantics means
+        # all voxels qualify (200 >= 200 is True for every voxel).
+        assert validate_mirrored_region(img, mask, tissue_threshold=200.0) is True
         assert validate_mirrored_region(img, mask, tissue_threshold=100.0) is True
 
     def test_all_background_fails(self) -> None:
-        img = np.zeros((10, 10), dtype=np.float64)
+        # Use z-score values well below BACKGROUND_Z_THRESHOLD so that no
+        # tissue voxels are present and the mirrored region fails validation.
+        img = np.full((10, 10), -3.0, dtype=np.float64)
         mask = np.ones((10, 10), dtype=bool)
-        # All zero image: threshold=0, voxels > 0 is 0 → fraction=0 → fail
         assert validate_mirrored_region(img, mask) is False
 
     def test_empty_mask_fails(self) -> None:
@@ -292,12 +298,12 @@ class TestCreateMirroredMask:
 
     def test_tissue_validation_can_reject(self) -> None:
         """A mask mirrored into background should be rejected."""
-        # Image with tissue only on the left half
-        img = np.zeros((64, 128), dtype=np.float64)
-        img[:, 5:60] = 200.0  # Only left breast
+        # Use z-score-normalised values: background = -3 (air), tissue = 1
+        img = np.full((64, 128), -3.0, dtype=np.float64)
+        img[:, 5:60] = 1.0  # Only left breast in z-score space
         mask = np.zeros((64, 128), dtype=bool)
         mask[20:40, 15:30] = True  # Tumor on left
-        # Midline ~64, mirrored to ~98-113 which is all zeros → fail
+        # Bilateral check will fail (no right breast) → both axes fail → None
         result = create_mirrored_mask(img, mask)
         assert result is None
 

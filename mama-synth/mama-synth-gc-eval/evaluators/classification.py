@@ -332,7 +332,7 @@ class ClassificationEvaluator(BaseEvaluator):
         ensemble: bool = False,
     ) -> None:
         self.ensemble = ensemble
-        self.models_dir = models_dir
+        self.models_dir = models_dir  # already the classification sub-dir when passed from evaluate.py
 
         # -- Contrast classifier(s) -----------------------------------
         self.contrast_clf: Optional[
@@ -482,7 +482,7 @@ class ClassificationEvaluator(BaseEvaluator):
 
             # Anatomical midline mirroring
             mirrored = create_mirrored_mask(
-                case.prediction, case.mask
+                case.prediction, case.mask, case_id=case.case_id
             )
             if mirrored is None:
                 continue
