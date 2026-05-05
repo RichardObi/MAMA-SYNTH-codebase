@@ -106,12 +106,23 @@ def _save_visual_overlay(
     mask_slice: np.ndarray,
     dest: Path,
     title: str = "",
+    mask_color: tuple = (1.0, 0.0, 0.0),  # RGB, default red
+    mask_label: str = "Mask",
 ) -> None:
-    """Save a side-by-side PNG: raw image | image with mask overlay."""
+    """Save a side-by-side PNG: raw image | image with mask overlay.
+
+    Parameters
+    ----------
+    mask_color:
+        RGB float tuple for the filled mask overlay (default: red).
+    mask_label:
+        Short label describing the mask shown in the right panel title.
+    """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from matplotlib.colors import Normalize as MplNorm
+    from matplotlib.patches import Patch
 
     dest.parent.mkdir(parents=True, exist_ok=True)
 
@@ -126,14 +137,139 @@ def _save_visual_overlay(
         ax.imshow(image_slice, cmap="gray", norm=norm, origin="upper")
         ax.axis("off")
 
-    # Right panel: red mask overlay (filled, semi-transparent)
+    # Right panel: coloured mask overlay (filled, semi-transparent)
     if np.any(mask_slice):
+        r, g, b = mask_color
         overlay = np.zeros((*mask_slice.shape, 4), dtype=np.float32)
-        overlay[mask_slice, 0] = 1.0   # R
-        overlay[mask_slice, 3] = 0.4   # alpha
+        overlay[mask_slice, 0] = r
+        overlay[mask_slice, 1] = g
+        overlay[mask_slice, 2] = b
+        overlay[mask_slice, 3] = 0.45   # alpha
         axes[1].imshow(overlay, origin="upper")
+        legend_patch = Patch(facecolor=mask_color, alpha=0.6, label=mask_label)
+        axes[1].legend(
+            handles=[legend_patch],
+            loc="lower right",
+            fontsize=8,
+            framealpha=0.7,
+        )
+
     axes[0].set_title("Raw slice")
-    axes[1].set_title("Slice + mask overlay")
+    axes[1].set_title(f"Slice + {mask_label} overlay")
+
+    fig.tight_layout()
+    fig.savefig(str(dest), dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _save_tumor_roi_combined_visual(
+    image_slice: np.ndarray,
+    tumor_mask: np.ndarray,
+    mirror_mask: np.ndarray,
+    dest: Path,
+    title: str = "",
+) -> None:
+    """Save an annotated three-panel PNG for the tumor-ROI task.
+
+    Panels (left → right):
+
+    1. **Tumor ROI** — image + red filled overlay for the original tumor mask.
+    2. **Both masks** — image + red tumor mask + blue mirrored mask shown
+       together so spatial relationship is immediately visible.  The body
+       midline is drawn as a dashed vertical line.
+    3. **Mirrored ROI** — image + blue filled overlay for the mirrored mask.
+
+    Each panel carries a plain-text annotation and a legend entry so the
+    viewer can identify which region is which at a glance.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import Normalize as MplNorm
+    from matplotlib.patches import Patch
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+
+    vmin, vmax = np.percentile(image_slice, [1, 99])
+    norm = MplNorm(vmin=vmin, vmax=vmax)
+
+    TUMOR_COLOR  = (1.0, 0.2, 0.2)   # red
+    MIRROR_COLOR = (0.2, 0.5, 1.0)   # blue
+    ALPHA = 0.45
+
+    def _make_overlay(mask, rgb):
+        ov = np.zeros((*mask.shape, 4), dtype=np.float32)
+        ov[mask, 0] = rgb[0]
+        ov[mask, 1] = rgb[1]
+        ov[mask, 2] = rgb[2]
+        ov[mask, 3] = ALPHA
+        return ov
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    fig.suptitle(title, fontsize=10)
+
+    for ax in axes:
+        ax.imshow(image_slice, cmap="gray", norm=norm, origin="upper")
+        ax.axis("off")
+
+    # ── Panel 0: Tumor ROI (red) ──────────────────────────────────────────
+    if np.any(tumor_mask):
+        axes[0].imshow(_make_overlay(tumor_mask, TUMOR_COLOR), origin="upper")
+    axes[0].set_title("Tumor ROI", fontsize=11, fontweight="bold")
+    axes[0].legend(
+        handles=[Patch(facecolor=TUMOR_COLOR, alpha=0.6, label="Original tumor mask")],
+        loc="lower right", fontsize=8, framealpha=0.7,
+    )
+    # Text annotation pinned to the mask centroid (if mask is non-empty)
+    if np.any(tumor_mask):
+        ys, xs = np.where(tumor_mask)
+        cx, cy = int(xs.mean()), int(ys.mean())
+        axes[0].text(
+            cx, cy, "Tumor",
+            color="white", fontsize=8, ha="center", va="center",
+            bbox=dict(facecolor=TUMOR_COLOR, alpha=0.6, boxstyle="round,pad=0.2"),
+        )
+
+    # ── Panel 1: Both masks together with midline ─────────────────────────
+    if np.any(tumor_mask):
+        axes[1].imshow(_make_overlay(tumor_mask, TUMOR_COLOR), origin="upper")
+    if np.any(mirror_mask):
+        axes[1].imshow(_make_overlay(mirror_mask, MIRROR_COLOR), origin="upper")
+    # Estimate and draw body midline
+    try:
+        from eval.mirror_utils import detect_midline
+        midline_col = detect_midline(image_slice)
+        axes[1].axvline(
+            x=midline_col, color="yellow", linestyle="--",
+            linewidth=1.2, alpha=0.8, label="Body midline",
+        )
+    except Exception:
+        pass
+    axes[1].set_title("Both masks (comparison)", fontsize=11, fontweight="bold")
+    axes[1].legend(
+        handles=[
+            Patch(facecolor=TUMOR_COLOR, alpha=0.6, label="Original tumor mask"),
+            Patch(facecolor=MIRROR_COLOR, alpha=0.6, label="Mirrored (contralateral) mask"),
+        ],
+        loc="lower right", fontsize=7, framealpha=0.7,
+    )
+
+    # ── Panel 2: Mirrored ROI (blue) ──────────────────────────────────────
+    if np.any(mirror_mask):
+        axes[2].imshow(_make_overlay(mirror_mask, MIRROR_COLOR), origin="upper")
+    axes[2].set_title("Mirrored (Contralateral) ROI", fontsize=11, fontweight="bold")
+    axes[2].legend(
+        handles=[Patch(facecolor=MIRROR_COLOR, alpha=0.6, label="Mirrored mask")],
+        loc="lower right", fontsize=8, framealpha=0.7,
+    )
+    if np.any(mirror_mask):
+        ys, xs = np.where(mirror_mask)
+        cx, cy = int(xs.mean()), int(ys.mean())
+        axes[2].text(
+            cx, cy, "Mirror",
+            color="white", fontsize=8, ha="center", va="center",
+            bbox=dict(facecolor=MIRROR_COLOR, alpha=0.6, boxstyle="round,pad=0.2"),
+        )
 
     fig.tight_layout()
     fig.savefig(str(dest), dpi=150, bbox_inches="tight")
@@ -385,35 +521,64 @@ def run_tumor_roi(
         pid_dir.mkdir(parents=True, exist_ok=True)
 
         for i, z_idx in enumerate(z_idxs):
-            for label, img_sl, msk_sl in [
-                ("tumor",  tumor_imgs[i],  tumor_masks[i]),
-                ("mirror", mirror_imgs[i], mirror_masks[i]),
+            # ── Raw NIfTI files ────────────────────────────────────────────
+            tumor_raw_img  = pid_dir / f"{pid}_tumor_roi_tumor_slice{z_idx:04d}_image.nii.gz"
+            tumor_raw_mask = pid_dir / f"{pid}_tumor_roi_tumor_slice{z_idx:04d}_mask.nii.gz"
+            mirror_raw_img  = pid_dir / f"{pid}_tumor_roi_mirror_slice{z_idx:04d}_image.nii.gz"
+            mirror_raw_mask = pid_dir / f"{pid}_tumor_roi_mirror_slice{z_idx:04d}_mask.nii.gz"
+
+            if save_raw:
+                _save_slice_as_nifti(tumor_imgs[i],   tumor_raw_img)
+                _save_mask_as_nifti(tumor_masks[i],   tumor_raw_mask)
+                _save_slice_as_nifti(mirror_imgs[i],  mirror_raw_img)
+                _save_mask_as_nifti(mirror_masks[i],  mirror_raw_mask)
+
+            # ── Visual files ──────────────────────────────────────────────
+            combined_vis = pid_dir / f"{pid}_tumor_roi_combined_slice{z_idx:04d}.png"
+            tumor_vis    = pid_dir / f"{pid}_tumor_roi_tumor_slice{z_idx:04d}.png"
+            mirror_vis   = pid_dir / f"{pid}_tumor_roi_mirror_slice{z_idx:04d}.png"
+
+            if save_visual:
+                # Combined 3-panel annotated figure (primary inspection file)
+                _save_tumor_roi_combined_visual(
+                    image_slice=tumor_imgs[i],
+                    tumor_mask=tumor_masks[i],
+                    mirror_mask=mirror_masks[i],
+                    dest=combined_vis,
+                    title=(
+                        f"{pid}  |  tumor-ROI vs mirrored-ROI  |  "
+                        f"phase={phase}  |  z={z_idx}  |  "
+                        "red=tumor  blue=mirror"
+                    ),
+                )
+                # Individual per-ROI overlays (red / blue) for completeness
+                _save_visual_overlay(
+                    tumor_imgs[i], tumor_masks[i], tumor_vis,
+                    title=f"{pid}  |  Tumor ROI  |  phase={phase}  |  z={z_idx}",
+                    mask_color=(1.0, 0.2, 0.2),
+                    mask_label="Original tumor mask",
+                )
+                _save_visual_overlay(
+                    mirror_imgs[i], mirror_masks[i], mirror_vis,
+                    title=f"{pid}  |  Mirrored (Contralateral) ROI  |  phase={phase}  |  z={z_idx}",
+                    mask_color=(0.2, 0.5, 1.0),
+                    mask_label="Mirrored mask",
+                )
+
+            for label, raw_img, raw_msk, vis in [
+                ("tumor",  tumor_raw_img,  tumor_raw_mask,  tumor_vis),
+                ("mirror", mirror_raw_img, mirror_raw_mask, mirror_vis),
             ]:
-                stem = f"{pid}_tumor_roi_{label}_slice{z_idx:04d}"
-                raw_img_path = pid_dir / f"{stem}_image.nii.gz"
-                raw_msk_path = pid_dir / f"{stem}_mask.nii.gz"
-                vis_path = pid_dir / f"{stem}.png"
-
-                if save_raw:
-                    _save_slice_as_nifti(img_sl, raw_img_path)
-                    _save_mask_as_nifti(msk_sl, raw_msk_path)
-
-                if save_visual:
-                    _save_visual_overlay(
-                        img_sl, msk_sl, vis_path,
-                        title=f"{pid}  |  roi={label}  |  "
-                              f"phase={phase}  |  z={z_idx}",
-                    )
-
                 rows.append(dict(
                     patient_id=pid,
                     task="tumor_roi",
                     label=label,
                     phase=phase,
                     slice_idx=z_idx,
-                    raw_image=str(raw_img_path) if save_raw else "",
-                    raw_mask=str(raw_msk_path) if save_raw else "",
-                    visual=str(vis_path) if save_visual else "",
+                    raw_image=str(raw_img)  if save_raw    else "",
+                    raw_mask=str(raw_msk)   if save_raw    else "",
+                    visual=str(vis)         if save_visual else "",
+                    visual_combined=str(combined_vis) if save_visual else "",
                 ))
 
     return rows
