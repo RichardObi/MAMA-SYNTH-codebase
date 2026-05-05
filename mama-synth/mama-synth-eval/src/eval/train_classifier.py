@@ -811,7 +811,7 @@ def create_contrast_dataset(
 
     Each patient contributes **two** feature vectors: one extracted from
     phase 0 (pre-contrast, label=0) and one from phase 1 (post-contrast,
-    label=1).  This effectively doubles the dataset size compared to a
+    label=1). This effectively doubles the dataset size compared to a
     single-phase subtype task.
 
     Parameters
